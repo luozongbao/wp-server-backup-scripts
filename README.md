@@ -4,40 +4,59 @@ A collection of robust bash scripts for backing up WordPress installations in di
 
 ## Scripts Overview
 
+### Backup Scripts
 | Script | Purpose | Environment |
 |--------|---------|-------------|
 | `wp_native_backup.sh` | Backup WordPress on native/bare metal servers | Native MySQL/MariaDB |
-| `wp-docker-backup.sh` | Backup WordPress running in Docker containers | Docker with MySQL/MariaDB |
-| `wp-universal-backup.sh` | Universal backup script with auto-detection | Both Native and Docker |
+| `wp_docker_backup.sh` | Backup WordPress running in Docker containers | Docker with MySQL/MariaDB |
+| `wp_universal_backup.sh` | Universal backup script with auto-detection | Both Native and Docker |
+
+### Recovery Scripts
+| Script | Purpose | Environment |
+|--------|---------|-------------|
+| `wp_native_recover.sh` | Restore WordPress on native/bare metal servers | Native MySQL/MariaDB |
+| `wp_docker_recover.sh` | Restore WordPress running in Docker containers | Docker with MySQL/MariaDB |
+| `wp_universal_recover.sh` | Universal recovery script with auto-detection | Both Native and Docker |
 
 ## Features
 
 ✅ **Complete Backups**: Files + Database in a single ZIP archive  
+✅ **Complete Recovery**: Restore files + Database from backup archives  
 ✅ **Auto-Detection**: Database service type (MySQL/MariaDB) and environment detection  
 ✅ **Docker Support**: Full Docker container integration  
 ✅ **Error Handling**: Comprehensive validation and error reporting  
 ✅ **Integrity Verification**: Backup file verification after creation  
 ✅ **Timestamped Backups**: Format: `YYYYMMDD_HHMMSS_foldername.zip`  
 ✅ **Detailed Logging**: Timestamped log messages throughout the process  
+✅ **Safe Recovery**: Existing files are backed up before restoration  
 
 ## Quick Start
 
-### Universal Script (Recommended)
+### Universal Scripts (Recommended)
 ```bash
 # Auto-detects environment and database type
-./wp-universal-backup.sh -w /var/www/html/wordpress -o /backups
+# Backup
+./wp_universal_backup.sh -w /var/www/html/wordpress -o /backups
+# Recovery
+./wp_universal_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
 ```
 
 ### Native Environment
 ```bash
 # For traditional LAMP stack installations
+# Backup
 ./wp_native_backup.sh -w /var/www/html/wordpress -o /backups
+# Recovery  
+./wp_native_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
 ```
 
 ### Docker Environment
 ```bash
 # For WordPress running in Docker containers
-./wp-docker-backup.sh -w /var/www/html/wordpress -o /backups
+# Backup
+./wp_docker_backup.sh -w /var/www/html/wordpress -o /backups
+# Recovery
+./wp_docker_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
 ```
 
 ## Detailed Usage
@@ -181,11 +200,10 @@ The scripts include comprehensive error handling for:
 
 ## Permissions
 
-Ensure the script has execute permissions:
+Ensure all scripts have execute permissions:
 ```bash
-chmod +x wp_native_backup.sh
-chmod +x wp-docker-backup.sh
-chmod +x wp-universal-backup.sh
+chmod +x wp_native_backup.sh wp_docker_backup.sh wp_universal_backup.sh
+chmod +x wp_native_recover.sh wp_docker_recover.sh wp_universal_recover.sh
 ```
 
 ## Security Considerations
@@ -216,6 +234,122 @@ chmod +x wp-universal-backup.sh
 ### Debug Mode
 Add `set -x` at the beginning of any script for detailed execution tracing.
 
+## Recovery Scripts Usage
+
+### 1. wp_native_recover.sh
+
+**Purpose**: Restore WordPress installations from backups on native/bare metal servers with MySQL or MariaDB.
+
+**Usage**:
+```bash
+./wp_native_recover.sh -b BACKUP_FILE -w WORDPRESS_DIR [-d DATABASE_SERVICE]
+```
+
+**Options**:
+- `-b BACKUP_FILE`: Path to the backup ZIP file (required)
+- `-w WORDPRESS_DIR`: Path to WordPress installation directory (required)
+- `-d DATABASE_SERVICE`: Database type - `mysql` or `mariadb` (optional, auto-detected)
+- `-h`: Show help message
+
+**Examples**:
+```bash
+# Basic recovery
+./wp_native_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+
+# Force MariaDB usage
+./wp_native_recover.sh -b /backups/backup.zip -w /var/www/html/wordpress -d mariadb
+```
+
+**Requirements**:
+- `unzip` command
+- `mysql` or `mariadb` client (based on database type)
+- Access to WordPress directory and database
+- Database must exist and be accessible
+
+### 2. wp_docker_recover.sh
+
+**Purpose**: Restore WordPress installations from backups in Docker containers.
+
+**Usage**:
+```bash
+./wp_docker_recover.sh -b BACKUP_FILE -w WORDPRESS_DIR [-d DOCKER_COMPOSE_DIR]
+```
+
+**Options**:
+- `-b BACKUP_FILE`: Path to the backup ZIP file (required)
+- `-w WORDPRESS_DIR`: Path to WordPress installation directory (required)
+- `-d DOCKER_COMPOSE_DIR`: Path to docker-compose.yml directory (optional, default: same as WordPress directory)
+- `-h`: Show help message
+
+**Examples**:
+```bash
+# Basic Docker recovery
+./wp_docker_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+
+# Specify docker-compose location
+./wp_docker_recover.sh -b /backups/backup.zip -w /var/www/html/wordpress -d /docker/wordpress
+```
+
+**Requirements**:
+- `unzip` command
+- `docker` command
+- `docker-compose` command
+- Running Docker containers
+- Access to docker-compose.yml file
+
+**Features**:
+- Auto-detects database type from docker-compose.yml
+- Reads backup_info.txt with environment details
+- Validates container status before restoration
+
+### 3. wp_universal_recover.sh (Recommended)
+
+**Purpose**: Universal recovery script that automatically detects whether WordPress is running in Docker or native environment.
+
+**Usage**:
+```bash
+./wp_universal_recover.sh -b BACKUP_FILE -w WORDPRESS_DIR
+```
+
+**Options**:
+- `-b BACKUP_FILE`: Path to the backup ZIP file (required)
+- `-w WORDPRESS_DIR`: Path to WordPress installation directory (required)
+- `-h`: Show help message
+
+**Examples**:
+```bash
+# Universal recovery (auto-detection)
+./wp_universal_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+```
+
+**Auto-Detection Logic**:
+1. **Docker Detection**: Searches for docker-compose.yml in WordPress directory and parent directories
+2. **Database Detection**: Analyzes docker-compose.yml or system processes to identify MySQL/MariaDB
+3. **Container Detection**: Identifies database container names automatically
+4. **Fallback**: Uses native database services if Docker is not detected
+
+## Recovery Process
+
+All recovery scripts follow this process:
+
+1. **Validation**: Verify backup file integrity and structure
+2. **Extraction**: Extract backup contents to temporary directory
+3. **Configuration**: Read database settings from backup's wp-config.php
+4. **Environment Detection**: Determine restoration method (Docker/Native)
+5. **Database Restoration**: Restore database using appropriate method
+6. **File Restoration**: Copy WordPress files to target directory
+7. **Verification**: Confirm successful restoration
+
+### Important Recovery Notes
+
+⚠️ **CAUTION**: Recovery scripts will replace existing WordPress files and database content!
+
+- Existing WordPress directory will be backed up as `[directory].backup.[timestamp]`
+- Database content will be completely replaced
+- File permissions may need to be adjusted after recovery
+- For Docker environments, containers must be running
+- Test recovery in non-production environment first
+
 ## Output Format
 
 Backup files follow the naming convention:
@@ -227,18 +361,23 @@ Example: `20250530_143022_wordpress.zip`
 
 ## Dependencies
 
-### All Scripts
+### All Backup Scripts
 - `zip` - For creating compressed archives
 - `bash` - Shell environment (version 4.0+)
 
-### Native Script
-- `mysqldump` or `mariadb-dump` - Database backup tools
+### All Recovery Scripts
+- `unzip` - For extracting backup archives
+- `bash` - Shell environment (version 4.0+)
 
-### Docker Script
+### Native Scripts
+- `mysqldump` or `mariadb-dump` - Database backup tools
+- `mysql` or `mariadb` - Database restore tools
+
+### Docker Scripts
 - `docker` - Docker engine
 - `docker-compose` - Container orchestration
 
-### Universal Script
+### Universal Scripts
 - Combination of above based on detected environment
 
 ---
