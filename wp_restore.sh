@@ -13,6 +13,10 @@ DB_TYPE=""
 DB_CONTAINER=""
 IS_DOCKER=false
 BACKUP_MODE=""
+# Tracks backup paths created as safety net during restore (e.g. www.backup.<TS>).
+# These are auto-removed on SUCCESS, but PRESERVED on ERROR so the user can
+# roll back manually if anything went wrong mid-restore.
+declare -a RESTORE_SAFETY_BACKUPS=()
 
 # Post-restore customization options
 NEW_URL=""                  # Replace site URL throughout database (e.g., http://localhost:8088)
@@ -544,12 +548,15 @@ run_db_query() {
     db_cmd=$(build_db_query_cmd)
     local query_file
     query_file=$(mktemp)
+    # 'trap ... RETURN' fires when this function returns, no matter how
+    # (success, error, or early-return). Guarantees the temp file is cleaned
+    # up even if a command between this point and the return fails.
+    trap "rm -f '$query_file'" RETURN
     # Write query to file with no shell expansion (printf preserves $ literally)
     printf '%s\n' "$query" > "$query_file"
     # Pipe into the command; db_cmd ends with the DB name (no -e flag)
     $db_cmd < "$query_file" 2>/dev/null
     local rc=$?
-    rm -f "$query_file"
     return $rc
 }
 
@@ -560,10 +567,11 @@ run_db_query_capture() {
     db_cmd=$(build_db_query_cmd)
     local query_file
     query_file=$(mktemp)
+    # trap RETURN ensures cleanup on any exit path from this function
+    trap "rm -f '$query_file'" RETURN
     printf '%s\n' "$query" > "$query_file"
     local output
     output=$($db_cmd < "$query_file" 2>/dev/null)
-    rm -f "$query_file"
     echo "$output"
 }
 
@@ -718,9 +726,10 @@ update_admin_user() {
         local pass_file
         pass_file=$(mktemp)
         chmod 600 "$pass_file"
+        # trap RETURN guarantees cleanup on any exit path (error or success)
+        trap "rm -f '$pass_file'" RETURN
         printf '%s' "$ADMIN_PASSWORD" > "$pass_file"
         wp_hash=$(docker exec -i "$php_container" php -r "\$p = trim(file_get_contents('php://stdin')); echo password_hash(\$p, PASSWORD_BCRYPT);" < "$pass_file" 2>/dev/null)
-        rm -f "$pass_file"
     elif command -v php >/dev/null 2>&1; then
         wp_hash=$(php -r "echo password_hash(getenv('WP_ADMIN_PASS'), PASSWORD_BCRYPT);" 2>/dev/null < <(echo "$ADMIN_PASSWORD"))
     else
@@ -805,9 +814,14 @@ restore_files() {
             if [ -d "$target_dir/wp-content" ]; then
                 local wp_content_backup="$target_dir/wp-content.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing wp-content to: $wp_content_backup"
-                mv "$target_dir/wp-content" "$wp_content_backup"
+                if mv "$target_dir/wp-content" "$wp_content_backup"; then
+                    RESTORE_SAFETY_BACKUPS+=("$wp_content_backup")
+                else
+                    log_message "ERROR: Failed to backup existing wp-content"
+                    return 1
+                fi
             fi
-            
+
             if cp -r "$backup_wp_dir/wp-content" "$target_dir/"; then
                 log_message "wp-content restored successfully"
             else
@@ -817,16 +831,21 @@ restore_files() {
         else
             log_message "WARNING: wp-content not found in backup"
         fi
-        
+
         # Restore wp-config.php
         if [ -f "$backup_wp_dir/wp-config.php" ]; then
             # Backup existing wp-config.php if exists
             if [ -f "$target_dir/wp-config.php" ]; then
                 local wp_config_backup="$target_dir/wp-config.php.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing wp-config.php to: $wp_config_backup"
-                mv "$target_dir/wp-config.php" "$wp_config_backup"
+                if mv "$target_dir/wp-config.php" "$wp_config_backup"; then
+                    RESTORE_SAFETY_BACKUPS+=("$wp_config_backup")
+                else
+                    log_message "ERROR: Failed to backup existing wp-config.php"
+                    return 1
+                fi
             fi
-            
+
             if cp "$backup_wp_dir/wp-config.php" "$target_dir/"; then
                 log_message "wp-config.php restored successfully"
             else
@@ -837,15 +856,20 @@ restore_files() {
             log_message "ERROR: wp-config.php not found in backup"
             return 1
         fi
-        
+
         # Restore .htaccess if exists in backup
         if [ -f "$backup_wp_dir/.htaccess" ]; then
             if [ -f "$target_dir/.htaccess" ]; then
                 local htaccess_backup="$target_dir/.htaccess.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing .htaccess to: $htaccess_backup"
-                mv "$target_dir/.htaccess" "$htaccess_backup"
+                if mv "$target_dir/.htaccess" "$htaccess_backup"; then
+                    RESTORE_SAFETY_BACKUPS+=("$htaccess_backup")
+                else
+                    log_message "ERROR: Failed to backup existing .htaccess"
+                    return 1
+                fi
             fi
-            
+
             if cp "$backup_wp_dir/.htaccess" "$target_dir/"; then
                 log_message ".htaccess restored successfully"
             else
@@ -871,13 +895,14 @@ restore_files() {
             fi
         else
             log_message "WARNING: Target directory exists. Contents will be replaced."
-            # Backup existing directory
+            # Backup existing directory — tracked for cleanup on success
             local backup_existing="$target_dir.backup.$(date +%Y%m%d_%H%M%S)"
             log_message "Creating backup of existing directory: $backup_existing"
             if ! mv "$target_dir" "$backup_existing"; then
                 log_message "ERROR: Failed to backup existing directory"
                 return 1
             fi
+            RESTORE_SAFETY_BACKUPS+=("$backup_existing")
             mkdir -p "$target_dir"
         fi
         
@@ -1054,26 +1079,30 @@ else
     fi
 fi
 
-# Validate backup file
-if [ ! -f "$BACKUP_FILE" ]; then
-    log_message "ERROR: Backup file does not exist: $BACKUP_FILE"
-    exit 1
-fi
+# Validate backup file (restore mode only — fix mode does not need a backup)
+if [ "$FIX_MODE" != true ]; then
+    if [ ! -f "$BACKUP_FILE" ]; then
+        log_message "ERROR: Backup file does not exist: $BACKUP_FILE"
+        exit 1
+    fi
 
-# Check if backup file is a valid ZIP
-if ! unzip -t "$BACKUP_FILE" >/dev/null 2>&1; then
-    log_message "ERROR: Invalid or corrupted backup file: $BACKUP_FILE"
-    exit 1
+    # Check if backup file is a valid ZIP
+    if ! unzip -t "$BACKUP_FILE" >/dev/null 2>&1; then
+        log_message "ERROR: Invalid or corrupted backup file: $BACKUP_FILE"
+        exit 1
+    fi
 fi
 
 # Validate conflicting flags
-if [ "$SKIP_FILES" = true ] && [ "$SKIP_DB" = true ]; then
+if [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" = true ] && [ "$SKIP_DB" = true ]; then
     log_message "ERROR: --skip-files and --skip-db cannot be used together"
     exit 1
 fi
 
 # Convert to absolute paths
-BACKUP_FILE=$(realpath "$BACKUP_FILE")
+if [ -n "$BACKUP_FILE" ]; then
+    BACKUP_FILE=$(realpath "$BACKUP_FILE")
+fi
 WORDPRESS_DIR=$(realpath "$WORDPRESS_DIR")
 
 # Detect environment (Docker or Native)
@@ -1103,13 +1132,58 @@ log_message "Database type: $DB_TYPE"
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
 
-# Cleanup function
+# Cleanup function — always called via 'trap cleanup EXIT'.
+# - Always removes $TEMP_DIR (it lives under /tmp and is recreated per-run).
+# - $RESTORE_SAFETY_BACKUPS contains pre-restore backups (www.backup.<TS>, etc.)
+#   These are removed ONLY on success. On error, they are preserved so the user
+#   can roll back manually. The caller controls cleanup_safety_backups().
 cleanup() {
-    log_message "Cleaning up temporary files..."
-    rm -rf "$TEMP_DIR"
+    # Only remove TEMP_DIR — safety backups are managed by cleanup_safety_backups()
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR" 2>/dev/null || true
+    fi
 }
 
-# Set trap to cleanup on exit
+# Remove all preserved safety backups (called after a fully successful restore).
+cleanup_safety_backups() {
+    if [ ${#RESTORE_SAFETY_BACKUPS[@]} -eq 0 ]; then
+        return 0
+    fi
+    log_message "Removing preserved safety backups (restore completed successfully):"
+    local b
+    for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
+        if [ -n "$b" ] && [ -e "$b" ]; then
+            log_message "  Removing: $b"
+            rm -rf "$b" 2>/dev/null || log_message "  WARNING: Failed to remove $b"
+        fi
+    done
+    RESTORE_SAFETY_BACKUPS=()
+}
+
+# Emit a clear message about any preserved safety backups, then exit 1.
+# Use this in main flow error paths so the user knows where their pre-restore
+# data went (for manual rollback) instead of wondering why a folder appeared
+# beside their WordPress install.
+die() {
+    local msg="$1"
+    log_message "ERROR: $msg"
+    if [ ${#RESTORE_SAFETY_BACKUPS[@]} -ne 0 ]; then
+        log_message ""
+        log_message "Pre-restore backups PRESERVED for manual rollback:"
+        local b
+        for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
+            if [ -n "$b" ] && [ -e "$b" ]; then
+                log_message "  - $b"
+            fi
+        done
+        log_message "Remove them manually once you've confirmed the restored site works."
+    fi
+    exit 1
+}
+
+# Set trap to cleanup on exit. Safety backups are intentionally NOT removed
+# by the trap — they are only removed by cleanup_safety_backups() on success.
+# On error/abort, they remain in place for manual rollback.
 trap cleanup EXIT
 
 if [ "$FIX_MODE" = true ]; then
@@ -1132,12 +1206,13 @@ if [ "$FIX_MODE" = true ]; then
     fi
 
     # Read DB credentials directly from the live wp-config.php (not from backup).
-    TEMP_DIR=""  # No temp dir needed in fix mode; suppress cleanup confusion
+    # The TEMP_DIR we created above is fine — it's empty and will be cleaned up
+    # by the trap on exit. (Some helpers like detect_old_url() touch
+    # $TEMP_DIR/files/wp-config.php, but in fix mode we don't call those.)
     if ! extract_db_config "$WORDPRESS_DIR"; then
         log_message "ERROR: Failed to extract database configuration from live wp-config.php"
         exit 1
     fi
-    TEMP_DIR=$(mktemp -d)  # Provide an empty TEMP_DIR for any helpers that touch it
 
     # URL auto-detection in fix mode reads 'siteurl' from the live DB
     # (update_database_urls() will pick this up if OLD_URL is empty).
@@ -1204,13 +1279,11 @@ elif [ "$SKIP_DB" = true ]; then
 else
     if [ "$IS_DOCKER" = true ]; then
         if ! restore_database_docker "$SQL_FILE"; then
-            log_message "ERROR: Docker database restoration failed"
-            exit 1
+            die "Docker database restoration failed"
         fi
     else
         if ! restore_database_native "$SQL_FILE"; then
-            log_message "ERROR: Native database restoration failed"
-            exit 1
+            die "Native database restoration failed"
         fi
     fi
 fi
@@ -1222,8 +1295,7 @@ elif [ "$SKIP_FILES" = true ]; then
     log_message "Skipping file restoration (--skip-files)"
 else
     if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
-        log_message "ERROR: Files restoration failed"
-        exit 1
+        die "Files restoration failed"
     fi
 fi
 
@@ -1285,4 +1357,6 @@ else
     if [ "$BACKUP_MODE" = "lightweight" ]; then
         log_message "           This was a lightweight restore - ensure WordPress core files exist and match the backup version."
     fi
+    # Success path: remove preserved safety backups (www.backup.<TS>, etc.)
+    cleanup_safety_backups
 fi
