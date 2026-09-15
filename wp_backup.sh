@@ -14,19 +14,22 @@ DB_CONTAINER=""
 DB_DUMP_CMD=""
 IS_DOCKER=false
 LIGHTWEIGHT=false
+EMAIL_TO=""
+EMAIL_FROM="admin@companydomain.com"
 
 # Function to display help
 show_help() {
     echo "WordPress Backup Script"
     echo "================================"
     echo ""
-    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-h]"
+    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-h]"
     echo ""
     echo "Options:"
     echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (required)"
     echo "  -o OUTPUT_DIR        Path to the backup output directory (optional, default: current directory)"
     echo "  -l                   Lightweight mode: backup only wp-content, wp-config.php,"
     echo "                       and .htaccess (optional, default: full backup)"
+    echo "  -e EMAIL             Send backup report to this email address (optional)"
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
@@ -34,6 +37,7 @@ show_help() {
     echo "  $0 -w /var/www/html/wordpress -o /backups"
     echo "  $0 -w /home/user/website -o /home/user/backups"
     echo "  $0 -w /var/www/html/wordpress -l -o /backups    (lightweight mode)"
+    echo "  $0 -w /var/www/html/wordpress -e admin@example.com"
     echo ""
     echo "Output format: [timestamp]_[wordpress-folder-name].zip"
     echo "Example: 20250530_143022_wordpress.zip"
@@ -49,7 +53,85 @@ show_help() {
 
 # Function to log messages
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg"
+    if [ -n "$LOG_FILE" ]; then
+        echo "$msg" >> "$LOG_FILE"
+    fi
+}
+
+# Initialize log file (captures entire backup session)
+init_log_file() {
+    LOG_FILE=$(mktemp /tmp/wp_backup_XXXXXX.log)
+    : > "$LOG_FILE"
+    export LOG_FILE
+}
+
+# Send backup report via email using msmtp
+send_email_notification() {
+    local status="$1"   # SUCCESS or FAILED
+    local exit_code="$2"
+
+    # Skip if no recipient configured or msmtp missing
+    if [ -z "$EMAIL_TO" ]; then
+        log_message "Email notification skipped (no recipient specified)"
+        return 0
+    fi
+
+    if ! command -v msmtp &> /dev/null; then
+        log_message "WARNING: msmtp not installed, skipping email notification"
+        return 1
+    fi
+
+    local subject_prefix="[WordPress Backup]"
+    if [ "$status" = "SUCCESS" ]; then
+        local subject="${subject_prefix} ✅ SUCCESS - ${WORDPRESS_FOLDER_NAME} (${TIMESTAMP})"
+    else
+        local subject="${subject_prefix} ❌ FAILED - ${WORDPRESS_FOLDER_NAME} (${TIMESTAMP})"
+    fi
+
+    local backup_size_line="N/A"
+    if [ -f "$BACKUP_PATH" ]; then
+        backup_size_line=$(du -h "$BACKUP_PATH" | cut -f1)
+    fi
+
+    {
+        echo "From: ${EMAIL_FROM}"
+        echo "To: ${EMAIL_TO}"
+        echo "Subject: ${subject}"
+        echo "Date: $(date -R)"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/plain; charset=utf-8"
+        echo "Content-Transfer-Encoding: 8bit"
+        echo ""
+        echo "WordPress Backup Report"
+        echo "======================="
+        echo ""
+        echo "Status          : ${status}"
+        echo "Exit code       : ${exit_code}"
+        echo "WordPress dir   : ${WORDPRESS_DIR}"
+        echo "Backup file     : ${BACKUP_PATH:-N/A}"
+        echo "Backup size     : ${backup_size_line}"
+        echo "Mode            : $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight" || echo "Full")"
+        echo "Environment     : $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER)" || echo "Native ($DB_TYPE)")"
+        echo "Database        : ${DB_TYPE:-N/A}"
+        echo "Timestamp       : ${TIMESTAMP}"
+        echo "Finished at     : $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Host            : $(hostname)"
+        echo ""
+        echo "----- Backup Log -----"
+        if [ -f "$LOG_FILE" ]; then
+            cat "$LOG_FILE"
+        else
+            echo "(no log file found)"
+        fi
+    } | msmtp --account=default "$EMAIL_TO"
+
+    if [ $? -eq 0 ]; then
+        log_message "Backup report sent successfully to ${EMAIL_TO}"
+    else
+        log_message "WARNING: Failed to send backup report to ${EMAIL_TO}"
+    fi
 }
 
 # Function to check if required tools are installed
@@ -412,7 +494,7 @@ backup_files() {
 }
 
 # Parse command line arguments
-while getopts "w:o:lh" opt; do
+while getopts "w:o:le:h" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
@@ -422,6 +504,9 @@ while getopts "w:o:lh" opt; do
             ;;
         l)
             LIGHTWEIGHT=true
+            ;;
+        e)
+            EMAIL_TO="$OPTARG"
             ;;
         h)
             SHOW_HELP=true
@@ -515,15 +600,34 @@ log_message "Backup filename: $BACKUP_FILENAME"
 log_message "Backup mode: $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight (wp-content + wp-config.php + .htaccess)" || echo "Full (entire WordPress directory)")"
 log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker" || echo "Native")"
 log_message "Database type: $DB_TYPE"
+if [ -n "$EMAIL_TO" ]; then
+    log_message "Email notification: $EMAIL_TO"
+fi
+
+# Initialize log file for email report
+init_log_file
+log_message "Log file initialized: $LOG_FILE"
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
 mkdir -p "$TEMP_DIR/files"
 
-# Cleanup function
+# Cleanup function (also sends email notification if configured)
 cleanup() {
+    local exit_code=$?
+
+    # Send email notification based on exit code
+    if [ -n "$EMAIL_TO" ] && [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
+        if [ $exit_code -eq 0 ]; then
+            send_email_notification "SUCCESS" "$exit_code"
+        else
+            send_email_notification "FAILED" "$exit_code"
+        fi
+    fi
+
     log_message "Cleaning up temporary files..."
     rm -rf "$TEMP_DIR"
+    rm -f "$LOG_FILE"
 }
 
 # Set trap to cleanup on exit
@@ -590,3 +694,4 @@ fi
 
 log_message "WordPress Backup process completed"
 log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER container)" || echo "Native ($DB_TYPE service)")"
+exit 0

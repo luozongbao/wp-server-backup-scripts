@@ -20,6 +20,7 @@ Both scripts work on **any web server** that serves WordPress — Nginx, Apache,
 - ✅ **Post-restore customization**: Optional URL replacement, site title change, admin user creation — perfect for migrations to new domains
 - ✅ **Dry-run mode**: Preview changes before applying them (`--dry-run`)
 - ✅ **Integrity verification**: Backup is verified after creation
+- ✅ **Email notifications**: Optional backup report via `msmtp` (`-e email`)
 - ✅ **Timestamped output**: `YYYYMMDD_HHMMSS_foldername[_lightweight].zip`
 - ✅ **Safe recovery**: Existing target files are backed up before overwrite
 
@@ -66,6 +67,9 @@ The restore script **refuses to proceed** and exits with an error if the target 
 
 # Lightweight backup (smaller, only wp-content + wp-config.php + .htaccess)
 ./wp_backup.sh -w /var/www/html/wordpress -o /backups -l
+
+# Backup + email notification
+./wp_backup.sh -w /var/www/html/wordpress -o /backups -e admin@example.com
 ```
 
 ### Restore
@@ -93,6 +97,7 @@ The restore script **refuses to proceed** and exits with an error if the target 
 - `-w WORDPRESS_DIR`: Path to WordPress installation (required)
 - `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
 - `-l`: Lightweight mode (backup only `wp-content`, `wp-config.php`, `.htaccess`)
+- `-e EMAIL`: Send backup report to this email address (optional, requires `msmtp`)
 - `-h`: Show help message
 
 **Examples**:
@@ -102,7 +107,44 @@ The restore script **refuses to proceed** and exits with an error if the target 
 
 # Lightweight backup
 ./wp_backup.sh -w /var/www/html/wordpress -l -o /backups
+
+# Backup with email notification
+./wp_backup.sh -w /var/www/html/wordpress -o /backups -e admin@example.com
 ```
+
+### Email Notifications
+
+Use `-e EMAIL` to receive a backup report after the run. The script uses `msmtp` (with the `default` account) to send mail.
+
+**Install msmtp** (Debian/Ubuntu):
+```bash
+sudo apt install msmtp msmtp-mta
+```
+
+**Configure** `~/.msmtprc` (or `/etc/msmtprc`):
+```ini
+defaults
+auth           on
+tls            on
+tls_starttls   on
+logfile        ~/.msmtp.log
+
+account        default
+host           smtp.example.com
+port           587
+from           server@example.com
+user           server@example.com
+password       your-app-password
+```
+
+The email contains:
+- Status indicator (✅ SUCCESS or ❌ FAILED) and exit code
+- Backup path, file size, mode (full/lightweight)
+- Detected environment (Docker/Native) and database type (MySQL/MariaDB)
+- Full backup log inlined in the message body
+- Hostname and timestamp
+
+Notification is sent automatically on both success and failure — even `exit 1` paths trigger an email so you always know when something goes wrong.
 
 **Auto-Detection Logic**:
 1. **Environment detection**: Searches for `docker-compose.yml` in the WordPress directory and up to 3 parent levels, then checks for running WordPress-related containers.
@@ -260,6 +302,9 @@ Examples: `20250530_143022_wordpress.zip`, `20250530_143022_wordpress_lightweigh
 - `mysqldump` or `mariadb-dump`
 - `mysql` or `mariadb`
 
+### For email notifications (optional)
+- `msmtp` (with a configured `default` account)
+
 The scripts only require dependencies for the environment they detect.
 
 ## Installation
@@ -275,6 +320,28 @@ The scripts need read access to the WordPress directory and write access to:
 - The target WordPress directory (for restore)
 
 For Docker environments, the scripts also need access to the Docker socket.
+
+## Scheduled Backups (Cron)
+
+```bash
+crontab -e
+```
+
+```cron
+# Full backup every day at 02:00, with email report
+0 2 * * * /home/zongbao/wp-server-backup-scripts/wp_backup.sh \
+    -w /var/www/html/wordpress \
+    -o /backups \
+    -e admin@example.com \
+    >> /var/log/wp_backup.log 2>&1
+
+# Lightweight backup every 6 hours (smaller, faster)
+0 */6 * * * /home/zongbao/wp-server-backup-scripts/wp_backup.sh \
+    -w /var/www/html/wordpress \
+    -o /backups \
+    -l \
+    >> /var/log/wp_backup.log 2>&1
+```
 
 ## Important Notes
 
