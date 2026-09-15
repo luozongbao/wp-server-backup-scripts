@@ -20,43 +20,113 @@ A collection of robust bash scripts for backing up WordPress installations in di
 
 ## Features
 
+✅ **Two Backup Modes**: Full mode (entire WordPress directory) or Lightweight mode (`wp-content` + `wp-config.php` + `.htaccess`)  
 ✅ **Complete Backups**: Files + Database in a single ZIP archive  
 ✅ **Complete Recovery**: Restore files + Database from backup archives  
 ✅ **Auto-Detection**: Database service type (MySQL/MariaDB) and environment detection  
 ✅ **Docker Support**: Full Docker container integration  
 ✅ **Error Handling**: Comprehensive validation and error reporting  
 ✅ **Integrity Verification**: Backup file verification after creation  
-✅ **Timestamped Backups**: Format: `YYYYMMDD_HHMMSS_foldername.zip`  
+✅ **Timestamped Backups**: Format: `YYYYMMDD_HHMMSS_foldername[_lightweight].zip`  
 ✅ **Detailed Logging**: Timestamped log messages throughout the process  
 ✅ **Safe Recovery**: Existing files are backed up before restoration  
+✅ **Smart Restore**: Recover script auto-detects full vs lightweight backup 
+
+## Backup Modes
+
+All backup scripts support **two modes**:
+
+### Full Mode (Default)
+Backs up the **entire WordPress directory** including core, plugins, themes, uploads, and configuration. This is the safest option for disaster recovery since it captures everything.
+
+```
+backup_YYYYMMDD_HHMMSS_foldername.zip
+├── files/                  ← Complete WordPress directory
+│   ├── wp-admin/
+│   ├── wp-includes/
+│   ├── wp-content/
+│   ├── wp-config.php
+│   └── ...
+├── database.sql
+└── backup_info.txt (Docker only)
+```
+
+### Lightweight Mode (`-l` flag)
+Backs up only what's **essential and unique** to your site:
+
+| Included | Purpose |
+|----------|---------|
+| `wp-content/` | Themes, plugins, uploads (your custom content) |
+| `wp-config.php` | Database credentials, security keys, custom constants |
+| `.htaccess` | Apache/OLS rewrite rules |
+| `database.sql` | Full database dump |
+
+WordPress core files (`wp-admin/`, `wp-includes/`) are **not** included since they can be re-downloaded. This produces significantly smaller backups.
+
+```
+backup_YYYYMMDD_HHMMSS_foldername_lightweight.zip
+├── files/
+│   ├── wp-content/         ← Your themes, plugins, uploads
+│   ├── wp-config.php
+│   └── .htaccess (if exists)
+├── database.sql
+└── backup_info.txt (Docker only)
+```
+
+### When to Use Each Mode
+
+| Scenario | Recommended Mode |
+|----------|------------------|
+| Disaster recovery / production backups | **Full** |
+| Frequent scheduled backups (cron) | **Lightweight** |
+| Migrating to a fresh server | **Full** |
+| Migrating to a server with matching WP version | **Lightweight** |
+| Quick backups where disk space matters | **Lightweight** |
+
+### Lightweight Restore Requirement
+
+> ⚠️ **IMPORTANT**: When restoring a lightweight backup, the target directory **must already contain WordPress core files** (`wp-includes/`, `wp-admin/`) with a compatible version. If not, install WordPress first or use a full backup.
+
+The restore script will **refuse to proceed** and exit with an error if it detects that the target is empty or missing core files, preventing a broken restore.
+
+---
 
 ## Quick Start
 
 ### Universal Scripts (Recommended)
 ```bash
 # Auto-detects environment and database type
-# Backup
+# Full backup (default)
 ./wp_universal_backup.sh -w /var/www/html/wordpress -o /backups
-# Recovery
+# Lightweight backup (smaller, only wp-content + wp-config.php + .htaccess)
+./wp_universal_backup.sh -w /var/www/html/wordpress -o /backups -l
+# Recovery (auto-detects full vs lightweight)
 ./wp_universal_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+./wp_universal_recover.sh -b /backups/20250530_143022_wordpress_lightweight.zip -w /var/www/html/wordpress
 ```
 
 ### Native Environment
 ```bash
 # For traditional LAMP stack installations
-# Backup
+# Full backup
 ./wp_native_backup.sh -w /var/www/html/wordpress -o /backups
-# Recovery  
+# Lightweight backup
+./wp_native_backup.sh -w /var/www/html/wordpress -l -o /backups
+# Recovery (auto-detects backup mode)
 ./wp_native_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+./wp_native_recover.sh -b /backups/20250530_143022_wordpress_lightweight.zip -w /var/www/html/wordpress
 ```
 
 ### Docker Environment
 ```bash
 # For WordPress running in Docker containers
-# Backup
+# Full backup
 ./wp_docker_backup.sh -w /var/www/html/wordpress -o /backups
-# Recovery
+# Lightweight backup
+./wp_docker_backup.sh -w /var/www/html/wordpress -l -o /backups
+# Recovery (auto-detects backup mode)
 ./wp_docker_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+./wp_docker_recover.sh -b /backups/20250530_143022_wordpress_lightweight.zip -w /var/www/html/wordpress
 ```
 
 ## Detailed Usage
@@ -67,18 +137,19 @@ A collection of robust bash scripts for backing up WordPress installations in di
 
 **Usage**:
 ```bash
-./wp_native_backup.sh -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DATABASE_SERVICE]
+./wp_native_backup.sh -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DATABASE_SERVICE] [-l]
 ```
 
 **Options**:
 - `-w WORDPRESS_DIR`: Path to WordPress installation (required)
 - `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
 - `-d DATABASE_SERVICE`: Database type - `mysql` or `mariadb` (optional, auto-detected)
+- `-l`: Lightweight mode (backup only `wp-content`, `wp-config.php`, `.htaccess`)
 - `-h`: Show help message
 
 **Examples**:
 ```bash
-# Basic backup
+# Full backup
 ./wp_native_backup.sh -w /var/www/html/wordpress
 
 # Specify output directory
@@ -86,6 +157,9 @@ A collection of robust bash scripts for backing up WordPress installations in di
 
 # Force MariaDB usage
 ./wp_native_backup.sh -w /var/www/html/wordpress -d mariadb -o /backups
+
+# Lightweight backup
+./wp_native_backup.sh -w /var/www/html/wordpress -l -o /backups
 ```
 
 **Requirements**:
@@ -99,13 +173,14 @@ A collection of robust bash scripts for backing up WordPress installations in di
 
 **Usage**:
 ```bash
-./wp-docker-backup.sh -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DOCKER_COMPOSE_DIR]
+./wp-docker-backup.sh -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DOCKER_COMPOSE_DIR] [-l]
 ```
 
 **Options**:
 - `-w WORDPRESS_DIR`: Path to WordPress installation (required)
 - `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
 - `-d DOCKER_COMPOSE_DIR`: Path to docker-compose.yml directory (optional, default: same as WordPress directory)
+- `-l`: Lightweight mode (backup only `wp-content`, `wp-config.php`, `.htaccess`)
 - `-h`: Show help message
 
 **Examples**:
@@ -115,6 +190,9 @@ A collection of robust bash scripts for backing up WordPress installations in di
 
 # Specify docker-compose location
 ./wp-docker-backup.sh -w /var/www/html/wordpress -d /docker/wordpress -o /backups
+
+# Lightweight Docker backup
+./wp-docker-backup.sh -w /var/www/html/wordpress -l -o /backups
 ```
 
 **Requirements**:
@@ -135,21 +213,25 @@ A collection of robust bash scripts for backing up WordPress installations in di
 
 **Usage**:
 ```bash
-./wp-universal-backup.sh -w WORDPRESS_DIR [-o OUTPUT_DIR]
+./wp-universal-backup.sh -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l]
 ```
 
 **Options**:
 - `-w WORDPRESS_DIR`: Path to WordPress installation (required)
 - `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
+- `-l`: Lightweight mode (backup only `wp-content`, `wp-config.php`, `.htaccess`)
 - `-h`: Show help message
 
 **Examples**:
 ```bash
-# Universal backup (auto-detection)
+# Universal backup (auto-detection, full mode)
 ./wp-universal-backup.sh -w /var/www/html/wordpress
 
 # With custom output directory
 ./wp-universal-backup.sh -w /var/www/html/wordpress -o /backups
+
+# Lightweight universal backup
+./wp-universal-backup.sh -w /var/www/html/wordpress -l -o /backups
 ```
 
 **Auto-Detection Logic**:
@@ -158,14 +240,42 @@ A collection of robust bash scripts for backing up WordPress installations in di
 3. **Container Detection**: Identifies database container names automatically
 4. **Fallback**: Uses native database services if Docker is not detected
 
+## Web Server Compatibility
+
+These scripts work at the **filesystem and database level only**, so they are compatible with **any web server** that serves WordPress:
+
+| Web Server | Compatible | Notes |
+|------------|-----------|-------|
+| Nginx | ✅ Yes | Operates below web server layer |
+| Apache | ✅ Yes | `.htaccess` is included in lightweight backups |
+| OpenLiteSpeed (OLS) | ✅ Yes | `.htaccess` is included in lightweight backups |
+| LiteSpeed Enterprise | ✅ Yes | `.htaccess` is included in lightweight backups |
+| Caddy | ✅ Yes | Operates below web server layer |
+
+The web server is irrelevant to the backup process — what matters is only that the WordPress files and database are accessible. You can freely migrate between web servers after restoring a backup.
+
+> 💡 **Tip**: For Nginx/Caddy users, custom rewrite rules live in server config files (not `.htaccess`). Back up those separately — they're outside WordPress.
+
+---
+
 ## Backup Contents
 
-Each backup creates a ZIP file containing:
-
+### Full Mode (default)
 ```
 backup_YYYYMMDD_HHMMSS_sitename.zip
 ├── files/
 │   └── [complete WordPress directory structure]
+├── database.sql
+└── backup_info.txt (Docker backups only)
+```
+
+### Lightweight Mode (`-l`)
+```
+backup_YYYYMMDD_HHMMSS_sitename_lightweight.zip
+├── files/
+│   ├── wp-content/         ← themes, plugins, uploads
+│   ├── wp-config.php
+│   └── .htaccess (if exists)
 ├── database.sql
 └── backup_info.txt (Docker backups only)
 ```
@@ -253,8 +363,11 @@ Add `set -x` at the beginning of any script for detailed execution tracing.
 
 **Examples**:
 ```bash
-# Basic recovery
+# Basic recovery (auto-detects full vs lightweight)
 ./wp_native_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+
+# Restore a lightweight backup (requires WP core to already exist at target)
+./wp_native_recover.sh -b /backups/20250530_143022_wordpress_lightweight.zip -w /var/www/html/wordpress
 
 # Force MariaDB usage
 ./wp_native_recover.sh -b /backups/backup.zip -w /var/www/html/wordpress -d mariadb
@@ -283,8 +396,11 @@ Add `set -x` at the beginning of any script for detailed execution tracing.
 
 **Examples**:
 ```bash
-# Basic Docker recovery
+# Basic Docker recovery (auto-detects full vs lightweight)
 ./wp_docker_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+
+# Restore a lightweight backup
+./wp_docker_recover.sh -b /backups/20250530_143022_wordpress_lightweight.zip -w /var/www/html/wordpress
 
 # Specify docker-compose location
 ./wp_docker_recover.sh -b /backups/backup.zip -w /var/www/html/wordpress -d /docker/wordpress
@@ -318,8 +434,11 @@ Add `set -x` at the beginning of any script for detailed execution tracing.
 
 **Examples**:
 ```bash
-# Universal recovery (auto-detection)
+# Universal recovery (auto-detects environment AND full vs lightweight)
 ./wp_universal_recover.sh -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress
+
+# Restore a lightweight backup
+./wp_universal_recover.sh -b /backups/20250530_143022_wordpress_lightweight.zip -w /var/www/html/wordpress
 ```
 
 **Auto-Detection Logic**:
@@ -334,11 +453,24 @@ All recovery scripts follow this process:
 
 1. **Validation**: Verify backup file integrity and structure
 2. **Extraction**: Extract backup contents to temporary directory
-3. **Configuration**: Read database settings from backup's wp-config.php
-4. **Environment Detection**: Determine restoration method (Docker/Native)
-5. **Database Restoration**: Restore database using appropriate method
-6. **File Restoration**: Copy WordPress files to target directory
-7. **Verification**: Confirm successful restoration
+3. **Mode Detection**: Auto-detect whether backup is **full** or **lightweight** (via `.backup_mode` marker)
+4. **Configuration**: Read database settings from backup's wp-config.php
+5. **Environment Detection**: Determine restoration method (Docker/Native)
+6. **Database Restoration**: Restore database using appropriate method
+7. **File Restoration**: Restore files based on detected mode
+   - **Full mode**: Replace entire WordPress directory
+   - **Lightweight mode**: Restore only `wp-content/`, `wp-config.php`, `.htaccess` into existing WordPress installation
+8. **Verification**: Confirm successful restoration
+
+### Lightweight Restore Safety Check
+
+The recovery scripts automatically verify that the target directory contains a valid WordPress core (`wp-includes/`) before performing a lightweight restore. If the target is empty or missing core files, the script will:
+
+- Print a clear warning explaining the issue
+- Suggest installing WordPress core first or using a full backup
+- **Exit with error code 1** to prevent a broken installation
+
+This safety check prevents accidentally creating a broken WordPress installation when restoring a lightweight backup to an empty directory.
 
 ### Important Recovery Notes
 
@@ -354,10 +486,11 @@ All recovery scripts follow this process:
 
 Backup files follow the naming convention:
 ```
-YYYYMMDD_HHMMSS_[wordpress-folder-name].zip
+YYYYMMDD_HHMMSS_[wordpress-folder-name].zip          # Full mode
+YYYYMMDD_HHMMSS_[wordpress-folder-name]_lightweight.zip   # Lightweight mode
 ```
 
-Example: `20250530_143022_wordpress.zip`
+Example: `20250530_143022_wordpress.zip`, `20250530_143022_wordpress_lightweight.zip`
 
 ## Dependencies
 

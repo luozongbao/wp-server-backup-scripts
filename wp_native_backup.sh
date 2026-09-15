@@ -10,18 +10,21 @@ WORDPRESS_DIR=""
 OUTPUT_DIR="$(pwd)"
 DB_SERVICE=""
 SHOW_HELP=false
+LIGHTWEIGHT=false
 
 # Function to display help
 show_help() {
     echo "WordPress Backup Script"
     echo "======================="
     echo ""
-    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DATABASE_SERVICE]"
+    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DATABASE_SERVICE] [-l]"
     echo ""
     echo "Options:"
     echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (required)"
     echo "  -o OUTPUT_DIR        Path to the backup output directory (optional, default: current directory)"
     echo "  -d DATABASE_SERVICE  Database service type: mariadb or mysql (optional, auto-detected if not specified)"
+    echo "  -l                   Lightweight mode: backup only wp-content, wp-config.php,"
+    echo "                       and .htaccess (optional, default: full backup)"
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
@@ -29,9 +32,11 @@ show_help() {
     echo "  $0 -w /var/www/html/wordpress -o /backups"
     echo "  $0 -w /var/www/html/wordpress -d mariadb -o /backups"
     echo "  $0 -w /home/user/website -d mysql -o /home/user/backups"
+    echo "  $0 -w /var/www/html/wordpress -l -o /backups    (lightweight mode)"
     echo ""
     echo "Output format: [timestamp]_[wordpressfoldername].zip"
     echo "Example: 20250530_143022_wordpress.zip"
+    echo "          20250530_143022_wordpress_lightweight.zip (lightweight mode)"
     echo ""
     echo "Note: Script will attempt to auto-detect database service if -d is not specified."
 }
@@ -138,17 +143,60 @@ backup_files() {
     local temp_dir="$2"
     local zip_file="$3"
     
-    log_message "Creating files backup..."
-    
-    # Copy WordPress files to temporary directory
-    cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null
-    
-    if [ $? -ne 0 ]; then
-        log_message "ERROR: Failed to copy WordPress files"
-        return 1
+    if [ "$LIGHTWEIGHT" = true ]; then
+        log_message "Creating lightweight files backup (wp-content, wp-config.php, .htaccess)..."
+        
+        # Copy wp-content directory
+        if [ -d "$wordpress_dir/wp-content" ]; then
+            if cp -r "$wordpress_dir/wp-content" "$temp_dir/files/" 2>/dev/null; then
+                log_message "wp-content directory copied successfully"
+            else
+                log_message "ERROR: Failed to copy wp-content directory"
+                return 1
+            fi
+        else
+            log_message "WARNING: wp-content directory not found"
+        fi
+        
+        # Copy wp-config.php (critical for DB credentials)
+        if [ -f "$wordpress_dir/wp-config.php" ]; then
+            if cp "$wordpress_dir/wp-config.php" "$temp_dir/files/" 2>/dev/null; then
+                log_message "wp-config.php copied successfully"
+            else
+                log_message "ERROR: Failed to copy wp-config.php"
+                return 1
+            fi
+        else
+            log_message "ERROR: wp-config.php not found"
+            return 1
+        fi
+        
+        # Copy .htaccess if exists (Apache/OLS rewrite rules)
+        if [ -f "$wordpress_dir/.htaccess" ]; then
+            if cp "$wordpress_dir/.htaccess" "$temp_dir/files/" 2>/dev/null; then
+                log_message ".htaccess copied successfully"
+            else
+                log_message "WARNING: Failed to copy .htaccess (non-critical)"
+            fi
+        fi
+        
+        # Create a marker file so restore script knows this is lightweight
+        echo "lightweight" > "$temp_dir/files/.backup_mode"
+        
+        log_message "Lightweight files backup completed successfully"
+    else
+        log_message "Creating full files backup..."
+        
+        # Copy WordPress files to temporary directory
+        cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null
+        
+        if [ $? -ne 0 ]; then
+            log_message "ERROR: Failed to copy WordPress files"
+            return 1
+        fi
+        
+        log_message "WordPress files copied successfully"
     fi
-    
-    log_message "WordPress files copied successfully"
     return 0
 }
 
@@ -208,7 +256,7 @@ detect_database_service() {
 }
 
 # Parse command line arguments
-while getopts "w:o:d:h" opt; do
+while getopts "w:o:d:lh" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
@@ -223,6 +271,9 @@ while getopts "w:o:d:h" opt; do
                 show_help
                 exit 1
             fi
+            ;;
+        l)
+            LIGHTWEIGHT=true
             ;;
         h)
             SHOW_HELP=true
@@ -286,13 +337,18 @@ check_dependencies
 # Generate timestamp and backup filename
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 WORDPRESS_FOLDER_NAME=$(basename "$WORDPRESS_DIR")
-BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}.zip"
+if [ "$LIGHTWEIGHT" = true ]; then
+    BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}_lightweight.zip"
+else
+    BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}.zip"
+fi
 BACKUP_PATH="$OUTPUT_DIR/$BACKUP_FILENAME"
 
 log_message "Starting WordPress backup process"
 log_message "WordPress directory: $WORDPRESS_DIR"
 log_message "Output directory: $OUTPUT_DIR"
 log_message "Backup filename: $BACKUP_FILENAME"
+log_message "Backup mode: $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight" || echo "Full")"
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)

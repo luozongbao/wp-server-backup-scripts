@@ -9,27 +9,32 @@ WORDPRESS_DIR=""
 OUTPUT_DIR="$(pwd)"
 DOCKER_COMPOSE_DIR=""
 SHOW_HELP=false
+LIGHTWEIGHT=false
 
 # Function to display help
 show_help() {
     echo "WordPress Docker Backup Script"
     echo "=============================="
     echo ""
-    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DOCKER_COMPOSE_DIR]"
+    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DOCKER_COMPOSE_DIR] [-l]"
     echo ""
     echo "Options:"
     echo "  -w WORDPRESS_DIR       Path to the WordPress installation directory (required)"
     echo "  -o OUTPUT_DIR          Path to the backup output directory (optional, default: current directory)"
     echo "  -d DOCKER_COMPOSE_DIR  Path to the docker-compose.yml directory (optional, default: same as WordPress directory)"
+    echo "  -l                     Lightweight mode: backup only wp-content, wp-config.php,"
+    echo "                         and .htaccess (optional, default: full backup)"
     echo "  -h                     Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 -w /var/www/html/wordpress"
     echo "  $0 -w /var/www/html/wordpress -o /backups"
     echo "  $0 -w /var/www/html/wordpress -d /docker/wordpress -o /backups"
+    echo "  $0 -w /var/www/html/wordpress -l -o /backups    (lightweight mode)"
     echo ""
     echo "Output format: [timestamp]_[wordpress-folder-name].zip"
     echo "Example: 20250530_143022_wordpress.zip"
+    echo "          20250530_143022_wordpress_lightweight.zip (lightweight mode)"
     echo ""
     echo "Note: This script detects MariaDB/MySQL from docker-compose.yml and uses appropriate dump commands."
 }
@@ -183,24 +188,70 @@ backup_files() {
     local wordpress_dir="$1"
     local temp_dir="$2"
     
-    log_message "Creating files backup..."
-    
-    # Copy WordPress files to temporary directory
-    if cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null; then
-        log_message "WordPress files copied successfully"
+    if [ "$LIGHTWEIGHT" = true ]; then
+        log_message "Creating lightweight files backup (wp-content, wp-config.php, .htaccess)..."
+        
+        # Copy wp-content directory
+        if [ -d "$wordpress_dir/wp-content" ]; then
+            if cp -r "$wordpress_dir/wp-content" "$temp_dir/files/" 2>/dev/null; then
+                log_message "wp-content directory copied successfully"
+            else
+                log_message "ERROR: Failed to copy wp-content directory"
+                return 1
+            fi
+        else
+            log_message "WARNING: wp-content directory not found"
+        fi
+        
+        # Copy wp-config.php (critical for DB credentials)
+        if [ -f "$wordpress_dir/wp-config.php" ]; then
+            if cp "$wordpress_dir/wp-config.php" "$temp_dir/files/" 2>/dev/null; then
+                log_message "wp-config.php copied successfully"
+            else
+                log_message "ERROR: Failed to copy wp-config.php"
+                return 1
+            fi
+        else
+            log_message "ERROR: wp-config.php not found"
+            return 1
+        fi
+        
+        # Copy .htaccess if exists (Apache/OLS rewrite rules)
+        if [ -f "$wordpress_dir/.htaccess" ]; then
+            if cp "$wordpress_dir/.htaccess" "$temp_dir/files/" 2>/dev/null; then
+                log_message ".htaccess copied successfully"
+            else
+                log_message "WARNING: Failed to copy .htaccess (non-critical)"
+            fi
+        fi
+        
+        # Create a marker file so restore script knows this is lightweight
+        echo "lightweight" > "$temp_dir/files/.backup_mode"
         
         # Calculate files backup size
         local files_size=$(du -sh "$temp_dir/files" | cut -f1)
-        log_message "WordPress files size: $files_size"
+        log_message "Lightweight backup size: $files_size"
         return 0
     else
-        log_message "ERROR: Failed to copy WordPress files"
-        return 1
+        log_message "Creating full files backup..."
+        
+        # Copy WordPress files to temporary directory
+        if cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null; then
+            log_message "WordPress files copied successfully"
+            
+            # Calculate files backup size
+            local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+            log_message "WordPress files size: $files_size"
+            return 0
+        else
+            log_message "ERROR: Failed to copy WordPress files"
+            return 1
+        fi
     fi
 }
 
 # Parse command line arguments
-while getopts "w:o:d:h" opt; do
+while getopts "w:o:d:lh" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
@@ -210,6 +261,9 @@ while getopts "w:o:d:h" opt; do
             ;;
         d)
             DOCKER_COMPOSE_DIR="$OPTARG"
+            ;;
+        l)
+            LIGHTWEIGHT=true
             ;;
         h)
             SHOW_HELP=true
@@ -284,7 +338,11 @@ check_dependencies
 # Generate timestamp and backup filename
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 WORDPRESS_FOLDER_NAME=$(basename "$WORDPRESS_DIR")
-BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}.zip"
+if [ "$LIGHTWEIGHT" = true ]; then
+    BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}_lightweight.zip"
+else
+    BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}.zip"
+fi
 BACKUP_PATH="$OUTPUT_DIR/$BACKUP_FILENAME"
 
 log_message "Starting WordPress Docker backup process"
@@ -292,6 +350,7 @@ log_message "WordPress directory: $WORDPRESS_DIR"
 log_message "Docker-compose directory: $DOCKER_COMPOSE_DIR"
 log_message "Output directory: $OUTPUT_DIR"
 log_message "Backup filename: $BACKUP_FILENAME"
+log_message "Backup mode: $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight" || echo "Full")"
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
@@ -333,7 +392,8 @@ fi
 
 # Create a backup info file
 INFO_FILE="$TEMP_DIR/backup_info.txt"
-cat > "$INFO_FILE" << EOF
+if [ "$LIGHTWEIGHT" = true ]; then
+    cat > "$INFO_FILE" << EOF
 WordPress Docker Backup Information
 ===================================
 
@@ -346,11 +406,35 @@ Database Name: $DB_NAME
 Database User: $DB_USER
 Database Host: $DB_HOST
 
+Backup Mode: Lightweight
+Backup Contents:
+- files/wp-content/: WordPress content directory (themes, plugins, uploads)
+- files/wp-config.php: WordPress configuration (DB credentials)
+- files/.htaccess: Apache/OLS rewrite rules (if exists)
+- database.sql: Database dump
+- backup_info.txt: This information file
+EOF
+else
+    cat > "$INFO_FILE" << EOF
+WordPress Docker Backup Information
+===================================
+
+Backup Date: $(date)
+WordPress Directory: $WORDPRESS_DIR
+Docker-compose Directory: $DOCKER_COMPOSE_DIR
+Database Type: $DB_TYPE
+Database Container: $DB_CONTAINER
+Database Name: $DB_NAME
+Database User: $DB_USER
+Database Host: $DB_HOST
+
+Backup Mode: Full
 Backup Contents:
 - files/: Complete WordPress file structure
 - database.sql: Database dump
 - backup_info.txt: This information file
 EOF
+fi
 
 log_message "Backup information file created"
 

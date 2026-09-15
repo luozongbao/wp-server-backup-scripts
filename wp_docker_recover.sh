@@ -9,6 +9,7 @@ BACKUP_FILE=""
 WORDPRESS_DIR=""
 DOCKER_COMPOSE_DIR=""
 SHOW_HELP=false
+BACKUP_MODE=""
 
 # Function to display help
 show_help() {
@@ -125,6 +126,15 @@ extract_backup() {
         return 1
     fi
     
+    # Detect backup mode (lightweight vs full)
+    if [ -f "$temp_dir/files/.backup_mode" ]; then
+        BACKUP_MODE="lightweight"
+        log_message "Detected backup mode: LIGHTWEIGHT (wp-content + wp-config.php + .htaccess)"
+    else
+        BACKUP_MODE="full"
+        log_message "Detected backup mode: FULL (complete WordPress directory)"
+    fi
+    
     # Check if files directory contains WordPress files
     local wp_files_dir=$(find "$temp_dir/files" -name "wp-config.php" -type f | head -1)
     if [ -z "$wp_files_dir" ]; then
@@ -223,39 +233,125 @@ restore_files() {
     local backup_wp_dir="$1"
     local target_dir="$2"
     
-    log_message "Restoring WordPress files..."
-    
-    # Create target directory if it doesn't exist
-    if [ ! -d "$target_dir" ]; then
-        log_message "Creating WordPress directory: $target_dir"
-        mkdir -p "$target_dir"
-        if [ $? -ne 0 ]; then
-            log_message "ERROR: Failed to create WordPress directory"
+    if [ "$BACKUP_MODE" = "lightweight" ]; then
+        log_message "Restoring WordPress files (lightweight mode)..."
+        
+        # Create target directory if it doesn't exist
+        if [ ! -d "$target_dir" ]; then
+            log_message "Creating WordPress directory: $target_dir"
+            mkdir -p "$target_dir"
+            if [ $? -ne 0 ]; then
+                log_message "ERROR: Failed to create WordPress directory"
+                return 1
+            fi
+            NEW_DIR=true
+        else
+            NEW_DIR=false
+        fi
+        
+        # For lightweight restore, we MUST have an existing WordPress core
+        if [ "$NEW_DIR" = false ] && [ ! -d "$target_dir/wp-includes" ]; then
+            log_message "WARNING: Target directory exists but does not appear to be a WordPress installation (no wp-includes found)."
+            log_message "         Lightweight backup only contains wp-content + wp-config.php + .htaccess."
+            log_message "         You need to install WordPress core first, then run this restore again."
+            log_message "         Or use a full backup to restore the entire WordPress installation."
             return 1
         fi
-    else
-        log_message "WARNING: Target directory exists. Contents will be replaced."
-        # Backup existing directory
-        local backup_existing="$target_dir.backup.$(date +%Y%m%d_%H%M%S)"
-        log_message "Creating backup of existing directory: $backup_existing"
-        if ! mv "$target_dir" "$backup_existing"; then
-            log_message "ERROR: Failed to backup existing directory"
+        
+        # Restore wp-content directory
+        if [ -d "$backup_wp_dir/wp-content" ]; then
+            # Backup existing wp-content if exists
+            if [ -d "$target_dir/wp-content" ]; then
+                local wp_content_backup="$target_dir/wp-content.backup.$(date +%Y%m%d_%H%M%S)"
+                log_message "Backing up existing wp-content to: $wp_content_backup"
+                mv "$target_dir/wp-content" "$wp_content_backup"
+            fi
+            
+            if cp -r "$backup_wp_dir/wp-content" "$target_dir/"; then
+                log_message "wp-content restored successfully"
+            else
+                log_message "ERROR: Failed to restore wp-content"
+                return 1
+            fi
+        else
+            log_message "WARNING: wp-content not found in backup"
+        fi
+        
+        # Restore wp-config.php
+        if [ -f "$backup_wp_dir/wp-config.php" ]; then
+            # Backup existing wp-config.php if exists
+            if [ -f "$target_dir/wp-config.php" ]; then
+                local wp_config_backup="$target_dir/wp-config.php.backup.$(date +%Y%m%d_%H%M%S)"
+                log_message "Backing up existing wp-config.php to: $wp_config_backup"
+                mv "$target_dir/wp-config.php" "$wp_config_backup"
+            fi
+            
+            if cp "$backup_wp_dir/wp-config.php" "$target_dir/"; then
+                log_message "wp-config.php restored successfully"
+            else
+                log_message "ERROR: Failed to restore wp-config.php"
+                return 1
+            fi
+        else
+            log_message "ERROR: wp-config.php not found in backup"
             return 1
         fi
-        mkdir -p "$target_dir"
-    fi
-    
-    # Copy WordPress files from backup
-    if cp -r "$backup_wp_dir"/* "$target_dir"/; then
-        log_message "WordPress files restored successfully"
+        
+        # Restore .htaccess if exists in backup
+        if [ -f "$backup_wp_dir/.htaccess" ]; then
+            if [ -f "$target_dir/.htaccess" ]; then
+                local htaccess_backup="$target_dir/.htaccess.backup.$(date +%Y%m%d_%H%M%S)"
+                log_message "Backing up existing .htaccess to: $htaccess_backup"
+                mv "$target_dir/.htaccess" "$htaccess_backup"
+            fi
+            
+            if cp "$backup_wp_dir/.htaccess" "$target_dir/"; then
+                log_message ".htaccess restored successfully"
+            else
+                log_message "WARNING: Failed to restore .htaccess (non-critical)"
+            fi
+        fi
         
         # Calculate restored files size
         local files_size=$(du -sh "$target_dir" | cut -f1)
-        log_message "Restored WordPress files size: $files_size"
+        log_message "Restored WordPress size: $files_size"
+        log_message "IMPORTANT: Make sure WordPress core files are installed and match the version used during backup."
         return 0
     else
-        log_message "ERROR: Failed to restore WordPress files"
-        return 1
+        log_message "Restoring WordPress files (full mode)..."
+        
+        # Create target directory if it doesn't exist
+        if [ ! -d "$target_dir" ]; then
+            log_message "Creating WordPress directory: $target_dir"
+            mkdir -p "$target_dir"
+            if [ $? -ne 0 ]; then
+                log_message "ERROR: Failed to create WordPress directory"
+                return 1
+            fi
+        else
+            log_message "WARNING: Target directory exists. Contents will be replaced."
+            # Backup existing directory
+            local backup_existing="$target_dir.backup.$(date +%Y%m%d_%H%M%S)"
+            log_message "Creating backup of existing directory: $backup_existing"
+            if ! mv "$target_dir" "$backup_existing"; then
+                log_message "ERROR: Failed to backup existing directory"
+                return 1
+            fi
+            mkdir -p "$target_dir"
+        fi
+        
+        # Copy WordPress files from backup
+        if cp -r "$backup_wp_dir"/* "$target_dir"/; then
+            log_message "WordPress files restored successfully"
+            
+            # Calculate restored files size
+            local files_size=$(du -sh "$target_dir" | cut -f1)
+            log_message "Restored WordPress files size: $files_size"
+            return 0
+        else
+            log_message "ERROR: Failed to restore WordPress files"
+            return 1
+        fi
     fi
 }
 
@@ -390,6 +486,10 @@ fi
 log_message "WordPress Docker recovery completed successfully!"
 log_message "WordPress files restored to: $WORDPRESS_DIR"
 log_message "Database '$DB_NAME' restored to container '$DB_CONTAINER'"
+log_message "Backup mode: $([ "$BACKUP_MODE" = "lightweight" ] && echo "Lightweight" || echo "Full")"
 log_message ""
 log_message "IMPORTANT: Please verify your WordPress installation and update file permissions if needed."
 log_message "           You may need to restart your Docker containers to apply changes."
+if [ "$BACKUP_MODE" = "lightweight" ]; then
+    log_message "           This was a lightweight restore - ensure WordPress core files exist and match the backup version."
+fi
