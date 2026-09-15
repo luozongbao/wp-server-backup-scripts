@@ -29,7 +29,7 @@ SKIP_FILES=false            # If true, skip file restoration
 SKIP_DB=false               # If true, skip database restoration
 DRY_RUN=false               # If true, print actions without executing
 FIX_MODE=false              # If true, skip restore entirely; only run post-restore customizations
-                            # (URL/title/admin/disable-plugins) against the live site. In this mode
+                            # (URL/title/admin) against the live site. In this mode
                             # -b is OPTIONAL (no backup needed) and -w is required so we can read
                             # wp-config.php to get DB credentials from the live installation.
 
@@ -48,7 +48,7 @@ show_help() {
     echo ""
     echo "Modes:"
     echo "  -f, --fix-mode       Fix mode: do NOT restore files or database. Only run"
-    echo "                       post-restore customizations (-u, -t, -A, -d) against the"
+    echo "                       post-restore customizations (-u, -t, -A) against the"
     echo "                       live site. -b is not needed; DB credentials are read from"
     echo "                       the live WordPress installation at -w."
     echo ""
@@ -59,7 +59,6 @@ show_help() {
     echo "  -A ADMIN_USER        Create/update admin user with this username"
     echo "  -P ADMIN_PASSWORD    Admin user password (requires -A)"
     echo "  -E ADMIN_EMAIL       Admin user email (requires -A)"
-    echo "  -d PLUGIN_LIST       Disable plugins (comma-separated slugs)"
     echo ""
     echo "Restore Scope:"
     echo "  --skip-files         Skip file restoration (DB only)"
@@ -94,9 +93,6 @@ show_help() {
     echo ""
     echo "  # FIX MODE: change site title only"
     echo "  $0 -f -w /var/www/html/wordpress -t 'My New Site'"
-    echo ""
-    echo "  # FIX MODE: disable plugins on live site (dry-run preview)"
-    echo "  $0 -f -w /var/www/html/wordpress -d wordfence,akismet --dry-run"
     echo ""
     echo "Features:"
     echo "  - Auto-detects Docker containers or native database services"
@@ -1318,7 +1314,6 @@ if [ "$FIX_MODE" = true ]; then
     update_database_urls
     update_site_title
     update_admin_user
-    disable_plugins_list
     log_message "Fix-mode customizations completed"
 elif [ "$SKIP_DB" = true ]; then
     log_message ""
@@ -1330,7 +1325,6 @@ else
         update_database_urls
         update_site_title
         update_admin_user
-        disable_plugins_list
         log_message "Post-restore customizations completed"
     fi
 fi
