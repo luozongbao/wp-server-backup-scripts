@@ -830,15 +830,50 @@ restore_files() {
             mkdir -p "$target_dir"
         fi
         
-        # Copy WordPress files from backup
-        if cp -r "$backup_wp_dir"/* "$target_dir"/; then
+        # Copy WordPress files from backup.
+        # IMPORTANT: 'cp -r src/* dest/' does NOT match dotfiles (.htaccess, .user.ini, .gitignore, etc.)
+        # because shell glob '*' excludes hidden files by default. We must use 'src/.' to include
+        # all entries — both regular and dotfiles. Without this fix, .htaccess is silently dropped.
+        # Also enable dotglob as a belt-and-suspenders measure in case the source path itself
+        # is expanded via a different mechanism.
+        shopt -s dotglob
+        if cp -r "$backup_wp_dir"/. "$target_dir"/; then
+            shopt -u dotglob
             log_message "WordPress files restored successfully"
-            
+
+            # Verify dotfiles (e.g. .htaccess) actually made it across — a missing
+            # .htaccess will silently break pretty-permalinks on Apache/OLS.
+            local missing_dotfiles=()
+            for df in "$backup_wp_dir"/.[!.]*; do
+                [ -e "$df" ] || continue
+                local base
+                base=$(basename "$df")
+                if [ ! -e "$target_dir/$base" ]; then
+                    missing_dotfiles+=("$base")
+                fi
+            done
+            if [ ${#missing_dotfiles[@]} -ne 0 ]; then
+                log_message "WARNING: Dotfiles missing in restored target: ${missing_dotfiles[*]}"
+                log_message "         Trying to copy them individually..."
+                local still_missing=()
+                for base in "${missing_dotfiles[@]}"; do
+                    if ! cp -r "$backup_wp_dir/$base" "$target_dir/" 2>/dev/null; then
+                        still_missing+=("$base")
+                    fi
+                done
+                if [ ${#still_missing[@]} -ne 0 ]; then
+                    log_message "ERROR: Failed to restore dotfiles: ${still_missing[*]}"
+                    return 1
+                fi
+                log_message "Dotfiles recovered: ${missing_dotfiles[*]}"
+            fi
+
             # Calculate restored files size
             local files_size=$(du -sh "$target_dir" | cut -f1)
             log_message "Restored WordPress files size: $files_size"
             return 0
         else
+            shopt -u dotglob
             log_message "ERROR: Failed to restore WordPress files"
             return 1
         fi
