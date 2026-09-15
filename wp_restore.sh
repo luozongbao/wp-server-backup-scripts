@@ -24,25 +24,38 @@ ADMIN_EMAIL=""              # Admin email (requires ADMIN_USER)
 SKIP_FILES=false            # If true, skip file restoration
 SKIP_DB=false               # If true, skip database restoration
 DRY_RUN=false               # If true, print actions without executing
+FIX_MODE=false              # If true, skip restore entirely; only run post-restore customizations
+                            # (URL/title/admin/disable-plugins) against the live site. In this mode
+                            # -b is OPTIONAL (no backup needed) and -w is required so we can read
+                            # wp-config.php to get DB credentials from the live installation.
 
 # Function to display help
 show_help() {
     echo "WordPress Restore Script"
     echo "=================================="
     echo ""
-    echo "Usage: $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]"
+    echo "Usage:"
+    echo "  Restore mode:   $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]"
+    echo "  Fix mode (-f):  $0 -f -w WORDPRESS_DIR [post-restore options]"
     echo ""
-    echo "Required Options:"
-    echo "  -b BACKUP_FILE       Path to the backup ZIP file (required)"
-    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (required)"
+    echo "Required Options (restore mode):"
+    echo "  -b BACKUP_FILE       Path to the backup ZIP file (required unless -f)"
+    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (always required)"
+    echo ""
+    echo "Modes:"
+    echo "  -f, --fix-mode       Fix mode: do NOT restore files or database. Only run"
+    echo "                       post-restore customizations (-u, -t, -A, -d) against the"
+    echo "                       live site. -b is not needed; DB credentials are read from"
+    echo "                       the live WordPress installation at -w."
     echo ""
     echo "Post-Restore Customization:"
     echo "  -u NEW_URL           Replace site URL throughout database (e.g., http://localhost:8088)"
-    echo "  -U OLD_URL           Old URL to search for (default: auto-detect from backup)"
+    echo "  -U OLD_URL           Old URL to search for (default: auto-detect from backup or live site)"
     echo "  -t NEW_TITLE         Set new site title (updates 'blogname' option)"
     echo "  -A ADMIN_USER        Create/update admin user with this username"
     echo "  -P ADMIN_PASSWORD    Admin user password (requires -A)"
     echo "  -E ADMIN_EMAIL       Admin user email (requires -A)"
+    echo "  -d PLUGIN_LIST       Disable plugins (comma-separated slugs)"
     echo ""
     echo "Restore Scope:"
     echo "  --skip-files         Skip file restoration (DB only)"
@@ -67,15 +80,32 @@ show_help() {
     echo "  # Preview restore without making changes"
     echo "  $0 -b /backups/backup.zip -w /var/www/html/wordpress --dry-run"
     echo ""
+    echo "  # FIX MODE: change live site URL only (no restore, no backup needed)"
+    echo "  $0 -f -w /var/www/html/wordpress \\"
+    echo "     -U https://oldsite.com -u https://newsite.com"
+    echo ""
+    echo "  # FIX MODE: reset admin password on live site"
+    echo "  $0 -f -w /var/www/html/wordpress \\"
+    echo "     -A newadmin -P 'SecurePass123' -E admin@example.com"
+    echo ""
+    echo "  # FIX MODE: change site title only"
+    echo "  $0 -f -w /var/www/html/wordpress -t 'My New Site'"
+    echo ""
+    echo "  # FIX MODE: disable plugins on live site (dry-run preview)"
+    echo "  $0 -f -w /var/www/html/wordpress -d wordfence,akismet --dry-run"
+    echo ""
     echo "Features:"
     echo "  - Auto-detects Docker containers or native database services"
     echo "  - Supports both MySQL and MariaDB"
     echo "  - Restores both WordPress files and database from backup"
     echo "  - Handles environment-specific restoration methods"
     echo "  - Optional URL/title/admin replacement after restore"
+    echo "  - Fix mode (-f) for site maintenance without a full restore"
     echo ""
-    echo "Note: This script will restore both WordPress files and database from the backup."
-    echo "      Existing files and database content will be replaced!"
+    echo "Note: This script will restore both WordPress files and database from the backup"
+    echo "      unless -f (fix mode) is used, in which case only the requested customizations"
+    echo "      are applied to the live site."
+    echo "      In restore mode, existing files and database content will be replaced!"
     echo "      For Docker environments, containers must be running before restoration."
 }
 
@@ -450,6 +480,27 @@ detect_old_url() {
         fi
     fi
 
+    return 1
+}
+
+# Function to detect old URL from the LIVE WordPress database (fix mode).
+# Reads the 'siteurl' option from the live DB using already-extracted credentials.
+# Falls back to the existing detect_old_url() (which needs the SQL dump) if that fails.
+detect_old_url_from_live_db() {
+    # Need DB credentials to be extracted first; bail out if not.
+    if [ -z "$DB_NAME" ]; then
+        return 1
+    fi
+    # Try siteurl first; if missing, fall back to home.
+    local detected
+    detected=$(run_db_query_capture "SELECT option_value FROM $(get_table_prefix)options WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null | tail -1 | tr -d '\r')
+    if [ -z "$detected" ]; then
+        detected=$(run_db_query_capture "SELECT option_value FROM $(get_table_prefix)options WHERE option_name='home' LIMIT 1;" 2>/dev/null | tail -1 | tr -d '\r')
+    fi
+    if [ -n "$detected" ]; then
+        echo "$detected"
+        return 0
+    fi
     return 1
 }
 
@@ -881,8 +932,8 @@ restore_files() {
 }
 
 # Parse command line arguments
-# Allow long options: --skip-files, --skip-db, --dry-run
-ARGS=$(getopt -o "b:w:u:U:t:A:P:E:h" -l "skip-files,skip-db,dry-run" -- "$@" 2>/dev/null)
+# Allow long options: --skip-files, --skip-db, --dry-run, --fix-mode
+ARGS=$(getopt -o "b:w:u:U:t:A:P:E:fh" -l "skip-files,skip-db,dry-run,fix-mode" -- "$@" 2>/dev/null)
 if [ $? -ne 0 ]; then
     show_help
     exit 1
@@ -923,6 +974,10 @@ while [ $# -gt 0 ]; do
             ADMIN_EMAIL="$2"
             shift 2
             ;;
+        -f)
+            FIX_MODE=true
+            shift
+            ;;
         -h)
             SHOW_HELP=true
             shift
@@ -937,6 +992,10 @@ while [ $# -gt 0 ]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --fix-mode)
+            FIX_MODE=true
             shift
             ;;
         --)
@@ -956,19 +1015,43 @@ if [ "$SHOW_HELP" = true ]; then
     exit 0
 fi
 
-# Validate required parameters
-if [ -z "$BACKUP_FILE" ]; then
-    echo "ERROR: Missing required parameter -b (backup file)"
-    echo ""
-    show_help
-    exit 1
-fi
+# Validate required parameters based on mode
+if [ "$FIX_MODE" = true ]; then
+    # Fix mode: -w required, -b NOT required, at least one post-restore option required
+    if [ -z "$WORDPRESS_DIR" ]; then
+        echo "ERROR: Fix mode (-f) requires -w WORDPRESS_DIR"
+        echo ""
+        show_help
+        exit 1
+    fi
+    if [ -n "$BACKUP_FILE" ]; then
+        log_message "NOTE: -b ignored in fix mode (-f)"
+    fi
+    if [ -z "$NEW_URL" ] && [ -z "$NEW_TITLE" ] && [ -z "$ADMIN_USER" ]; then
+        echo "ERROR: Fix mode requires at least one post-restore option: -u, -t, or -A"
+        echo ""
+        show_help
+        exit 1
+    fi
+    # --skip-files / --skip-db are meaningless in fix mode
+    if [ "$SKIP_FILES" = true ] || [ "$SKIP_DB" = true ]; then
+        log_message "NOTE: --skip-files / --skip-db ignored in fix mode (-f)"
+    fi
+else
+    # Restore mode: -b and -w both required
+    if [ -z "$BACKUP_FILE" ]; then
+        echo "ERROR: Missing required parameter -b (backup file). Use -f for fix mode."
+        echo ""
+        show_help
+        exit 1
+    fi
 
-if [ -z "$WORDPRESS_DIR" ]; then
-    echo "ERROR: Missing required parameter -w (WordPress directory)"
-    echo ""
-    show_help
-    exit 1
+    if [ -z "$WORDPRESS_DIR" ]; then
+        echo "ERROR: Missing required parameter -w (WordPress directory)"
+        echo ""
+        show_help
+        exit 1
+    fi
 fi
 
 # Validate backup file
@@ -1029,20 +1112,55 @@ cleanup() {
 # Set trap to cleanup on exit
 trap cleanup EXIT
 
-# Extract and validate backup
-if ! extract_backup "$BACKUP_FILE" "$TEMP_DIR"; then
-    log_message "ERROR: Failed to extract or validate backup"
-    exit 1
+if [ "$FIX_MODE" = true ]; then
+    # ========================================================================
+    # FIX MODE: skip backup extraction and file/database restore entirely.
+    # Read credentials from the LIVE WordPress installation, then apply the
+    # requested post-restore customizations against the live database.
+    # ========================================================================
+    log_message "========================================================================"
+    log_message "FIX MODE (-f): applying post-restore customizations to LIVE site"
+    log_message "No files or database will be restored."
+    log_message "========================================================================"
+
+    # In fix mode, we need at least one post-restore option (already validated),
+    # and we need the live wp-config.php to read DB credentials.
+    if [ ! -f "$WORDPRESS_DIR/wp-config.php" ]; then
+        log_message "ERROR: wp-config.php not found in $WORDPRESS_DIR"
+        log_message "       Fix mode requires an existing WordPress installation with wp-config.php"
+        exit 1
+    fi
+
+    # Read DB credentials directly from the live wp-config.php (not from backup).
+    TEMP_DIR=""  # No temp dir needed in fix mode; suppress cleanup confusion
+    if ! extract_db_config "$WORDPRESS_DIR"; then
+        log_message "ERROR: Failed to extract database configuration from live wp-config.php"
+        exit 1
+    fi
+    TEMP_DIR=$(mktemp -d)  # Provide an empty TEMP_DIR for any helpers that touch it
+
+    # URL auto-detection in fix mode reads 'siteurl' from the live DB
+    # (update_database_urls() will pick this up if OLD_URL is empty).
+else
+    # ========================================================================
+    # RESTORE MODE: extract backup, read credentials from backup's wp-config.
+    # ========================================================================
+
+    # Extract and validate backup
+    if ! extract_backup "$BACKUP_FILE" "$TEMP_DIR"; then
+        log_message "ERROR: Failed to extract or validate backup"
+        exit 1
+    fi
+
+    # Extract database configuration from backup
+    if ! extract_db_config "$BACKUP_WP_DIR"; then
+        log_message "ERROR: Failed to extract database configuration"
+        exit 1
+    fi
 fi
 
-# Extract database configuration from backup
-if ! extract_db_config "$BACKUP_WP_DIR"; then
-    log_message "ERROR: Failed to extract database configuration"
-    exit 1
-fi
-
-# Validate conflicting flags
-if [ "$SKIP_FILES" = true ] && [ "$SKIP_DB" = true ]; then
+# Validate conflicting flags (restore mode only — fix mode flags already warned above)
+if [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" = true ] && [ "$SKIP_DB" = true ]; then
     log_message "ERROR: --skip-files and --skip-db cannot be used together"
     exit 1
 fi
@@ -1051,19 +1169,22 @@ fi
 if [ "$DRY_RUN" = true ]; then
     log_message ""
     log_message "========== DRY-RUN PLAN =========="
-    log_message "Backup file:        $BACKUP_FILE"
+    log_message "Mode:               $([ "$FIX_MODE" = true ] && echo "FIX (no restore, only customizations)" || echo "RESTORE")"
+    if [ "$FIX_MODE" != true ]; then
+        log_message "Backup file:        $BACKUP_FILE"
+        log_message "Backup mode:        $([ "$BACKUP_MODE" = "lightweight" ] && echo "Lightweight" || echo "Full")"
+        log_message "Restore DB:         $([ "$SKIP_DB" = true ] && echo "NO (--skip-db)" || echo "YES")"
+        log_message "Restore files:      $([ "$SKIP_FILES" = true ] && echo "NO (--skip-files)" || echo "YES")"
+    fi
     log_message "Target dir:         $WORDPRESS_DIR"
     log_message "Environment:        $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER)" || echo "Native ($DB_TYPE)")"
     log_message "Database:           $DB_NAME @ $DB_HOST"
-    log_message "Backup mode:        $([ "$BACKUP_MODE" = "lightweight" ] && echo "Lightweight" || echo "Full")"
-    log_message "Restore DB:         $([ "$SKIP_DB" = true ] && echo "NO (--skip-db)" || echo "YES")"
-    log_message "Restore files:      $([ "$SKIP_FILES" = true ] && echo "NO (--skip-files)" || echo "YES")"
     [ -n "$NEW_URL" ] && log_message "URL replacement:    ${OLD_URL:-<auto-detect>} -> $NEW_URL"
     [ -n "$NEW_TITLE" ] && log_message "Site title:         $NEW_TITLE"
     [ -n "$ADMIN_USER" ] && log_message "Admin user:         $ADMIN_USER <$ADMIN_EMAIL>"
     log_message "================================="
     log_message ""
-    log_message "No changes were made. Remove --dry-run to perform the actual restore."
+    log_message "No changes were made. Remove --dry-run to perform the actual run."
     log_message "[DRY-RUN] Post-restore customizations would now be applied:"
     [ -n "$NEW_URL" ] && log_message "  - URL replacement: ${OLD_URL:-<auto-detect>} -> $NEW_URL"
     [ -n "$NEW_TITLE" ] && log_message "  - Site title: $NEW_TITLE"
@@ -1074,9 +1195,11 @@ fi
 # Print dry-run summary if enabled (already handled before this point; kept for safety)
 # Note: DRY-RUN exits early at the top of this block to avoid modifying anything.
 
-# Restore database based on environment
+# RESTORE-ONLY: database restoration (skip in fix mode)
 SQL_FILE="$TEMP_DIR/database.sql"
-if [ "$SKIP_DB" = true ]; then
+if [ "$FIX_MODE" = true ]; then
+    log_message "Skipping database restore (fix mode)"
+elif [ "$SKIP_DB" = true ]; then
     log_message "Skipping database restoration (--skip-db)"
 else
     if [ "$IS_DOCKER" = true ]; then
@@ -1092,8 +1215,10 @@ else
     fi
 fi
 
-# Restore WordPress files
-if [ "$SKIP_FILES" = true ]; then
+# RESTORE-ONLY: file restoration (skip in fix mode)
+if [ "$FIX_MODE" = true ]; then
+    log_message "Skipping file restore (fix mode)"
+elif [ "$SKIP_FILES" = true ]; then
     log_message "Skipping file restoration (--skip-files)"
 else
     if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
@@ -1102,16 +1227,30 @@ else
     fi
 fi
 
-# Post-restore customizations (only if DB was restored and we have data to modify)
-if [ "$SKIP_DB" = true ]; then
+# Post-restore customizations.
+# - In fix mode: always run them (that's the whole point of fix mode).
+# - In restore mode: skip if --skip-db was used.
+# - With --dry-run: already exited above, so we always run real actions here.
+if [ "$FIX_MODE" = true ]; then
+    log_message ""
+    log_message "Applying fix-mode customizations to live site..."
+    # Auto-detect OLD_URL from live DB if not specified (fix-mode-specific)
+    if [ -z "$OLD_URL" ] && [ -n "$NEW_URL" ]; then
+        local detected_live
+        detected_live=$(detect_old_url_from_live_db)
+        if [ -n "$detected_live" ]; then
+            OLD_URL="$detected_live"
+            log_message "Auto-detected old URL from live DB: $OLD_URL"
+        fi
+    fi
+    update_database_urls
+    update_site_title
+    update_admin_user
+    disable_plugins_list
+    log_message "Fix-mode customizations completed"
+elif [ "$SKIP_DB" = true ]; then
     log_message ""
     log_message "Skipping post-restore customizations (--skip-db was used)"
-elif [ "$DRY_RUN" = true ]; then
-    log_message ""
-    log_message "[DRY-RUN] Post-restore customizations would now be applied:"
-    [ -n "$NEW_URL" ] && log_message "  - URL replacement: $OLD_URL -> $NEW_URL"
-    [ -n "$NEW_TITLE" ] && log_message "  - Site title: $NEW_TITLE"
-    [ -n "$ADMIN_USER" ] && log_message "  - Admin user: $ADMIN_USER <$ADMIN_EMAIL>"
 else
     if [ -n "$NEW_URL" ] || [ -n "$NEW_TITLE" ] || [ -n "$ADMIN_USER" ]; then
         log_message ""
@@ -1119,20 +1258,31 @@ else
         update_database_urls
         update_site_title
         update_admin_user
+        disable_plugins_list
         log_message "Post-restore customizations completed"
     fi
 fi
 
-log_message "WordPress Restore completed successfully!"
-log_message "WordPress files restored to: $WORDPRESS_DIR"
-log_message "Database '$DB_NAME' restored successfully"
-log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER container)" || echo "Native ($DB_TYPE service)")"
-log_message "Backup mode: $([ "$BACKUP_MODE" = "lightweight" ] && echo "Lightweight" || echo "Full")"
-log_message ""
-log_message "IMPORTANT: Please verify your WordPress installation and update file permissions if needed."
-if [ "$IS_DOCKER" = true ]; then
-    log_message "           You may need to restart your Docker containers to apply changes."
-fi
-if [ "$BACKUP_MODE" = "lightweight" ]; then
-    log_message "           This was a lightweight restore - ensure WordPress core files exist and match the backup version."
+if [ "$FIX_MODE" = true ]; then
+    log_message ""
+    log_message "========================================================================"
+    log_message "FIX MODE completed"
+    log_message "Live site at: $WORDPRESS_DIR"
+    log_message "Database '$DB_NAME' modified"
+    log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER container)" || echo "Native ($DB_TYPE service)")"
+    log_message "========================================================================"
+else
+    log_message "WordPress Restore completed successfully!"
+    log_message "WordPress files restored to: $WORDPRESS_DIR"
+    log_message "Database '$DB_NAME' restored successfully"
+    log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER container)" || echo "Native ($DB_TYPE service)")"
+    log_message "Backup mode: $([ "$BACKUP_MODE" = "lightweight" ] && echo "Lightweight" || echo "Full")"
+    log_message ""
+    log_message "IMPORTANT: Please verify your WordPress installation and update file permissions if needed."
+    if [ "$IS_DOCKER" = true ]; then
+        log_message "           You may need to restart your Docker containers to apply changes."
+    fi
+    if [ "$BACKUP_MODE" = "lightweight" ]; then
+        log_message "           This was a lightweight restore - ensure WordPress core files exist and match the backup version."
+    fi
 fi
