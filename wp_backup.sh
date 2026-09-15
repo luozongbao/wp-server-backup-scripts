@@ -1,42 +1,50 @@
 #!/bin/bash
 
-# WordPress Docker Backup Script
-# Creates a backup of WordPress files and database running in Docker containers
-# Usage: ./wp-docker-backup.sh -w /path/to/wordpress [-o /path/to/backup/output] [-d /path/to/docker-compose]
+# WordPress Backup Script
+# Creates a backup of WordPress files and database
+# Auto-detects Docker or native database services
+# Usage: ./wp_backup.sh -w /path/to/wordpress [-o /path/to/backup/output] [-l] [-h]
 
 # Default values
 WORDPRESS_DIR=""
 OUTPUT_DIR="$(pwd)"
-DOCKER_COMPOSE_DIR=""
 SHOW_HELP=false
+DB_TYPE=""
+DB_CONTAINER=""
+DB_DUMP_CMD=""
+IS_DOCKER=false
 LIGHTWEIGHT=false
 
 # Function to display help
 show_help() {
-    echo "WordPress Docker Backup Script"
-    echo "=============================="
+    echo "WordPress Backup Script"
+    echo "================================"
     echo ""
-    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-d DOCKER_COMPOSE_DIR] [-l]"
+    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-h]"
     echo ""
     echo "Options:"
-    echo "  -w WORDPRESS_DIR       Path to the WordPress installation directory (required)"
-    echo "  -o OUTPUT_DIR          Path to the backup output directory (optional, default: current directory)"
-    echo "  -d DOCKER_COMPOSE_DIR  Path to the docker-compose.yml directory (optional, default: same as WordPress directory)"
-    echo "  -l                     Lightweight mode: backup only wp-content, wp-config.php,"
-    echo "                         and .htaccess (optional, default: full backup)"
-    echo "  -h                     Show this help message"
+    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (required)"
+    echo "  -o OUTPUT_DIR        Path to the backup output directory (optional, default: current directory)"
+    echo "  -l                   Lightweight mode: backup only wp-content, wp-config.php,"
+    echo "                       and .htaccess (optional, default: full backup)"
+    echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 -w /var/www/html/wordpress"
     echo "  $0 -w /var/www/html/wordpress -o /backups"
-    echo "  $0 -w /var/www/html/wordpress -d /docker/wordpress -o /backups"
+    echo "  $0 -w /home/user/website -o /home/user/backups"
     echo "  $0 -w /var/www/html/wordpress -l -o /backups    (lightweight mode)"
     echo ""
     echo "Output format: [timestamp]_[wordpress-folder-name].zip"
     echo "Example: 20250530_143022_wordpress.zip"
     echo "          20250530_143022_wordpress_lightweight.zip (lightweight mode)"
     echo ""
-    echo "Note: This script detects MariaDB/MySQL from docker-compose.yml and uses appropriate dump commands."
+    echo "Features:"
+    echo "  - Auto-detects Docker containers or native database services"
+    echo "  - Supports both MySQL and MariaDB"
+    echo "  - Full mode: backs up entire WordPress directory + database"
+    echo "  - Lightweight mode: backs up wp-content + wp-config.php + .htaccess + database"
+    echo "  - Verifies backup integrity"
 }
 
 # Function to log messages
@@ -52,12 +60,25 @@ check_dependencies() {
         missing_tools+=("zip")
     fi
     
-    if ! command -v docker &> /dev/null; then
-        missing_tools+=("docker")
-    fi
-    
-    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
-        missing_tools+=("docker-compose")
+    if [ "$IS_DOCKER" = true ]; then
+        if ! command -v docker &> /dev/null; then
+            missing_tools+=("docker")
+        fi
+        
+        if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+            missing_tools+=("docker-compose")
+        fi
+    else
+        # Check for native database dump tools
+        if [ "$DB_TYPE" = "mariadb" ]; then
+            if ! command -v mariadb-dump &> /dev/null; then
+                missing_tools+=("mariadb-dump")
+            fi
+        else
+            if ! command -v mysqldump &> /dev/null; then
+                missing_tools+=("mysqldump")
+            fi
+        fi
     fi
     
     if [ ${#missing_tools[@]} -ne 0 ]; then
@@ -67,25 +88,70 @@ check_dependencies() {
     fi
 }
 
-# Function to detect database type and container from docker-compose.yml
-detect_database_info() {
-    local compose_file="$1/docker-compose.yml"
+# Function to detect if WordPress is running in Docker
+detect_docker_environment() {
+    log_message "Checking for Docker environment..."
+    
+    # Check for docker-compose.yml in WordPress directory or parent directories
+    local current_dir="$WORDPRESS_DIR"
+    local compose_file=""
+    
+    # Search for docker-compose.yml in current and parent directories
+    for i in {0..3}; do
+        if [ -f "$current_dir/docker-compose.yml" ]; then
+            compose_file="$current_dir/docker-compose.yml"
+            break
+        fi
+        current_dir=$(dirname "$current_dir")
+        if [ "$current_dir" = "/" ]; then
+            break
+        fi
+    done
+    
+    if [ -n "$compose_file" ]; then
+        log_message "Found docker-compose.yml at: $compose_file"
+        
+        # Check if the compose file contains database services
+        if grep -qi "mariadb\|mysql" "$compose_file"; then
+            IS_DOCKER=true
+            DOCKER_COMPOSE_DIR=$(dirname "$compose_file")
+            log_message "Detected Docker environment with database service"
+            return 0
+        fi
+    fi
+    
+    # Check for running WordPress-related Docker containers
+    if command -v docker &> /dev/null; then
+        local wp_containers=$(docker ps --format "table {{.Names}}" | grep -E "(wordpress|wp|mysql|mariadb)" 2>/dev/null || true)
+        if [ -n "$wp_containers" ]; then
+            log_message "Found WordPress-related Docker containers running"
+            IS_DOCKER=true
+            return 0
+        fi
+    fi
+    
+    log_message "No Docker environment detected, using native database services"
+    IS_DOCKER=false
+    return 1
+}
+
+# Function to detect database type and container (for Docker)
+detect_docker_database_info() {
+    local compose_file="$DOCKER_COMPOSE_DIR/docker-compose.yml"
     
     if [ ! -f "$compose_file" ]; then
-        log_message "ERROR: docker-compose.yml not found in $1"
+        log_message "ERROR: docker-compose.yml not found in $DOCKER_COMPOSE_DIR"
         return 1
     fi
     
     log_message "Analyzing docker-compose.yml for database configuration..."
     
-    # Detect database type and container name
+    # Detect database type
     if grep -qi "mariadb" "$compose_file"; then
         DB_TYPE="mariadb"
-        DB_DUMP_CMD="mariadb-dump"
         log_message "Detected database type: MariaDB"
     elif grep -qi "mysql" "$compose_file"; then
         DB_TYPE="mysql"
-        DB_DUMP_CMD="mysqldump"
         log_message "Detected database type: MySQL"
     else
         log_message "ERROR: Could not detect database type (MariaDB/MySQL) in docker-compose.yml"
@@ -93,19 +159,76 @@ detect_database_info() {
     fi
     
     # Find database container name
-    DB_CONTAINER=$(grep -A 10 -B 5 "$DB_TYPE" "$compose_file" | grep -E "container_name:|service:" | head -1 | sed 's/.*container_name:\s*\|.*:\s*//' | tr -d '"' | tr -d "'")
-    
-    if [ -z "$DB_CONTAINER" ]; then
+    local container_line=$(grep -A 10 -B 5 "$DB_TYPE" "$compose_file" | grep -E "container_name:" | head -1)
+    if [ -n "$container_line" ]; then
+        DB_CONTAINER=$(echo "$container_line" | sed 's/.*container_name:\s*//' | tr -d '"' | tr -d "'" | xargs)
+    else
         # Try to find service name if container_name is not specified
         DB_CONTAINER=$(grep -B 5 -A 10 "$DB_TYPE" "$compose_file" | grep -E "^\s*[a-zA-Z0-9_-]+:" | head -1 | sed 's/:\s*$//' | sed 's/^\s*//')
-        if [ -z "$DB_CONTAINER" ]; then
-            log_message "ERROR: Could not determine database container name"
-            return 1
-        fi
+    fi
+    
+    if [ -z "$DB_CONTAINER" ]; then
+        log_message "ERROR: Could not determine database container name"
+        return 1
     fi
     
     log_message "Database container: $DB_CONTAINER"
     return 0
+}
+
+# Function to detect native database service type
+detect_native_database_service() {
+    log_message "Attempting to auto-detect native database service..."
+    
+    # Method 1: Check running processes
+    if pgrep -f "mariadb\|mysqld.*mariadb" > /dev/null; then
+        DB_TYPE="mariadb"
+        log_message "Detected MariaDB from running processes"
+        return 0
+    elif pgrep -f "mysqld" > /dev/null; then
+        DB_TYPE="mysql"
+        log_message "Detected MySQL from running processes"
+        return 0
+    fi
+    
+    # Method 2: Check installed packages (Debian/Ubuntu)
+    if command -v dpkg &> /dev/null; then
+        if dpkg -l | grep -q "mariadb-server\|mariadb-client"; then
+            DB_TYPE="mariadb"
+            log_message "Detected MariaDB from installed packages"
+            return 0
+        elif dpkg -l | grep -q "mysql-server\|mysql-client"; then
+            DB_TYPE="mysql"
+            log_message "Detected MySQL from installed packages"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Check for MariaDB-specific command
+    if command -v mariadb &> /dev/null || command -v mariadb-dump &> /dev/null; then
+        DB_TYPE="mariadb"
+        log_message "Detected MariaDB from available commands"
+        return 0
+    fi
+    
+    # Method 4: Try connecting and check version
+    if command -v mysql &> /dev/null; then
+        local version_output=$(mysql --version 2>/dev/null)
+        if echo "$version_output" | grep -qi "mariadb"; then
+            DB_TYPE="mariadb"
+            log_message "Detected MariaDB from version output"
+            return 0
+        else
+            DB_TYPE="mysql"
+            log_message "Detected MySQL from version output"
+            return 0
+        fi
+    fi
+    
+    # Default fallback
+    log_message "Could not auto-detect database service, defaulting to MySQL"
+    DB_TYPE="mysql"
+    return 1
 }
 
 # Function to extract database configuration from wp-config.php
@@ -123,20 +246,18 @@ extract_db_config() {
     DB_PASSWORD=$(grep "define.*DB_PASSWORD" "$wp_config" | sed -n "s/.*DB_PASSWORD.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_HOST=$(grep "define.*DB_HOST" "$wp_config" | sed -n "s/.*DB_HOST.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     
-    if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ]; then
+    if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ] || [ -z "$DB_HOST" ]; then
         log_message "ERROR: Could not extract database configuration from wp-config.php"
         return 1
     fi
     
     log_message "Database configuration extracted successfully"
-    log_message "Database: $DB_NAME"
-    log_message "User: $DB_USER"
-    log_message "Host: $DB_HOST"
+    log_message "Database: $DB_NAME on $DB_HOST"
     return 0
 }
 
-# Function to create database backup using Docker
-backup_database() {
+# Function to create database backup (Docker)
+backup_database_docker() {
     local output_file="$1"
     
     log_message "Creating database backup using Docker..."
@@ -177,8 +298,48 @@ backup_database() {
             return 1
         fi
     else
-        log_message "ERROR: Failed to create database backup"
+        log_message "ERROR: Failed to create database backup using Docker"
         log_message "Please check database credentials and container status"
+        return 1
+    fi
+}
+
+# Function to create database backup (Native)
+backup_database_native() {
+    local output_file="$1"
+    
+    log_message "Creating database backup using native $DB_TYPE..."
+    
+    # Create database dump command based on service type
+    local dump_cmd=""
+    if [ "$DB_TYPE" = "mariadb" ]; then
+        dump_cmd="mariadb-dump -h$DB_HOST -u$DB_USER"
+    else
+        dump_cmd="mysqldump -h$DB_HOST -u$DB_USER"
+    fi
+    
+    if [ -n "$DB_PASSWORD" ]; then
+        dump_cmd="$dump_cmd -p$DB_PASSWORD"
+    fi
+    
+    dump_cmd="$dump_cmd --single-transaction --routines --triggers $DB_NAME"
+    
+    # Execute database dump
+    if eval "$dump_cmd" > "$output_file" 2>/dev/null; then
+        log_message "Database backup created successfully: $output_file"
+        
+        # Check if backup file has content
+        if [ -s "$output_file" ]; then
+            local backup_size=$(du -h "$output_file" | cut -f1)
+            log_message "Database backup size: $backup_size"
+            return 0
+        else
+            log_message "ERROR: Database backup file is empty"
+            return 1
+        fi
+    else
+        log_message "ERROR: Failed to create database backup using native $DB_TYPE"
+        log_message "Please check database credentials and service availability"
         return 1
     fi
 }
@@ -235,7 +396,7 @@ backup_files() {
     else
         log_message "Creating full files backup..."
         
-        # Copy WordPress files to temporary directory
+        # Copy entire WordPress directory
         if cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null; then
             log_message "WordPress files copied successfully"
             
@@ -251,16 +412,13 @@ backup_files() {
 }
 
 # Parse command line arguments
-while getopts "w:o:d:lh" opt; do
+while getopts "w:o:lh" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
             ;;
         o)
             OUTPUT_DIR="$OPTARG"
-            ;;
-        d)
-            DOCKER_COMPOSE_DIR="$OPTARG"
             ;;
         l)
             LIGHTWEIGHT=true
@@ -295,11 +453,6 @@ if [ -z "$WORDPRESS_DIR" ]; then
     exit 1
 fi
 
-# Set default docker-compose directory if not specified
-if [ -z "$DOCKER_COMPOSE_DIR" ]; then
-    DOCKER_COMPOSE_DIR="$WORDPRESS_DIR"
-fi
-
 # Validate WordPress directory
 if [ ! -d "$WORDPRESS_DIR" ]; then
     log_message "ERROR: WordPress directory does not exist: $WORDPRESS_DIR"
@@ -311,11 +464,8 @@ if [ ! -f "$WORDPRESS_DIR/wp-config.php" ]; then
     exit 1
 fi
 
-# Validate docker-compose directory
-if [ ! -d "$DOCKER_COMPOSE_DIR" ]; then
-    log_message "ERROR: Docker-compose directory does not exist: $DOCKER_COMPOSE_DIR"
-    exit 1
-fi
+# Convert to absolute path
+WORDPRESS_DIR=$(cd "$WORDPRESS_DIR" && pwd)
 
 # Validate output directory
 if [ ! -d "$OUTPUT_DIR" ]; then
@@ -327,9 +477,22 @@ if [ ! -d "$OUTPUT_DIR" ]; then
     fi
 fi
 
-# Convert OUTPUT_DIR to absolute path
-if [[ ! "$OUTPUT_DIR" = /* ]]; then
-    OUTPUT_DIR="$(pwd)/$OUTPUT_DIR"
+# Convert to absolute path
+OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
+
+# Detect environment (Docker or Native)
+detect_docker_environment
+
+# Detect database configuration based on environment
+if [ "$IS_DOCKER" = true ]; then
+    if ! detect_docker_database_info; then
+        log_message "ERROR: Failed to detect Docker database configuration"
+        exit 1
+    fi
+else
+    if ! detect_native_database_service; then
+        log_message "WARNING: Database service auto-detection may not be accurate"
+    fi
 fi
 
 # Check dependencies
@@ -345,12 +508,13 @@ else
 fi
 BACKUP_PATH="$OUTPUT_DIR/$BACKUP_FILENAME"
 
-log_message "Starting WordPress Docker backup process"
+log_message "Starting WordPress Backup process"
 log_message "WordPress directory: $WORDPRESS_DIR"
-log_message "Docker-compose directory: $DOCKER_COMPOSE_DIR"
 log_message "Output directory: $OUTPUT_DIR"
 log_message "Backup filename: $BACKUP_FILENAME"
-log_message "Backup mode: $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight" || echo "Full")"
+log_message "Backup mode: $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight (wp-content + wp-config.php + .htaccess)" || echo "Full (entire WordPress directory)")"
+log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker" || echo "Native")"
+log_message "Database type: $DB_TYPE"
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
@@ -365,23 +529,24 @@ cleanup() {
 # Set trap to cleanup on exit
 trap cleanup EXIT
 
-# Detect database information from docker-compose.yml
-if ! detect_database_info "$DOCKER_COMPOSE_DIR"; then
-    log_message "ERROR: Failed to detect database information"
-    exit 1
-fi
-
-# Extract database configuration from wp-config.php
+# Extract database configuration
 if ! extract_db_config "$WORDPRESS_DIR"; then
     log_message "ERROR: Failed to extract database configuration"
     exit 1
 fi
 
-# Create database backup
+# Create database backup based on environment
 DB_BACKUP_FILE="$TEMP_DIR/database.sql"
-if ! backup_database "$DB_BACKUP_FILE"; then
-    log_message "ERROR: Database backup failed"
-    exit 1
+if [ "$IS_DOCKER" = true ]; then
+    if ! backup_database_docker "$DB_BACKUP_FILE"; then
+        log_message "ERROR: Docker database backup failed"
+        exit 1
+    fi
+else
+    if ! backup_database_native "$DB_BACKUP_FILE"; then
+        log_message "ERROR: Native database backup failed"
+        exit 1
+    fi
 fi
 
 # Create files backup
@@ -390,65 +555,19 @@ if ! backup_files "$WORDPRESS_DIR" "$TEMP_DIR"; then
     exit 1
 fi
 
-# Create a backup info file
-INFO_FILE="$TEMP_DIR/backup_info.txt"
-if [ "$LIGHTWEIGHT" = true ]; then
-    cat > "$INFO_FILE" << EOF
-WordPress Docker Backup Information
-===================================
-
-Backup Date: $(date)
-WordPress Directory: $WORDPRESS_DIR
-Docker-compose Directory: $DOCKER_COMPOSE_DIR
-Database Type: $DB_TYPE
-Database Container: $DB_CONTAINER
-Database Name: $DB_NAME
-Database User: $DB_USER
-Database Host: $DB_HOST
-
-Backup Mode: Lightweight
-Backup Contents:
-- files/wp-content/: WordPress content directory (themes, plugins, uploads)
-- files/wp-config.php: WordPress configuration (DB credentials)
-- files/.htaccess: Apache/OLS rewrite rules (if exists)
-- database.sql: Database dump
-- backup_info.txt: This information file
-EOF
-else
-    cat > "$INFO_FILE" << EOF
-WordPress Docker Backup Information
-===================================
-
-Backup Date: $(date)
-WordPress Directory: $WORDPRESS_DIR
-Docker-compose Directory: $DOCKER_COMPOSE_DIR
-Database Type: $DB_TYPE
-Database Container: $DB_CONTAINER
-Database Name: $DB_NAME
-Database User: $DB_USER
-Database Host: $DB_HOST
-
-Backup Mode: Full
-Backup Contents:
-- files/: Complete WordPress file structure
-- database.sql: Database dump
-- backup_info.txt: This information file
-EOF
-fi
-
-log_message "Backup information file created"
-
 # Create final zip archive
 log_message "Creating final backup archive..."
-log_message "Temporary directory: $TEMP_DIR"
-log_message "Backup path: $BACKUP_PATH"
-
 cd "$TEMP_DIR"
-log_message "Changed to temporary directory: $(pwd)"
-log_message "Contents of temp directory:"
-ls -la
-log_message "Running zip command: zip -r \"$BACKUP_PATH\" ."
-if zip -r "$BACKUP_PATH" .; then
+
+# Check if the backup path is valid
+if [ ! -d "$(dirname "$BACKUP_PATH")" ]; then
+    log_message "ERROR: Backup directory does not exist: $(dirname "$BACKUP_PATH")"
+    exit 1
+fi
+
+# Create zip archive with better error handling
+zip_output=$(zip -r "$BACKUP_PATH" . 2>&1)
+if [ $? -eq 0 ]; then
     log_message "Backup completed successfully!"
     log_message "Backup file: $BACKUP_PATH"
     
@@ -457,6 +576,7 @@ if zip -r "$BACKUP_PATH" .; then
     log_message "Total backup size: $BACKUP_SIZE"
 else
     log_message "ERROR: Failed to create backup archive"
+    log_message "Zip error: $zip_output"
     exit 1
 fi
 
@@ -468,5 +588,5 @@ else
     log_message "WARNING: Backup integrity verification failed"
 fi
 
-log_message "WordPress Docker backup process completed successfully"
-log_message "Backup location: $BACKUP_PATH"
+log_message "WordPress Backup process completed"
+log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER container)" || echo "Native ($DB_TYPE service)")"
