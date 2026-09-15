@@ -14,27 +14,65 @@ DB_CONTAINER=""
 IS_DOCKER=false
 BACKUP_MODE=""
 
+# Post-restore customization options
+NEW_URL=""                  # Replace site URL throughout database (e.g., http://localhost:8088)
+OLD_URL=""                  # Old URL to search for (auto-detected from backup if empty)
+NEW_TITLE=""                # New site title (updates blogname option)
+ADMIN_USER=""               # New admin username to create/update
+ADMIN_PASSWORD=""           # Admin password (requires ADMIN_USER)
+ADMIN_EMAIL=""              # Admin email (requires ADMIN_USER)
+SKIP_FILES=false            # If true, skip file restoration
+SKIP_DB=false               # If true, skip database restoration
+DRY_RUN=false               # If true, print actions without executing
+
 # Function to display help
 show_help() {
     echo "WordPress Restore Script"
     echo "=================================="
     echo ""
-    echo "Usage: $0 -b BACKUP_FILE -w WORDPRESS_DIR [-h]"
+    echo "Usage: $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]"
     echo ""
-    echo "Options:"
+    echo "Required Options:"
     echo "  -b BACKUP_FILE       Path to the backup ZIP file (required)"
     echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (required)"
+    echo ""
+    echo "Post-Restore Customization:"
+    echo "  -u NEW_URL           Replace site URL throughout database (e.g., http://localhost:8088)"
+    echo "  -U OLD_URL           Old URL to search for (default: auto-detect from backup)"
+    echo "  -t NEW_TITLE         Set new site title (updates 'blogname' option)"
+    echo "  -A ADMIN_USER        Create/update admin user with this username"
+    echo "  -P ADMIN_PASSWORD    Admin user password (requires -A)"
+    echo "  -E ADMIN_EMAIL       Admin user email (requires -A)"
+    echo ""
+    echo "Restore Scope:"
+    echo "  --skip-files         Skip file restoration (DB only)"
+    echo "  --skip-db            Skip database restoration (files only)"
+    echo "  --dry-run            Show what would be done without executing"
+    echo ""
+    echo "Other:"
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
+    echo "  # Basic restore (auto-detects environment AND backup mode)"
     echo "  $0 -b /backups/20250530_143022_wordpress.zip -w /var/www/html/wordpress"
-    echo "  $0 -b /backups/backup.zip -w /home/user/website"
+    echo ""
+    echo "  # Restore and change URL to new domain"
+    echo "  $0 -b /backups/backup.zip -w /var/www/html/wordpress \\"
+    echo "     -U https://oldsite.com -u https://newsite.com"
+    echo ""
+    echo "  # Restore and set site title + new admin user"
+    echo "  $0 -b /backups/backup.zip -w /var/www/html/wordpress \\"
+    echo "     -t 'My New Site' -A newadmin -P 'SecurePass123' -E admin@example.com"
+    echo ""
+    echo "  # Preview restore without making changes"
+    echo "  $0 -b /backups/backup.zip -w /var/www/html/wordpress --dry-run"
     echo ""
     echo "Features:"
     echo "  - Auto-detects Docker containers or native database services"
     echo "  - Supports both MySQL and MariaDB"
     echo "  - Restores both WordPress files and database from backup"
     echo "  - Handles environment-specific restoration methods"
+    echo "  - Optional URL/title/admin replacement after restore"
     echo ""
     echo "Note: This script will restore both WordPress files and database from the backup."
     echo "      Existing files and database content will be replaced!"
@@ -388,6 +426,297 @@ restore_database_native() {
     fi
 }
 
+# Function to detect old URL from backup's wp_options
+detect_old_url() {
+    local wp_config_path="$1"
+
+    # Try to extract siteurl from the SQL file in the backup
+    if [ -f "$TEMP_DIR/database.sql" ]; then
+        local detected_url
+        detected_url=$(grep -oE "siteurl.*'https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null | head -1 | grep -oE "https?://[^']+")
+        if [ -n "$detected_url" ]; then
+            echo "$detected_url"
+            return 0
+        fi
+    fi
+
+    # Fallback: try to read wp-config.php DB_HOST as a hint (less reliable)
+    if [ -f "$wp_config_path" ]; then
+        local db_host
+        db_host=$(grep -E "DB_HOST" "$wp_config_path" 2>/dev/null | head -1 | grep -oE "'[^']+'" | tr -d "'")
+        if [ -n "$db_host" ] && [ "$db_host" != "localhost" ] && [ "$db_host" != "127.0.0.1" ]; then
+            echo "http://$db_host"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Function to build the mysql/mariadb client command for queries
+build_db_query_cmd() {
+    # Outputs the prefix command to run a query against the DB.
+    # Caller is responsible for appending the SQL.
+
+    if [ "$IS_DOCKER" = true ]; then
+        local cmd="docker exec -i $DB_CONTAINER"
+        if [ "$DB_TYPE" = "mariadb" ]; then
+            cmd="$cmd mariadb"
+        else
+            cmd="$cmd mysql"
+        fi
+        cmd="$cmd -u$DB_USER"
+        [ -n "$DB_PASSWORD" ] && cmd="$cmd -p$DB_PASSWORD"
+        cmd="$cmd -N -B $DB_NAME"
+        echo "$cmd"
+    else
+        local cmd=""
+        if [ "$DB_TYPE" = "mariadb" ]; then
+            cmd="mariadb"
+        else
+            cmd="mysql"
+        fi
+        cmd="$cmd -h$DB_HOST -u$DB_USER"
+        [ -n "$DB_PASSWORD" ] && cmd="$cmd -p$DB_PASSWORD"
+        cmd="$cmd -N -B $DB_NAME"
+        echo "$cmd"
+    fi
+}
+
+# Function to run a SQL query against the restored database
+# Uses temp file + pipe to avoid bash eval double-interpreting '$' in passwords/hashes
+# IMPORTANT: build_db_query_cmd already includes 'docker exec' for Docker env,
+# so do NOT wrap it again — just pipe into it as stdin to mariadb/mysql.
+run_db_query() {
+    local query="$1"
+    local db_cmd
+    db_cmd=$(build_db_query_cmd)
+    local query_file
+    query_file=$(mktemp)
+    # Write query to file with no shell expansion (printf preserves $ literally)
+    printf '%s\n' "$query" > "$query_file"
+    # Pipe into the command; db_cmd ends with the DB name (no -e flag)
+    $db_cmd < "$query_file" 2>/dev/null
+    local rc=$?
+    rm -f "$query_file"
+    return $rc
+}
+
+# Function to capture output of a SQL query (for SELECT statements)
+run_db_query_capture() {
+    local query="$1"
+    local db_cmd
+    db_cmd=$(build_db_query_cmd)
+    local query_file
+    query_file=$(mktemp)
+    printf '%s\n' "$query" > "$query_file"
+    local output
+    output=$($db_cmd < "$query_file" 2>/dev/null)
+    rm -f "$query_file"
+    echo "$output"
+}
+
+# Function to update URLs throughout the database
+update_database_urls() {
+    if [ -z "$NEW_URL" ]; then
+        return 0
+    fi
+
+    # Auto-detect OLD_URL if not specified
+    if [ -z "$OLD_URL" ]; then
+        local detected
+        detected=$(detect_old_url "$TEMP_DIR/files/wp-config.php")
+        if [ -n "$detected" ]; then
+            OLD_URL="$detected"
+            log_message "Auto-detected old URL from backup: $OLD_URL"
+        else
+            log_message "WARNING: Could not auto-detect old URL; using NEW_URL as-is for siteurl/home only"
+            # Without OLD_URL we can only set siteurl/home directly
+            run_db_query "UPDATE $(get_table_prefix)options SET option_value='$NEW_URL' WHERE option_name IN ('siteurl', 'home');"
+            log_message "Updated siteurl/home to: $NEW_URL"
+            return 0
+        fi
+    fi
+
+    if [ "$OLD_URL" = "$NEW_URL" ]; then
+        log_message "Old and new URL are identical; skipping URL replacement"
+        return 0
+    fi
+
+    log_message "Replacing URLs in database:"
+    log_message "  From: $OLD_URL"
+    log_message "  To:   $NEW_URL"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would replace '$OLD_URL' with '$NEW_URL' in all wp_options, wp_posts, wp_postmeta, wp_comments, wp_commentmeta, wp_links, wp_term_taxonomy, wp_usermeta"
+        return 0
+    fi
+
+    local table_prefix
+    table_prefix=$(get_table_prefix)
+
+    # Tables that commonly contain URLs (serialized data needs careful handling)
+    local tables=(
+        "${table_prefix}options"
+        "${table_prefix}posts"
+        "${table_prefix}postmeta"
+        "${table_prefix}comments"
+        "${table_prefix}commentmeta"
+        "${table_prefix}links"
+        "${table_prefix}term_taxonomy"
+        "${table_prefix}usermeta"
+    )
+
+    # Replace in plain text columns (posts.guid, posts.post_content, posts.post_excerpt, etc.)
+    run_db_query "UPDATE ${table_prefix}posts SET guid = REPLACE(guid, '$OLD_URL', '$NEW_URL'), post_content = REPLACE(post_content, '$OLD_URL', '$NEW_URL'), post_excerpt = REPLACE(post_excerpt, '$OLD_URL', '$NEW_URL');"
+    run_db_query "UPDATE ${table_prefix}options SET option_value = REPLACE(option_value, '$OLD_URL', '$NEW_URL');"
+    run_db_query "UPDATE ${table_prefix}postmeta SET meta_value = REPLACE(meta_value, '$OLD_URL', '$NEW_URL');"
+    run_db_query "UPDATE ${table_prefix}comments SET comment_content = REPLACE(comment_content, '$OLD_URL', '$NEW_URL'), comment_author_url = REPLACE(comment_author_url, '$OLD_URL', '$NEW_URL');"
+    run_db_query "UPDATE ${table_prefix}commentmeta SET meta_value = REPLACE(meta_value, '$OLD_URL', '$NEW_URL');"
+    run_db_query "UPDATE ${table_prefix}links SET link_url = REPLACE(link_url, '$OLD_URL', '$NEW_URL'), link_image = REPLACE(link_image, '$OLD_URL', '$NEW_URL');"
+    run_db_query "UPDATE ${table_prefix}usermeta SET meta_value = REPLACE(meta_value, '$OLD_URL', '$NEW_URL');"
+
+    log_message "URL replacement completed"
+}
+
+# Function to get WordPress table prefix from wp-config.php in restored files
+get_table_prefix() {
+    local wp_config="$WORDPRESS_DIR/wp-config.php"
+    if [ -f "$wp_config" ]; then
+        local prefix
+        prefix=$(grep -E "\\\$table_prefix" "$wp_config" 2>/dev/null | head -1 | sed -E "s/.*table_prefix[[:space:]]*=[[:space:]]*['\"]([^'\"]+)['\"].*/\1/")
+        if [ -n "$prefix" ]; then
+            echo "$prefix"
+            return 0
+        fi
+    fi
+    # Default WordPress prefix
+    echo "wp_"
+}
+
+# Function to update site title (blogname option)
+update_site_title() {
+    if [ -z "$NEW_TITLE" ]; then
+        return 0
+    fi
+
+    log_message "Updating site title to: $NEW_TITLE"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would set blogname option to '$NEW_TITLE'"
+        return 0
+    fi
+
+    local table_prefix
+    table_prefix=$(get_table_prefix)
+    local escaped_title="${NEW_TITLE//\'/\'\'}"
+    run_db_query "UPDATE ${table_prefix}options SET option_value='$escaped_title' WHERE option_name='blogname';"
+    log_message "Site title updated"
+}
+
+# Function to create or update admin user
+update_admin_user() {
+    if [ -z "$ADMIN_USER" ]; then
+        return 0
+    fi
+
+    if [ -z "$ADMIN_PASSWORD" ] || [ -z "$ADMIN_EMAIL" ]; then
+        log_message "ERROR: -A ADMIN_USER requires both -P ADMIN_PASSWORD and -E ADMIN_EMAIL"
+        return 1
+    fi
+
+    log_message "Setting up admin user: $ADMIN_USER <$ADMIN_EMAIL>"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would create or update admin user '$ADMIN_USER' with email '$ADMIN_EMAIL'"
+        return 0
+    fi
+
+    local table_prefix
+    table_prefix=$(get_table_prefix)
+
+    # WordPress password hashing using PHP (must run inside a container that has PHP)
+    # PHP is typically in the web server container (OLS/Apache/nginx), not the DB container.
+    # We try: 1) user-supplied $PHP_CONTAINER, 2) auto-detect from compose, 3) fallback list, 4) host php
+    local wp_hash
+    local php_container=""
+    if [ -n "$PHP_CONTAINER" ]; then
+        php_container="$PHP_CONTAINER"
+    elif [ -n "$COMPOSE_DIR" ]; then
+        # Auto-detect web server container from docker-compose.yml (skip db/mariadb/mysql/postgres)
+        php_container=$(cd "$COMPOSE_DIR" && docker compose ps --services 2>/dev/null | grep -vE '^(db|database|mariadb|mysql|postgres|redis)' | head -1)
+        if [ -n "$php_container" ]; then
+            php_container=$(cd "$COMPOSE_DIR" && docker compose ps -q "$php_container" 2>/dev/null)
+        fi
+    fi
+    # Fallback: try common web container names
+    if [ -z "$php_container" ] || ! docker exec "$php_container" which php >/dev/null 2>&1; then
+        for try in wordpress web app nginx apache httpd ols lsws; do
+            local cid
+            cid=$(docker ps -q -f "name=$try" 2>/dev/null | head -1)
+            if [ -n "$cid" ] && docker exec "$cid" which php >/dev/null 2>&1; then
+                php_container="$cid"
+                break
+            fi
+        done
+    fi
+
+    if [ "$IS_DOCKER" = true ] && [ -n "$php_container" ] && docker exec "$php_container" which php >/dev/null 2>&1; then
+        wp_hash=$(docker exec "$php_container" php -r "echo password_hash(getenv('WP_ADMIN_PASS'), PASSWORD_BCRYPT);" 2>/dev/null < <(echo "$ADMIN_PASSWORD"))
+        # The above passes password via stdin env-substitution; safer approach: write to temp file
+        local pass_file
+        pass_file=$(mktemp)
+        chmod 600 "$pass_file"
+        printf '%s' "$ADMIN_PASSWORD" > "$pass_file"
+        wp_hash=$(docker exec -i "$php_container" php -r "\$p = trim(file_get_contents('php://stdin')); echo password_hash(\$p, PASSWORD_BCRYPT);" < "$pass_file" 2>/dev/null)
+        rm -f "$pass_file"
+    elif command -v php >/dev/null 2>&1; then
+        wp_hash=$(php -r "echo password_hash(getenv('WP_ADMIN_PASS'), PASSWORD_BCRYPT);" 2>/dev/null < <(echo "$ADMIN_PASSWORD"))
+    else
+        log_message "ERROR: PHP not found (tried: compose web service, common names, host). Cannot hash password."
+        log_message "       Install php-cli on host (e.g., 'sudo apt install php-cli') or set PHP_CONTAINER env var."
+        return 1
+    fi
+
+    if [ -z "$wp_hash" ]; then
+        log_message "ERROR: Failed to generate password hash (PHP not available?)"
+        return 1
+    fi
+
+    # Escape single quotes in hash and email for SQL safety
+    local safe_hash="${wp_hash//\'/\'\'}"
+    local safe_email="${ADMIN_EMAIL//\'/\'\'}"
+    local safe_user="${ADMIN_USER//\'/\'\'}"
+
+    # Check if user already exists
+    local existing_id
+    existing_id=$(run_db_query_capture "SELECT ID FROM ${table_prefix}users WHERE user_login='$safe_user' LIMIT 1;")
+
+    if [ -n "$existing_id" ]; then
+        log_message "User '$ADMIN_USER' exists (ID=$existing_id); updating password and email"
+        run_db_query "UPDATE ${table_prefix}users SET user_pass='$safe_hash', user_email='$safe_email' WHERE ID=$existing_id;"
+    else
+        log_message "Creating new admin user '$ADMIN_USER'"
+        local registered
+        registered=$(date '+%Y-%m-%d %H:%M:%S')
+        run_db_query "INSERT INTO ${table_prefix}users (user_login, user_pass, user_nicename, user_email, user_registered, user_status, display_name) VALUES ('$safe_user', '$safe_hash', '$safe_user', '$safe_email', '$registered', 0, '$safe_user');"
+        existing_id=$(run_db_query_capture "SELECT ID FROM ${table_prefix}users WHERE user_login='$safe_user' LIMIT 1;")
+    fi
+
+    if [ -z "$existing_id" ]; then
+        log_message "ERROR: Failed to create or find user '$ADMIN_USER'"
+        return 1
+    fi
+
+    # Ensure user has administrator role
+    run_db_query "DELETE FROM ${table_prefix}usermeta WHERE user_id=$existing_id AND meta_key='${table_prefix}capabilities';"
+    run_db_query "INSERT INTO ${table_prefix}usermeta (user_id, meta_key, meta_value) VALUES ($existing_id, '${table_prefix}capabilities', 'a:1:{s:13:\"administrator\";b:1;}');"
+    run_db_query "DELETE FROM ${table_prefix}usermeta WHERE user_id=$existing_id AND meta_key='${table_prefix}user_level';"
+    run_db_query "INSERT INTO ${table_prefix}usermeta (user_id, meta_key, meta_value) VALUES ($existing_id, '${table_prefix}user_level', '10');"
+
+    log_message "Admin user '$ADMIN_USER' (ID=$existing_id) is configured as administrator"
+}
+
 # Function to restore WordPress files
 restore_files() {
     local backup_wp_dir="$1"
@@ -517,24 +846,69 @@ restore_files() {
 }
 
 # Parse command line arguments
-while getopts "b:w:h" opt; do
-    case $opt in
-        b)
-            BACKUP_FILE="$OPTARG"
+# Allow long options: --skip-files, --skip-db, --dry-run
+ARGS=$(getopt -o "b:w:u:U:t:A:P:E:h" -l "skip-files,skip-db,dry-run" -- "$@" 2>/dev/null)
+if [ $? -ne 0 ]; then
+    show_help
+    exit 1
+fi
+eval set -- "$ARGS"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -b)
+            BACKUP_FILE="$2"
+            shift 2
             ;;
-        w)
-            WORDPRESS_DIR="$OPTARG"
+        -w)
+            WORDPRESS_DIR="$2"
+            shift 2
             ;;
-        h)
+        -u)
+            NEW_URL="$2"
+            shift 2
+            ;;
+        -U)
+            OLD_URL="$2"
+            shift 2
+            ;;
+        -t)
+            NEW_TITLE="$2"
+            shift 2
+            ;;
+        -A)
+            ADMIN_USER="$2"
+            shift 2
+            ;;
+        -P)
+            ADMIN_PASSWORD="$2"
+            shift 2
+            ;;
+        -E)
+            ADMIN_EMAIL="$2"
+            shift 2
+            ;;
+        -h)
             SHOW_HELP=true
+            shift
             ;;
-        \?)
-            echo "Invalid option: -$OPTARG" >&2
-            show_help
-            exit 1
+        --skip-files)
+            SKIP_FILES=true
+            shift
             ;;
-        :)
-            echo "Option -$OPTARG requires an argument." >&2
+        --skip-db)
+            SKIP_DB=true
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --)
+            shift
+            ;;
+        *)
+            echo "Invalid option: $1" >&2
             show_help
             exit 1
             ;;
@@ -571,6 +945,12 @@ fi
 # Check if backup file is a valid ZIP
 if ! unzip -t "$BACKUP_FILE" >/dev/null 2>&1; then
     log_message "ERROR: Invalid or corrupted backup file: $BACKUP_FILE"
+    exit 1
+fi
+
+# Validate conflicting flags
+if [ "$SKIP_FILES" = true ] && [ "$SKIP_DB" = true ]; then
+    log_message "ERROR: --skip-files and --skip-db cannot be used together"
     exit 1
 fi
 
@@ -626,24 +1006,86 @@ if ! extract_db_config "$BACKUP_WP_DIR"; then
     exit 1
 fi
 
+# Validate conflicting flags
+if [ "$SKIP_FILES" = true ] && [ "$SKIP_DB" = true ]; then
+    log_message "ERROR: --skip-files and --skip-db cannot be used together"
+    exit 1
+fi
+
+# Print dry-run summary and EXIT before any modifications
+if [ "$DRY_RUN" = true ]; then
+    log_message ""
+    log_message "========== DRY-RUN PLAN =========="
+    log_message "Backup file:        $BACKUP_FILE"
+    log_message "Target dir:         $WORDPRESS_DIR"
+    log_message "Environment:        $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER)" || echo "Native ($DB_TYPE)")"
+    log_message "Database:           $DB_NAME @ $DB_HOST"
+    log_message "Backup mode:        $([ "$BACKUP_MODE" = "lightweight" ] && echo "Lightweight" || echo "Full")"
+    log_message "Restore DB:         $([ "$SKIP_DB" = true ] && echo "NO (--skip-db)" || echo "YES")"
+    log_message "Restore files:      $([ "$SKIP_FILES" = true ] && echo "NO (--skip-files)" || echo "YES")"
+    [ -n "$NEW_URL" ] && log_message "URL replacement:    ${OLD_URL:-<auto-detect>} -> $NEW_URL"
+    [ -n "$NEW_TITLE" ] && log_message "Site title:         $NEW_TITLE"
+    [ -n "$ADMIN_USER" ] && log_message "Admin user:         $ADMIN_USER <$ADMIN_EMAIL>"
+    log_message "================================="
+    log_message ""
+    log_message "No changes were made. Remove --dry-run to perform the actual restore."
+    log_message "[DRY-RUN] Post-restore customizations would now be applied:"
+    [ -n "$NEW_URL" ] && log_message "  - URL replacement: ${OLD_URL:-<auto-detect>} -> $NEW_URL"
+    [ -n "$NEW_TITLE" ] && log_message "  - Site title: $NEW_TITLE"
+    [ -n "$ADMIN_USER" ] && log_message "  - Admin user: $ADMIN_USER <$ADMIN_EMAIL>"
+    exit 0
+fi
+
+# Print dry-run summary if enabled (already handled before this point; kept for safety)
+# Note: DRY-RUN exits early at the top of this block to avoid modifying anything.
+
 # Restore database based on environment
 SQL_FILE="$TEMP_DIR/database.sql"
-if [ "$IS_DOCKER" = true ]; then
-    if ! restore_database_docker "$SQL_FILE"; then
-        log_message "ERROR: Docker database restoration failed"
-        exit 1
-    fi
+if [ "$SKIP_DB" = true ]; then
+    log_message "Skipping database restoration (--skip-db)"
 else
-    if ! restore_database_native "$SQL_FILE"; then
-        log_message "ERROR: Native database restoration failed"
-        exit 1
+    if [ "$IS_DOCKER" = true ]; then
+        if ! restore_database_docker "$SQL_FILE"; then
+            log_message "ERROR: Docker database restoration failed"
+            exit 1
+        fi
+    else
+        if ! restore_database_native "$SQL_FILE"; then
+            log_message "ERROR: Native database restoration failed"
+            exit 1
+        fi
     fi
 fi
 
 # Restore WordPress files
-if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
-    log_message "ERROR: Files restoration failed"
-    exit 1
+if [ "$SKIP_FILES" = true ]; then
+    log_message "Skipping file restoration (--skip-files)"
+else
+    if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
+        log_message "ERROR: Files restoration failed"
+        exit 1
+    fi
+fi
+
+# Post-restore customizations (only if DB was restored and we have data to modify)
+if [ "$SKIP_DB" = true ]; then
+    log_message ""
+    log_message "Skipping post-restore customizations (--skip-db was used)"
+elif [ "$DRY_RUN" = true ]; then
+    log_message ""
+    log_message "[DRY-RUN] Post-restore customizations would now be applied:"
+    [ -n "$NEW_URL" ] && log_message "  - URL replacement: $OLD_URL -> $NEW_URL"
+    [ -n "$NEW_TITLE" ] && log_message "  - Site title: $NEW_TITLE"
+    [ -n "$ADMIN_USER" ] && log_message "  - Admin user: $ADMIN_USER <$ADMIN_EMAIL>"
+else
+    if [ -n "$NEW_URL" ] || [ -n "$NEW_TITLE" ] || [ -n "$ADMIN_USER" ]; then
+        log_message ""
+        log_message "Applying post-restore customizations..."
+        update_database_urls
+        update_site_title
+        update_admin_user
+        log_message "Post-restore customizations completed"
+    fi
 fi
 
 log_message "WordPress Restore completed successfully!"
