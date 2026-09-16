@@ -3,7 +3,7 @@
 # Webserver Restore Script
 # Restores webserver configuration from a backup created by webserver_backup.sh
 # Supports Apache, OpenLiteSpeed, Nginx — both native and Docker
-# Usage: ./webserver_restore.sh -b /path/to/backup.zip [-f /path/to/target] [-c CONTAINER] [-e EMAIL] [--force] [--dry-run] [--restart] [-h]
+# Usage: ./webserver_restore.sh -b /path/to/backup.zip [-f /path/to/target] [-c CONTAINER] [--force] [--dry-run] [--restart] [-h]
 
 # Default values
 BACKUP_FILE=""
@@ -13,8 +13,6 @@ SHOW_HELP=false
 DRY_RUN=false
 FORCE=false
 ACTION="reload"
-EMAIL_TO=""
-EMAIL_FROM="admin@companydomain.com"
 IS_DOCKER=false
 WEBSERVER_TYPE=""
 DOCKER_COMPOSE_DIR=""
@@ -44,7 +42,6 @@ show_help() {
     echo "  --force              Skip the safety backup of existing target config"
     echo "  --dry-run            Show what would be done without modifying anything"
     echo "  --restart            Hard restart webserver after restore (default: graceful reload)"
-    echo "  -e EMAIL             Send restore report to this email address (optional)"
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
@@ -72,13 +69,17 @@ show_help() {
     echo "Note: Backward compatible with the legacy filename *_webserver_backup.zip —"
     echo "      the script reads .backup_info inside the archive, not the filename."
     echo ""
+    echo "Note: Restore is an interactive operation — logs stream to the terminal so you"
+    echo "      can see preflight warnings, safety backups, and reload results immediately."
+    echo "      Use webserver_backup.sh (-e EMAIL) if you need emailed reports."
+    echo ""
     echo "Features:"
     echo "  - Restores webserver configuration from a backup archive"
     echo "  - Supports native AND Docker targets (auto-detected from backup metadata)"
     echo "  - Safety-backs up existing target config to <target>.backup.<timestamp>"
     echo "  - Verifies integrity of the backup before restoring"
     echo "  - Verifies post-restore presence of key config files"
-    echo "  - Attempts a graceful reload after restore (apache/nginx/openlitespeed)"
+    echo "  - Graceful reload (default) or hard restart (--restart) of the webserver after restore"
     echo ""
     echo "Note: Restoring webserver configuration overwrites the existing config."
     echo "      Existing config is renamed to <target>.backup.<timestamp> first, UNLESS --force is used."
@@ -100,74 +101,9 @@ init_log_file() {
     export LOG_FILE
 }
 
-# Send restore report via email using msmtp
-send_email_notification() {
-    local status="$1"
-    local exit_code="$2"
-
-    if [ -z "$EMAIL_TO" ]; then
-        log_message "Email notification skipped (no recipient specified)"
-        return 0
-    fi
-
-    if ! command -v msmtp &> /dev/null; then
-        log_message "WARNING: msmtp not installed, skipping email notification"
-        return 1
-    fi
-
-    local subject_prefix="[Webserver Restore]"
-    if [ "$status" = "SUCCESS" ]; then
-        local subject="${subject_prefix} ✅ SUCCESS - ${WEBSERVER_TYPE:-unknown} (${BACKUP_TIMESTAMP:-N})"
-    else
-        local subject="${subject_prefix} ❌ FAILED - ${WEBSERVER_TYPE:-unknown} (${BACKUP_TIMESTAMP:-N})"
-    fi
-
-    {
-        echo "From: ${EMAIL_FROM}"
-        echo "To: ${EMAIL_TO}"
-        echo "Subject: ${subject}"
-        echo "Date: $(date -R)"
-        echo "MIME-Version: 1.0"
-        echo "Content-Type: text/plain; charset=utf-8"
-        echo "Content-Transfer-Encoding: 8bit"
-        echo ""
-        echo "Webserver Restore Report"
-        echo "==========================="
-        echo ""
-        echo "Status          : ${status}"
-        echo "Exit code       : ${exit_code}"
-        echo "Webserver type  : ${WEBSERVER_TYPE:-N/A}"
-        echo "Backup file     : ${BACKUP_FILE}"
-        echo "Backup source   : ${BACKUP_SOURCE:-N/A}"
-        echo "Backup env      : ${BACKUP_ENV:-N/A}"
-        echo "Backup host     : ${BACKUP_HOST:-N/A}"
-        echo "Target path     : ${WEBSERVER_DIR:-N/A}"
-        echo "Target container: ${WEBSERVER_CONTAINER:-N/A}"
-        echo "Environment     : $([ "$IS_DOCKER" = true ] && echo "Docker ($WEBSERVER_CONTAINER)" || echo "Native")"
-        echo "Dry-run         : ${DRY_RUN}"
-        echo "Action          : ${ACTION}"
-        echo "Finished at     : $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "Host            : $(hostname)"
-        echo ""
-        if [ -n "${PREFLIGHT_RESULTS:-}" ]; then
-            echo "----- Preflight Checks -----"
-            echo -e "$PREFLIGHT_RESULTS"
-            echo ""
-        fi
-        echo "----- Restore Log -----"
-        if [ -f "$LOG_FILE" ]; then
-            cat "$LOG_FILE"
-        else
-            echo "(no log file found)"
-        fi
-    } | msmtp --account=default "$EMAIL_TO"
-
-    if [ $? -eq 0 ]; then
-        log_message "Restore report sent successfully to ${EMAIL_TO}"
-    else
-        log_message "WARNING: Failed to send restore report to ${EMAIL_TO}"
-    fi
-}
+# (Email notification removed in this version: restore is an interactive operation.
+#  Logs stream to the terminal; the user is expected to be present.
+#  Use webserver_backup.sh -e EMAIL if you need emailed backup reports.)
 
 # Function to check required tools
 check_dependencies() {
@@ -780,7 +716,7 @@ while [[ $# -gt 0 ]]; do
         -b) BACKUP_FILE="$2"; shift 2 ;;
         -f) WEBSERVER_DIR="$2"; shift 2 ;;
         -c) WEBSERVER_CONTAINER="$2"; shift 2 ;;
-        -e) EMAIL_TO="$2"; shift 2 ;;
+        -e) echo "ERROR: -e EMAIL has been removed in this version. Restore logs stream to the terminal — no email option." >&2; exit 1 ;;
         --force) FORCE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         --restart) ACTION="restart"; shift ;;
@@ -837,15 +773,6 @@ TEMP_DIR=$(mktemp -d)
 # Cleanup function
 cleanup() {
     local exit_code=$?
-
-    # Send email notification based on exit code
-    if [ -n "$EMAIL_TO" ] && [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
-        if [ $exit_code -eq 0 ]; then
-            send_email_notification "SUCCESS" "$exit_code"
-        else
-            send_email_notification "FAILED" "$exit_code"
-        fi
-    fi
 
     # On SUCCESS: remove the safety backups we created
     # On FAILURE: preserve them so the user can roll back manually

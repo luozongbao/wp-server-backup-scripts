@@ -340,17 +340,11 @@ The webserver type is embedded in the filename so multi-server backups stay iden
 
 > 💡 **Note**: Restore reads `.backup_info` inside the archive, not the filename — so it accepts both the new `*_<type>_config_backup.zip` format and the legacy `*_webserver_backup.zip` format.
 
-The email report contains:
-- Status indicator (✅ SUCCESS or ❌ FAILED) and exit code
-- Detected webserver type (apache / openlitespeed / nginx)
-- Source directory (or container path)
-- Environment (Docker container name or Native)
-- Backup path, file size, timestamp, hostname
-- Full backup log inlined in the message body
-
 ### webserver_restore.sh
 
 **Purpose**: Restore webserver configuration from a backup created by `webserver_backup.sh`. Mirrors the safety/reporting style of `wp_restore.sh`.
+
+> 💡 **Interactive by design**: Restore is an operation you run while watching the terminal. All logs — preflight warnings, safety backups, file copies, reload results — stream live so you can react immediately. There is intentionally **no email option** (unlike `webserver_backup.sh -e EMAIL`, which is meant for scheduled/cron runs).
 
 **Usage**:
 ```bash
@@ -367,7 +361,6 @@ The email report contains:
 | `--force` | Skip the safety backup of existing target config |
 | `--dry-run` | Show what would be done without modifying anything |
 | `--restart` | Hard restart webserver after restore (default: graceful reload) |
-| `-e EMAIL` | Send restore report to this email address (optional, requires `msmtp`) |
 | `-h` | Show help message |
 
 **Examples**:
@@ -392,9 +385,6 @@ The email report contains:
 
 # Hard restart after restore (default: graceful reload)
 ./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --restart
-
-# With email report
-./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -e admin@example.com
 ```
 
 **Auto-Detection Logic**:
@@ -406,7 +396,7 @@ The email report contains:
 **Preflight checks** (run before extracting the backup):
 - **Docker mode**: verifies the target container exists and is running (FATAL if not). If running, also checks whether the container's image looks like the backup's webserver type — mismatch is a WARN (you may be migrating config between different webserver images intentionally).
 - **Native mode**: detects the webserver process(es) running on the host via `pgrep -x` and `systemctl is-active`. Reports mismatch as WARN (e.g. backup is nginx but host runs apache). If no webserver process is detected at all, emits a WARN — this is normal for fresh hosts or during migration.
-- All preflight results appear in the log and the email report under the **Preflight Checks** section.
+- All preflight results appear in the log under the **Preflight Checks** section.
 - **Severity**:
   - `FATAL` → aborts the restore. Re-run with `--force` to override.
   - `WARN` → logs and proceeds (use `--force` to silence).
