@@ -38,6 +38,10 @@ show_help() {
     echo "  -c CONTAINER         Target Docker container (only used when env=docker)."
     echo "                       Defaults to the container recorded in the backup, or auto-detected."
     echo ""
+    echo "Environment variables (Docker mode, optional):"
+    echo "  WEBSERVER_SERVICE    Force the webserver service name when auto-detection is wrong."
+    echo "                       Example: export WEBSERVER_SERVICE=webserver"
+    echo ""
     echo "Restore Behavior:"
     echo "  --force              Skip the safety backup of existing target config"
     echo "  --dry-run            Show what would be done without modifying anything"
@@ -208,27 +212,48 @@ detect_webserver_container() {
     log_message "Reading webserver container from $compose_file..."
 
     local service_name=""
-    service_name=$(awk -v t="$type" '
-        BEGIN { IGNORECASE=1 }
-        /^[A-Za-z0-9_.-]+:[[:space:]]*$/ {
-            current=$1; sub(/:$/, "", current); in_service=0
-        }
-        /^[A-Za-z0-9_.-]+:/ {
-            line=$0
-            if (line ~ /^[^ ]/) in_service=1
-        }
-        in_service && /image:/ {
-            img=$2
-            if (img ~ t) { print current; exit }
-        }
-    ' "$compose_file" 2>/dev/null)
+    local pick_reason=""
 
+    # Priority B: $WEBSERVER_SERVICE env var override (explicit user intent).
+    # Highest priority — checked first so users with custom compose layouts
+    # (where webserver is not the first service) don't need to rename anything.
+    if [ -n "${WEBSERVER_SERVICE:-}" ]; then
+        if grep -qE "^[[:space:]]*${WEBSERVER_SERVICE}:[[:space:]]*$" "$compose_file" 2>/dev/null; then
+            service_name="$WEBSERVER_SERVICE"
+            pick_reason="WEBSERVER_SERVICE env var"
+            log_message "Using WEBSERVER_SERVICE override: $service_name"
+        else
+            log_message "WARNING: WEBSERVER_SERVICE='$WEBSERVER_SERVICE' not found in $compose_file — falling back to auto-detect"
+        fi
+    fi
+
+    # Fallback: image-name heuristic (legacy behaviour).
     if [ -z "$service_name" ]; then
-        service_name=$(grep -B1 -iE "image:.*(apache|httpd|nginx|openlitespeed|ols|lsws|litespeed)" "$compose_file" \
-            | grep -oE "^  [A-Za-z0-9_.-]+:" | head -1 | sed 's/^  //; s/:$//')
+        service_name=$(awk -v t="$type" '
+            BEGIN { IGNORECASE=1 }
+            /^[A-Za-z0-9_.-]+:[[:space:]]*$/ {
+                current=$1; sub(/:$/, "", current); in_service=0
+            }
+            /^[A-Za-z0-9_.-]+:/ {
+                line=$0
+                if (line ~ /^[^ ]/) in_service=1
+            }
+            in_service && /image:/ {
+                img=$2
+                if (img ~ t) { print current; exit }
+            }
+        ' "$compose_file" 2>/dev/null)
+
+        if [ -z "$service_name" ]; then
+            service_name=$(grep -B1 -iE "image:.*(apache|httpd|nginx|openlitespeed|ols|lsws|litespeed)" "$compose_file" \
+                | grep -oE "^  [A-Za-z0-9_.-]+:" | head -1 | sed 's/^  //; s/:$//')
+        fi
+        [ -n "$service_name" ] && pick_reason="image-name fallback"
     fi
 
     [ -z "$service_name" ] && return 1
+
+    log_message "Webserver service: $service_name (picked by: $pick_reason)"
 
     local container_line=$(grep -A 20 "^[[:space:]]*${service_name}:[[:space:]]*$" "$compose_file" \
         | grep -E "container_name:" | head -1)

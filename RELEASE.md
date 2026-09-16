@@ -11,13 +11,52 @@ add new features; major releases introduce breaking changes.
 ## [Unreleased]
 
 ### Added
-- (none yet)
 
-### Changed
-- (none yet)
+**Robust webserver service detection** (`webserver_backup.sh`, `webserver_restore.sh`).
+
+When a `docker-compose.yml` contains multiple services whose images match a
+known webserver type (e.g. several `nginx:alpine` instances, or a sidecar
+`nginx` plus a real `nginx`/`openlitespeed`/`apache`), the script can no
+longer accidentally pick the wrong one. Service detection now follows an
+**early-return priority chain** — the first hit wins, lower-priority
+detectors are skipped entirely:
+
+| # | Priority | Method | Notes |
+|---|----------|--------|-------|
+| 1 | **D** (lowest) | First service whose image matches the detected webserver type | Legacy fallback (preserved for back-compat) |
+| 2 | **C** | Image matches webserver type **AND** exposes a webserver port (`80`/`443`/`8080`/`8443`) | Resolves `${VAR:-default}` interpolation from compose `.env` |
+| 3 | **B** | `$WEBSERVER_SERVICE` env var | Explicit, bypasses all heuristics |
+| 4 | **A** (highest) | Compose label `wp-backup: webserver` (or shorthand `wp-backup=webserver` in list form) | Explicit user intent |
+
+Key user-facing additions:
+
+- **`WEBSERVER_SERVICE` env var** — forces the webserver service name when
+  auto-detection is wrong. Set with `export WEBSERVER_SERVICE=myservice`
+  before running either `webserver_backup.sh` or `webserver_restore.sh`.
+- **Compose label `wp-backup: webserver`** — opt-in marker on a service to
+  declare it as the webserver. Supports both YAML map form
+  (`labels: wp-backup: webserver`) and list/shorthand form
+  (`labels: - "wp-backup=webserver"`).
+- **`.env` interpolation for ports** — port specs such as
+  `"${WEB_PORT:-80}:80"` now correctly resolve from
+  `$DOCKER_COMPOSE_DIR/.env` during the port-based heuristic. Previously a
+  service exposing only an interpolated webserver port (e.g. `WEB_PORT=443`)
+  could be missed.
 
 ### Fixed
-- (none yet)
+
+- `webserver_backup.sh` no longer picks the wrong service when
+  `docker-compose.yml` lists another webserver-image service first
+  (e.g. `nginx-helper` before `actual-web`).
+- `webserver_backup.sh` awk-based label parser crashed on compose files
+  where `services:` was the first indented line. Replaced with a
+  shell/awk two-pass walker that uses `lead()` indentation counts and
+  correctly handles both tab-indented and space-indented files.
+- `webserver_backup.sh` port heuristic treated the literal string
+  `"8080:80"` as a port value (with quotes), so webserver ports in
+  docker-compose short syntax were never matched. Now the host port is
+  extracted before regex matching, and `${VAR:-default}` interpolations
+  are resolved against `.env` first.
 
 ### Removed
 - (none yet)

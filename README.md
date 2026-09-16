@@ -322,6 +322,39 @@ The `webserver_backup.sh` and `webserver_restore.sh` scripts back up and restore
 
 > ⚠️ **Tip**: When using `-f`, the script respects your path on the host. It will **not** fall back to scanning running Docker containers, even if their names look like webserver images. This prevents accidentally backing up an unrelated sidecar when you clearly want a host-side config.
 
+**Docker service resolution priority** (when auto-detecting inside `docker-compose.yml`):
+
+The script follows an **early-return chain** — the first detector that finds a service wins; lower-priority detectors are skipped. Detection runs in order **D → C → B → A** (lowest to highest priority):
+
+| # | Priority | Detector | When it picks |
+|---|----------|----------|---------------|
+| 1 | **D** (lowest) | First service whose image matches the detected webserver type | Legacy fallback — preserved for backward compatibility |
+| 2 | **C** | Image matches the webserver type **AND** the service exposes a webserver port (`80`, `443`, `8080`, `8443`) | Port specs honour `${VAR:-default}` interpolation from `$DOCKER_COMPOSE_DIR/.env` |
+| 3 | **B** | `$WEBSERVER_SERVICE` env var | Explicit override — must exist as a service in the compose file |
+| 4 | **A** (highest) | Compose label `wp-backup: webserver` (or shorthand `wp-backup=webserver`) | Explicit user intent |
+
+Use the higher-priority options when:
+
+- **`A` (label)** — you want a permanent, self-documenting marker that survives renames and survives being copied into a fresh repo:
+
+  ```yaml
+  services:
+    actual-web:
+      image: nginx:alpine
+      labels:
+        - "wp-backup=webserver"
+  ```
+
+- **`B` (`WEBSERVER_SERVICE`)** — you want a quick override without editing the compose file:
+  ```bash
+  export WEBSERVER_SERVICE=actual-web
+  ./webserver_backup.sh -o /backups
+  ```
+
+- **`C` (port heuristic)** — happens automatically; tune by exposing a webserver port (`80`/`443`/`8080`/`8443`) and using `${WEB_PORT:-...}` in your compose so the right port is matched even when the value comes from `.env`.
+
+> 💡 The port heuristic and `.env` interpolation only matter when no higher-priority detector (`A` / `B`) fires. If `wp-backup: webserver` is set, it wins unconditionally.
+
 **Output Format**:
 ```
 YYYYMMDD_HHMMSS_<webserver_type>_config_backup.zip
@@ -385,7 +418,12 @@ The webserver type is embedded in the filename so multi-server backups stay iden
 
 # Hard restart after restore (default: graceful reload)
 ./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --restart
+
+# Force a specific webserver service when auto-detect picks the wrong one
+WEBSERVER_SERVICE=actual-web ./webserver_restore.sh -b /backups/..._nginx_config_backup.zip
 ```
+
+The `WEBSERVER_SERVICE` env var (also documented in [`webserver_backup.sh`](#webservver_backupsh)) lets you override which service in `docker-compose.yml` is treated as the webserver during restore. The same priority order applies (label → env var → port heuristic → first-image-match).
 
 **Auto-Detection Logic**:
 1. **Webserver type**: Reads from `.backup_info` in the archive, or infers from filenames inside (`nginx.conf`, `httpd_config.conf`, `apache2.conf`, `httpd.conf`).
@@ -534,6 +572,7 @@ crontab -e
 - **Lightweight safety check**: The restore script refuses to restore a lightweight WordPress backup into an empty directory to prevent a broken WordPress installation.
 - **Existing files**: On WordPress restore, existing files at the target are moved to a timestamped backup folder (not deleted) so you can recover. On webserver restore, the target config directory is renamed with a `.backup.<timestamp>` suffix before being overwritten.
 - **Webserver backup scope**: The webserver backup captures the **configuration** of Apache/OLS/Nginx only. It does not include site content (that's the WordPress backup's job) or TLS certificates, logs, or binary executables. Adjust paths accordingly if you need extras.
+- **Disambiguating the webserver service in compose**: If your `docker-compose.yml` has multiple services whose image matches the same webserver type, add the label `wp-backup: webserver` to the canonical one (or use the shorthand `wp-backup=webserver` in list form). Alternatively set `WEBSERVER_SERVICE=<service-name>` in the environment before running either backup or restore. See [Docker service resolution priority](#webservver_backupsh) for the full detection chain.
 
 ## Troubleshooting
 
@@ -574,6 +613,33 @@ FLUSH PRIVILEGES;
 The script could not auto-detect a webserver container from the recorded compose file or running containers. Solutions:
 1. Pass `-c CONTAINER` explicitly, or
 2. Pass `-f WEBSERVER_DIR` with the in-container path you want to restore to (and optionally `-c`).
+
+### "Webserver backup targeted the wrong service in docker-compose.yml"
+
+When `docker-compose.yml` has more than one service whose image matches the
+detected webserver type (e.g. a sidecar `nginx` plus the actual `nginx`/
+`openlitespeed`/`apache` service), the auto-detector can land on the first
+listed one. Fix this with the highest-priority detector — the **compose
+label** is the recommended approach:
+
+```yaml
+services:
+  actual-web:
+    image: nginx:alpine
+    labels:
+      - "wp-backup=webserver"   # <- explicit marker
+```
+
+Or, without editing the compose file, force a service via the
+`WEBSERVER_SERVICE` env var:
+
+```bash
+export WEBSERVER_SERVICE=actual-web
+./webserver_backup.sh -o /backups
+```
+
+See [Docker service resolution priority](#webservver_backupsh) for the full
+detection chain.
 
 ### Webserver restore failed but safety backups were preserved
 On failure, the script leaves the pre-existing target config in place under `<target>.backup.<timestamp>`. Inspect those directories to manually recover. They are automatically removed only on success.
