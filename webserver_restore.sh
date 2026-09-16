@@ -3,7 +3,7 @@
 # Webserver Restore Script
 # Restores webserver configuration from a backup created by webserver_backup.sh
 # Supports Apache, OpenLiteSpeed, Nginx — both native and Docker
-# Usage: ./webserver_restore.sh -b /path/to/backup.zip [-f /path/to/target] [-c CONTAINER] [-e EMAIL] [--force] [--dry-run] [-h]
+# Usage: ./webserver_restore.sh -b /path/to/backup.zip [-f /path/to/target] [-c CONTAINER] [-e EMAIL] [--force] [--dry-run] [--restart] [-h]
 
 # Default values
 BACKUP_FILE=""
@@ -12,6 +12,7 @@ WEBSERVER_CONTAINER=""  # Target container (-c); empty = use backup_info / auto-
 SHOW_HELP=false
 DRY_RUN=false
 FORCE=false
+ACTION="reload"
 EMAIL_TO=""
 EMAIL_FROM="admin@companydomain.com"
 IS_DOCKER=false
@@ -42,6 +43,7 @@ show_help() {
     echo "Restore Behavior:"
     echo "  --force              Skip the safety backup of existing target config"
     echo "  --dry-run            Show what would be done without modifying anything"
+    echo "  --restart            Hard restart webserver after restore (default: graceful reload)"
     echo "  -e EMAIL             Send restore report to this email address (optional)"
     echo "  -h                   Show this help message"
     echo ""
@@ -63,6 +65,9 @@ show_help() {
     echo ""
     echo "  # Force restore (skip safety backup of existing config)"
     echo "  $0 -b /backups/20250530_143022_nginx_config_backup.zip --force"
+    echo ""
+    echo "  # Hard restart after restore (default: graceful reload)"
+    echo "  $0 -b /backups/20250530_143022_nginx_config_backup.zip --restart"
     echo ""
     echo "Note: Backward compatible with the legacy filename *_webserver_backup.zip —"
     echo "      the script reads .backup_info inside the archive, not the filename."
@@ -140,6 +145,7 @@ send_email_notification() {
         echo "Target container: ${WEBSERVER_CONTAINER:-N/A}"
         echo "Environment     : $([ "$IS_DOCKER" = true ] && echo "Docker ($WEBSERVER_CONTAINER)" || echo "Native")"
         echo "Dry-run         : ${DRY_RUN}"
+        echo "Action          : ${ACTION}"
         echo "Finished at     : $(date '+%Y-%m-%d %H:%M:%S')"
         echo "Host            : $(hostname)"
         echo ""
@@ -663,33 +669,86 @@ verify_post_restore() {
     fi
 }
 
-# Try a graceful reload of the webserver; never fatal if it fails
+# Apply the restored config to the running webserver.
+# ACTION="reload"  (default): graceful reload — no downtime.
+# ACTION="restart"            : hard restart — brief downtime, picks up changes reload can't.
+# Always non-fatal: failures only emit a warning so the restore itself is still considered successful.
 attempt_reload() {
     if [ "$DRY_RUN" = true ]; then
-        log_message "[DRY-RUN] Skipping reload"
+        log_message "[DRY-RUN] Skipping $ACTION"
         return 0
     fi
 
-    log_message "Attempting graceful reload of $WEBSERVER_TYPE..."
+    if [ "$ACTION" = "restart" ]; then
+        log_message "Attempting hard restart of $WEBSERVER_TYPE..."
+    else
+        log_message "Attempting graceful reload of $WEBSERVER_TYPE..."
+    fi
 
     if [ "$IS_DOCKER" = true ]; then
         local container="$WEBSERVER_CONTAINER"
-        local cmd=""
-        case "$WEBSERVER_TYPE" in
-            apache) cmd="apachectl -k graceful || httpd -k graceful || true" ;;
-            nginx) cmd="nginx -s reload || true" ;;
-            openlitespeed) cmd="lswsctrl reload || /usr/local/lsws/bin/lswsctrl reload || true" ;;
-            *) cmd="true" ;;
-        esac
-        docker exec "$container" sh -c "$cmd" >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            log_message "Reload command issued in container $container"
+        if [ "$ACTION" = "restart" ]; then
+            # docker restart kills+starts the container. Picks up any config change.
+            docker restart "$container" >/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                log_message "Container restarted: $container"
+            else
+                log_message "WARNING: docker restart failed for $container (non-fatal)"
+            fi
         else
-            log_message "WARNING: Reload command failed inside container (non-fatal)"
+            local cmd=""
+            case "$WEBSERVER_TYPE" in
+                apache) cmd="apachectl -k graceful || httpd -k graceful || true" ;;
+                nginx) cmd="nginx -s reload || true" ;;
+                openlitespeed) cmd="lswsctrl reload || /usr/local/lsws/bin/lswsctrl reload || true" ;;
+                *) cmd="true" ;;
+            esac
+            docker exec "$container" sh -c "$cmd" >/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+                log_message "Reload command issued in container $container"
+            else
+                log_message "WARNING: Reload command failed inside container (non-fatal)"
+            fi
         fi
         return 0
     fi
 
+    if [ "$ACTION" = "restart" ]; then
+        # Native hard restart: try systemctl first, then fall back to service(8), then to direct binary.
+        case "$WEBSERVER_TYPE" in
+            apache)
+                if systemctl restart apache2 >/dev/null 2>&1 \
+                    || systemctl restart httpd >/dev/null 2>&1; then
+                    log_message "Restart issued (systemctl restart apache2/httpd)"
+                elif command -v apachectl >/dev/null 2>&1 && apachectl -k restart >/dev/null 2>&1; then
+                    log_message "Restart issued (apachectl -k restart)"
+                else
+                    log_message "WARNING: apache restart failed (non-fatal)"
+                fi
+                ;;
+            nginx)
+                if systemctl restart nginx >/dev/null 2>&1; then
+                    log_message "Restart issued (systemctl restart nginx)"
+                elif command -v nginx >/dev/null 2>&1 && nginx -s reopen >/dev/null 2>&1; then
+                    log_message "Restart issued (nginx reopen via nginx -s reopen)"
+                else
+                    log_message "WARNING: nginx restart failed (non-fatal)"
+                fi
+                ;;
+            openlitespeed)
+                if systemctl restart lsws >/dev/null 2>&1; then
+                    log_message "Restart issued (systemctl restart lsws)"
+                elif command -v lswsctrl >/dev/null 2>&1 && lswsctrl restart >/dev/null 2>&1; then
+                    log_message "Restart issued (lswsctrl restart)"
+                else
+                    log_message "WARNING: openlitespeed restart failed (non-fatal)"
+                fi
+                ;;
+        esac
+        return 0
+    fi
+
+    # Default: graceful reload
     case "$WEBSERVER_TYPE" in
         apache)
             if command -v apachectl &> /dev/null; then
@@ -724,6 +783,7 @@ while [[ $# -gt 0 ]]; do
         -e) EMAIL_TO="$2"; shift 2 ;;
         --force) FORCE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --restart) ACTION="restart"; shift ;;
         -h) SHOW_HELP=true; shift ;;
         *)
             echo "Invalid option: $1" >&2
@@ -959,6 +1019,7 @@ fi
 log_message "Webserver type : $WEBSERVER_TYPE"
 log_message "Target         : $TARGET"
 log_message "Mode           : $([ "$DRY_RUN" = true ] && echo "DRY-RUN" || echo "APPLY")"
+log_message "Action         : $ACTION"
 log_message "Force          : $FORCE"
 
 # Preflight checks: verify target is reachable and (softly) that the running webserver matches the backup type.

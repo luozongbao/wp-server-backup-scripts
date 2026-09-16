@@ -366,6 +366,7 @@ The email report contains:
 | `-c CONTAINER` | Target Docker container. Defaults to the container recorded in the backup, or auto-detected. |
 | `--force` | Skip the safety backup of existing target config |
 | `--dry-run` | Show what would be done without modifying anything |
+| `--restart` | Hard restart webserver after restore (default: graceful reload) |
 | `-e EMAIL` | Send restore report to this email address (optional, requires `msmtp`) |
 | `-h` | Show help message |
 
@@ -388,6 +389,9 @@ The email report contains:
 
 # Force restore (skip safety backup of existing config)
 ./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --force
+
+# Hard restart after restore (default: graceful reload)
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --restart
 
 # With email report
 ./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -e admin@example.com
@@ -412,7 +416,10 @@ The email report contains:
 **Safety behavior**:
 - Before overwriting an existing target directory, the script renames it to `<target>.backup.<timestamp>` and tracks the path. If the restore **succeeds**, these safety backups are automatically removed. If the restore **fails at any point**, they are **preserved** and listed in the log so you can recover manually.
 - Use `--force` to skip both the safety backup and the preflight checks (faster, but riskier).
-- After restore, the script verifies presence of key config files for the detected webserver type and attempts a graceful reload (`apachectl -k graceful` / `nginx -s reload` / `lswsctrl reload`). Reload failures are non-fatal — they only emit a warning.
+- After restore, the script verifies presence of key config files for the detected webserver type and applies the new config:
+  - **Default (graceful reload)** — no downtime. Uses `apachectl -k graceful` / `nginx -s reload` / `lswsctrl reload` (native) or `docker exec ... <reload cmd>` (Docker).
+  - **`--restart` (hard restart)** — brief downtime, picks up changes that reload can't (e.g. new listen sockets, new modules, removed directives). Uses `systemctl restart <service>` (native) or `docker restart <container>` (Docker).
+  - Both actions are **non-fatal** if they fail — the restore itself is still considered successful; only a warning is emitted. The user can apply the config manually.
 
 > ⚠️ **Note**: Restoring webserver configuration is a privileged operation. The script must be able to write to `/etc/...` (run with `sudo`) or invoke `docker exec` against the target container. For Docker, the container must be running.
 
