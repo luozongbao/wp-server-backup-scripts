@@ -6,10 +6,12 @@ A pair of robust bash scripts for backing up and restoring WordPress installatio
 
 | Script | Purpose |
 |--------|---------|
-| [`wp_backup.sh`](wp_backup.sh) | Create a backup (files + database) |
-| [`wp_restore.sh`](wp_restore.sh) | Restore from a backup archive |
+| [`wp_backup.sh`](wp_backup.sh) | Back up a WordPress installation (files + database) |
+| [`wp_restore.sh`](wp_restore.sh) | Restore WordPress from a backup archive |
+| [`webserver_backup.sh`](webserver_backup.sh) | Back up webserver configuration (Apache, OLS, Nginx) |
+| [`webserver_restore.sh`](webserver_restore.sh) | Restore webserver configuration from a backup archive |
 
-Both scripts work on **any web server** that serves WordPress — Nginx, Apache, OpenLiteSpeed, LiteSpeed Enterprise, or Caddy — because they operate at the filesystem and database level only.
+The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, Apache, OpenLiteSpeed, LiteSpeed Enterprise, or Caddy — because they operate at the filesystem and database level only. The `webserver_*` scripts back up the webserver configuration itself, which lives **outside** WordPress.
 
 ## Features
 
@@ -23,6 +25,7 @@ Both scripts work on **any web server** that serves WordPress — Nginx, Apache,
 - ✅ **Email notifications**: Optional backup report via `msmtp` (`-e email`)
 - ✅ **Timestamped output**: `YYYYMMDD_HHMMSS_foldername[_lightweight].zip`
 - ✅ **Safe recovery**: Existing target files are backed up before overwrite
+- ✅ **Webserver config backup**: Companion scripts back up Apache, OpenLiteSpeed, or Nginx configuration (host or Docker container)
 
 ## Backup Modes
 
@@ -80,6 +83,35 @@ The restore script **refuses to proceed** and exits with an error if the target 
 
 # Restore a lightweight backup
 ./wp_restore.sh -b /backups/20250530_143022_wordpress_lightweight.zip -w /var/www/html/wordpress
+```
+
+### Webserver Backup
+
+```bash
+# Back up a known config directory (host)
+./webserver_backup.sh -f /etc/nginx -o /backups
+
+# Back up a known config directory (OpenLiteSpeed)
+./webserver_backup.sh -f /usr/local/lsws/conf -o /backups
+
+# Auto-detect Docker or native, send email report
+./webserver_backup.sh -o /backups -e admin@example.com
+```
+
+### Webserver Restore
+
+```bash
+# Restore to default native location (auto-detect from backup metadata)
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip
+
+# Restore to a specific native path
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -f /etc/nginx
+
+# Restore to a Docker container
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -c my_nginx_container
+
+# Preview before applying
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip --dry-run
 ```
 
 ## Detailed Usage
@@ -239,6 +271,129 @@ When `-u`, `-t`, or `-A` are used, additional changes are applied **after** the 
    - **Lightweight mode**: Restore only `wp-content/`, `wp-config.php`, `.htaccess` into the existing WordPress installation
 8. **Verification**: Confirm successful restoration
 
+## Webserver Backup & Restore
+
+The `webserver_backup.sh` and `webserver_restore.sh` scripts back up and restore the **webserver configuration** itself (Apache, OpenLiteSpeed, Nginx). This lives **outside** of WordPress and is therefore not covered by `wp_backup.sh` / `wp_restore.sh`.
+
+### webserver_backup.sh
+
+**Purpose**: Create a backup of the webserver configuration directory.
+
+**Usage**:
+```bash
+./webserver_backup.sh [-f WEBSERVER_DIR] [-o OUTPUT_DIR] [-e EMAIL]
+```
+
+**Options**:
+- `-f WEBSERVER_DIR`: Path to the webserver config directory (optional). If omitted, the script auto-detects from the system or Docker.
+  - Apache → `/etc/apache2` (Debian/Ubuntu) or `/etc/httpd` (RHEL)
+  - OpenLiteSpeed / LiteSpeed → `/usr/local/lsws/conf`
+  - Nginx → `/etc/nginx`
+- `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
+- `-e EMAIL`: Send backup report to this email address (optional, requires `msmtp`)
+- `-h`: Show help message
+
+**Examples**:
+```bash
+# Back up nginx config
+./webserver_backup.sh -f /etc/nginx -o /backups
+
+# Back up OpenLiteSpeed config
+./webserver_backup.sh -f /usr/local/lsws/conf -o /backups
+
+# Auto-detect (Docker or native), email report
+./webserver_backup.sh -o /backups -e admin@example.com
+
+# Back up a single file path (e.g. httpd.conf only)
+./webserver_backup.sh -f /etc/httpd/conf/httpd.conf -o /backups
+```
+
+**Auto-Detection Logic**:
+1. **Webserver type**: Detected from the `-f` path's filenames (`nginx.conf`, `httpd.conf`, `httpd_config.conf`) or, when `-f` is omitted, from installed packages (`dpkg` / `rpm`), running processes (`apache2`, `httpd`, `nginx`, `lshttpd`), and known config paths.
+2. **Environment**: Searches for `docker-compose.yml` containing a webserver service in the `-f` path and up to 3 parent levels. Falls back to well-known roots (`/var/www`, `/opt`, `/srv`) and finally to running Docker containers (only when `-f` is NOT supplied, to avoid false positives from unrelated webserver containers on the host).
+3. **Docker mode**: Uses `docker exec tar` to stream the in-container config out to the host (more reliable than `docker cp` for directories).
+4. **Native mode**: Copies the config directory (or file) directly.
+
+> ⚠️ **Tip**: When using `-f`, the script respects your path on the host. It will **not** fall back to scanning running Docker containers, even if their names look like webserver images. This prevents accidentally backing up an unrelated sidecar when you clearly want a host-side config.
+
+**Output Format**:
+```
+YYYYMMDD_HHMMSS_webserver_backup.zip
+└── files/                          ← Webserver config
+│   ├── nginx.conf / httpd.conf / httpd_config.conf
+│   ├── conf.d/, sites-enabled/, mods-available/, ...   (whatever was in the source)
+│   └── .backup_info                ← Metadata: type, source, container, env, host
+```
+
+The email report contains:
+- Status indicator (✅ SUCCESS or ❌ FAILED) and exit code
+- Detected webserver type (apache / openlitespeed / nginx)
+- Source directory (or container path)
+- Environment (Docker container name or Native)
+- Backup path, file size, timestamp, hostname
+- Full backup log inlined in the message body
+
+### webserver_restore.sh
+
+**Purpose**: Restore webserver configuration from a backup created by `webserver_backup.sh`. Mirrors the safety/reporting style of `wp_restore.sh`.
+
+**Usage**:
+```bash
+./webserver_restore.sh -b BACKUP_FILE [options]
+```
+
+**Options**:
+
+| Option | Description |
+|--------|-------------|
+| `-b BACKUP_FILE` | Path to the webserver backup ZIP file (required) |
+| `-f WEBSERVER_DIR` | Target path. Native host path on the host, OR in-container path when env=docker. If omitted, auto-detected. |
+| `-c CONTAINER` | Target Docker container. Defaults to the container recorded in the backup, or auto-detected. |
+| `--force` | Skip the safety backup of existing target config |
+| `--dry-run` | Show what would be done without modifying anything |
+| `-e EMAIL` | Send restore report to this email address (optional, requires `msmtp`) |
+| `-h` | Show help message |
+
+**Examples**:
+```bash
+# Restore to default native location (auto-detect from backup metadata)
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip
+
+# Restore to a specific native path
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -f /etc/nginx
+
+# Restore to a Docker container
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -c my_nginx_container
+
+# Restore to a specific in-container path
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -c my_nginx_container -f /etc/nginx
+
+# Preview before applying
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip --dry-run
+
+# Force restore (skip safety backup of existing config)
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip --force
+
+# With email report
+./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -e admin@example.com
+```
+
+**Auto-Detection Logic**:
+1. **Webserver type**: Reads from `.backup_info` in the archive, or infers from filenames inside (`nginx.conf`, `httpd_config.conf`, `apache2.conf`, `httpd.conf`).
+2. **Environment**: Honored from `.backup_info` (native vs docker). Override with `-c` (forces Docker) or with `-f` pointing at an existing host path (forces native).
+3. **Target container**: Uses the container recorded in `.backup_info`, or scans `docker-compose.yml` from the same compose directory as the original backup, falling back to inspecting running containers whose images match the detected webserver type.
+4. **Default target path**: Auto-selected per type — `/etc/apache2` (apache), `/usr/local/lsws/conf` (openlitespeed), `/etc/nginx` (nginx). Override with `-f`.
+
+**Safety behavior**:
+- Before overwriting an existing target directory, the script renames it to `<target>.backup.<timestamp>` and tracks the path. If the restore **succeeds**, these safety backups are automatically removed. If the restore **fails at any point**, they are **preserved** and listed in the log so you can recover manually.
+- Use `--force` to skip the safety backup entirely (faster, but riskier).
+- After restore, the script verifies presence of key config files for the detected webserver type and attempts a graceful reload (`apachectl -k graceful` / `nginx -s reload` / `lswsctrl reload`). Reload failures are non-fatal — they only emit a warning.
+
+> ⚠️ **Note**: Restoring webserver configuration is a privileged operation. The script must be able to write to `/etc/...` (run with `sudo`) or invoke `docker exec` against the target container. For Docker, the container must be running.
+
+**Conflict validation**:
+- No required parameters beyond `-b`. All other options are optional and validated lazily.
+
 ## Web Server Compatibility
 
 These scripts work at the **filesystem and database level only**, so they are compatible with **any web server** that serves WordPress:
@@ -290,17 +445,17 @@ Examples: `20250530_143022_wordpress.zip`, `20250530_143022_wordpress_lightweigh
 
 ## Dependencies
 
-### Common (both scripts)
+### Common (all scripts)
 - `bash` (4.0+)
 - `zip` (backup) / `unzip` (restore)
 
 ### For Docker environments
 - `docker`
-- `docker-compose`
+- `docker-compose` (or the `docker compose` plugin)
 
 ### For native environments
-- `mysqldump` or `mariadb-dump`
-- `mysql` or `mariadb`
+- **WordPress scripts**: `mysqldump` or `mariadb-dump`, plus `mysql` or `mariadb`
+- **Webserver scripts**: no DB tools needed
 
 ### For email notifications (optional)
 - `msmtp` (with a configured `default` account)
@@ -310,7 +465,7 @@ The scripts only require dependencies for the environment they detect.
 ## Installation
 
 ```bash
-chmod +x wp_backup.sh wp_restore.sh
+chmod +x wp_backup.sh wp_restore.sh webserver_backup.sh webserver_restore.sh
 ```
 
 ## Permissions
@@ -341,15 +496,22 @@ crontab -e
     -o /backups \
     -l \
     >> /var/log/wp_backup.log 2>&1
+
+# Webserver config backup every Sunday at 03:00
+0 3 * * 0 /home/zongbao/wp-server-backup-scripts/webserver_backup.sh \
+    -o /backups \
+    -e admin@example.com \
+    >> /var/log/webserver_backup.log 2>&1
 ```
 
 ## Important Notes
 
 - **Test first**: Always test backup and restore in a non-production environment before relying on these scripts.
-- **Database credentials**: The backup captures `wp-config.php` which contains plaintext database credentials — store backups securely.
-- **Docker backups**: Database dumps are streamed via `docker exec`, so the Docker daemon must be running.
-- **Lightweight safety check**: The restore script refuses to restore a lightweight backup into an empty directory to prevent a broken WordPress installation.
-- **Existing files**: On restore, existing files at the target are moved to a timestamped backup folder (not deleted) so you can recover.
+- **Database credentials**: The WordPress backup captures `wp-config.php` which contains plaintext database credentials — store backups securely.
+- **Docker backups**: Database dumps and webserver configs are streamed via `docker exec`, so the Docker daemon must be running.
+- **Lightweight safety check**: The restore script refuses to restore a lightweight WordPress backup into an empty directory to prevent a broken WordPress installation.
+- **Existing files**: On WordPress restore, existing files at the target are moved to a timestamped backup folder (not deleted) so you can recover. On webserver restore, the target config directory is renamed with a `.backup.<timestamp>` suffix before being overwritten.
+- **Webserver backup scope**: The webserver backup captures the **configuration** of Apache/OLS/Nginx only. It does not include site content (that's the WordPress backup's job) or TLS certificates, logs, or binary executables. Adjust paths accordingly if you need extras.
 
 ## Troubleshooting
 
@@ -385,6 +547,17 @@ docker exec -it <db_container> mariadb -uroot -p
 GRANT ALL PRIVILEGES ON *.* TO 'brkdbuser'@'%';
 FLUSH PRIVILEGES;
 ```
+
+### "Could not determine target webserver container" (webserver_restore.sh)
+The script could not auto-detect a webserver container from the recorded compose file or running containers. Solutions:
+1. Pass `-c CONTAINER` explicitly, or
+2. Pass `-f WEBSERVER_DIR` with the in-container path you want to restore to (and optionally `-c`).
+
+### Webserver restore failed but safety backups were preserved
+On failure, the script leaves the pre-existing target config in place under `<target>.backup.<timestamp>`. Inspect those directories to manually recover. They are automatically removed only on success.
+
+### "Post-restore reload failed" (webserver_restore.sh)
+The restore itself succeeded, but the in-place reload command (`apachectl -k graceful` / `nginx -s reload` / `lswsctrl reload`) failed — usually because the new config has a syntax error. Inspect the webserver error log, fix the config, and reload manually.
 
 ## License
 
