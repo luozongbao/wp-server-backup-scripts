@@ -94,7 +94,7 @@ The restore script **refuses to proceed** and exits with an error if the target 
 # Back up a known config directory (OpenLiteSpeed)
 ./webserver_backup.sh -f /usr/local/lsws/conf -o /backups
 
-# Auto-detect Docker or native, send email report
+# Auto-detect Docker or native (no `-f` needed), send email report
 ./webserver_backup.sh -o /backups -e admin@example.com
 ```
 
@@ -102,16 +102,16 @@ The restore script **refuses to proceed** and exits with an error if the target 
 
 ```bash
 # Restore to default native location (auto-detect from backup metadata)
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip
 
 # Restore to a specific native path
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -f /etc/nginx
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -f /etc/nginx
 
 # Restore to a Docker container
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -c my_nginx_container
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -c my_nginx_container
 
 # Preview before applying
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip --dry-run
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --dry-run
 ```
 
 ## Detailed Usage
@@ -281,30 +281,36 @@ The `webserver_backup.sh` and `webserver_restore.sh` scripts back up and restore
 
 **Usage**:
 ```bash
-./webserver_backup.sh [-f WEBSERVER_DIR] [-o OUTPUT_DIR] [-e EMAIL]
+./webserver_backup.sh [-o OUTPUT_DIR] [-e EMAIL] [-f WEBSERVER_DIR] [-h]
 ```
 
 **Options**:
-- `-f WEBSERVER_DIR`: Path to the webserver config directory (optional). If omitted, the script auto-detects from the system or Docker.
+- `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
+- `-e EMAIL`: Send backup report to this email address (optional, requires `msmtp`)
+- `-f WEBSERVER_DIR`: Advanced override — path to a specific webserver config directory. If omitted, the script **auto-detects** from the system or Docker (recommended).
   - Apache → `/etc/apache2` (Debian/Ubuntu) or `/etc/httpd` (RHEL)
   - OpenLiteSpeed / LiteSpeed → `/usr/local/lsws/conf`
   - Nginx → `/etc/nginx`
-- `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
-- `-e EMAIL`: Send backup report to this email address (optional, requires `msmtp`)
 - `-h`: Show help message
 
 **Examples**:
 ```bash
-# Back up nginx config
-./webserver_backup.sh -f /etc/nginx -o /backups
+# Easiest: auto-detect everything (Docker or native), use current dir as output
+./webserver_backup.sh
 
-# Back up OpenLiteSpeed config
-./webserver_backup.sh -f /usr/local/lsws/conf -o /backups
+# Auto-detect, write to /backups
+./webserver_backup.sh -o /backups
 
-# Auto-detect (Docker or native), email report
+# Auto-detect + email report
 ./webserver_backup.sh -o /backups -e admin@example.com
 
-# Back up a single file path (e.g. httpd.conf only)
+# Advanced: back up a known nginx config dir explicitly
+./webserver_backup.sh -f /etc/nginx -o /backups
+
+# Advanced: back up OpenLiteSpeed config explicitly
+./webserver_backup.sh -f /usr/local/lsws/conf -o /backups
+
+# Advanced: back up a single file path (e.g. httpd.conf only)
 ./webserver_backup.sh -f /etc/httpd/conf/httpd.conf -o /backups
 ```
 
@@ -318,12 +324,21 @@ The `webserver_backup.sh` and `webserver_restore.sh` scripts back up and restore
 
 **Output Format**:
 ```
-YYYYMMDD_HHMMSS_webserver_backup.zip
+YYYYMMDD_HHMMSS_<webserver_type>_config_backup.zip
 └── files/                          ← Webserver config
 │   ├── nginx.conf / httpd.conf / httpd_config.conf
 │   ├── conf.d/, sites-enabled/, mods-available/, ...   (whatever was in the source)
 │   └── .backup_info                ← Metadata: type, source, container, env, host
+
+Examples:
+  20250530_143022_nginx_config_backup.zip
+  20250530_143022_apache_config_backup.zip
+  20250530_143022_openlitespeed_config_backup.zip
+
+The webserver type is embedded in the filename so multi-server backups stay identifiable.
 ```
+
+> 💡 **Note**: Restore reads `.backup_info` inside the archive, not the filename — so it accepts both the new `*_<type>_config_backup.zip` format and the legacy `*_webserver_backup.zip` format.
 
 The email report contains:
 - Status indicator (✅ SUCCESS or ❌ FAILED) and exit code
@@ -357,25 +372,25 @@ The email report contains:
 **Examples**:
 ```bash
 # Restore to default native location (auto-detect from backup metadata)
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip
 
 # Restore to a specific native path
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -f /etc/nginx
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -f /etc/nginx
 
 # Restore to a Docker container
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -c my_nginx_container
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -c my_nginx_container
 
 # Restore to a specific in-container path
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -c my_nginx_container -f /etc/nginx
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -c my_nginx_container -f /etc/nginx
 
 # Preview before applying
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip --dry-run
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --dry-run
 
 # Force restore (skip safety backup of existing config)
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip --force
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --force
 
 # With email report
-./webserver_restore.sh -b /backups/20250530_143022_webserver_backup.zip -e admin@example.com
+./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip -e admin@example.com
 ```
 
 **Auto-Detection Logic**:
