@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# WordPress Universal Backup Script
+# WordPress Backup Script
 # Creates a backup of WordPress files and database
 # Auto-detects Docker or native database services
-# Usage: ./wp-universal-backup.sh -w /path/to/wordpress [-o /path/to/backup/output] [-h]
+# Usage: ./wp_backup.sh -w /path/to/wordpress [-o /path/to/backup/output] [-l] [-h]
 
 # Default values
 WORDPRESS_DIR=""
@@ -13,37 +13,125 @@ DB_TYPE=""
 DB_CONTAINER=""
 DB_DUMP_CMD=""
 IS_DOCKER=false
+LIGHTWEIGHT=false
+EMAIL_TO=""
+EMAIL_FROM="admin@companydomain.com"
 
 # Function to display help
 show_help() {
-    echo "WordPress Universal Backup Script"
+    echo "WordPress Backup Script"
     echo "================================"
     echo ""
-    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-h]"
+    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-h]"
     echo ""
     echo "Options:"
     echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (required)"
     echo "  -o OUTPUT_DIR        Path to the backup output directory (optional, default: current directory)"
+    echo "  -l                   Lightweight mode: backup only wp-content, wp-config.php,"
+    echo "                       and .htaccess (optional, default: full backup)"
+    echo "  -e EMAIL             Send backup report to this email address (optional)"
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 -w /var/www/html/wordpress"
     echo "  $0 -w /var/www/html/wordpress -o /backups"
     echo "  $0 -w /home/user/website -o /home/user/backups"
+    echo "  $0 -w /var/www/html/wordpress -l -o /backups    (lightweight mode)"
+    echo "  $0 -w /var/www/html/wordpress -e admin@example.com"
     echo ""
     echo "Output format: [timestamp]_[wordpress-folder-name].zip"
     echo "Example: 20250530_143022_wordpress.zip"
+    echo "          20250530_143022_wordpress_lightweight.zip (lightweight mode)"
     echo ""
     echo "Features:"
     echo "  - Auto-detects Docker containers or native database services"
     echo "  - Supports both MySQL and MariaDB"
-    echo "  - Creates compressed backup with files and database"
+    echo "  - Full mode: backs up entire WordPress directory + database"
+    echo "  - Lightweight mode: backs up wp-content + wp-config.php + .htaccess + database"
     echo "  - Verifies backup integrity"
 }
 
 # Function to log messages
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg"
+    if [ -n "$LOG_FILE" ]; then
+        echo "$msg" >> "$LOG_FILE"
+    fi
+}
+
+# Initialize log file (captures entire backup session)
+init_log_file() {
+    LOG_FILE=$(mktemp /tmp/wp_backup_XXXXXX.log)
+    : > "$LOG_FILE"
+    export LOG_FILE
+}
+
+# Send backup report via email using msmtp
+send_email_notification() {
+    local status="$1"   # SUCCESS or FAILED
+    local exit_code="$2"
+
+    # Skip if no recipient configured or msmtp missing
+    if [ -z "$EMAIL_TO" ]; then
+        log_message "Email notification skipped (no recipient specified)"
+        return 0
+    fi
+
+    if ! command -v msmtp &> /dev/null; then
+        log_message "WARNING: msmtp not installed, skipping email notification"
+        return 1
+    fi
+
+    local subject_prefix="[WordPress Backup]"
+    if [ "$status" = "SUCCESS" ]; then
+        local subject="${subject_prefix} ✅ SUCCESS - ${WORDPRESS_FOLDER_NAME} (${TIMESTAMP})"
+    else
+        local subject="${subject_prefix} ❌ FAILED - ${WORDPRESS_FOLDER_NAME} (${TIMESTAMP})"
+    fi
+
+    local backup_size_line="N/A"
+    if [ -f "$BACKUP_PATH" ]; then
+        backup_size_line=$(du -h "$BACKUP_PATH" | cut -f1)
+    fi
+
+    {
+        echo "From: ${EMAIL_FROM}"
+        echo "To: ${EMAIL_TO}"
+        echo "Subject: ${subject}"
+        echo "Date: $(date -R)"
+        echo "MIME-Version: 1.0"
+        echo "Content-Type: text/plain; charset=utf-8"
+        echo "Content-Transfer-Encoding: 8bit"
+        echo ""
+        echo "WordPress Backup Report"
+        echo "======================="
+        echo ""
+        echo "Status          : ${status}"
+        echo "Exit code       : ${exit_code}"
+        echo "WordPress dir   : ${WORDPRESS_DIR}"
+        echo "Backup file     : ${BACKUP_PATH:-N/A}"
+        echo "Backup size     : ${backup_size_line}"
+        echo "Mode            : $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight" || echo "Full")"
+        echo "Environment     : $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER)" || echo "Native ($DB_TYPE)")"
+        echo "Database        : ${DB_TYPE:-N/A}"
+        echo "Timestamp       : ${TIMESTAMP}"
+        echo "Finished at     : $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Host            : $(hostname)"
+        echo ""
+        echo "----- Backup Log -----"
+        if [ -f "$LOG_FILE" ]; then
+            cat "$LOG_FILE"
+        else
+            echo "(no log file found)"
+        fi
+    } | msmtp --account=default "$EMAIL_TO"
+
+    if [ $? -eq 0 ]; then
+        log_message "Backup report sent successfully to ${EMAIL_TO}"
+    else
+        log_message "WARNING: Failed to send backup report to ${EMAIL_TO}"
+    fi
 }
 
 # Function to check if required tools are installed
@@ -343,30 +431,82 @@ backup_files() {
     local wordpress_dir="$1"
     local temp_dir="$2"
     
-    log_message "Creating files backup..."
-    
-    # Copy WordPress files to temporary directory
-    if cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null; then
-        log_message "WordPress files copied successfully"
+    if [ "$LIGHTWEIGHT" = true ]; then
+        log_message "Creating lightweight files backup (wp-content, wp-config.php, .htaccess)..."
+        
+        # Copy wp-content directory
+        if [ -d "$wordpress_dir/wp-content" ]; then
+            if cp -r "$wordpress_dir/wp-content" "$temp_dir/files/" 2>/dev/null; then
+                log_message "wp-content directory copied successfully"
+            else
+                log_message "ERROR: Failed to copy wp-content directory"
+                return 1
+            fi
+        else
+            log_message "WARNING: wp-content directory not found"
+        fi
+        
+        # Copy wp-config.php (critical for DB credentials)
+        if [ -f "$wordpress_dir/wp-config.php" ]; then
+            if cp "$wordpress_dir/wp-config.php" "$temp_dir/files/" 2>/dev/null; then
+                log_message "wp-config.php copied successfully"
+            else
+                log_message "ERROR: Failed to copy wp-config.php"
+                return 1
+            fi
+        else
+            log_message "ERROR: wp-config.php not found"
+            return 1
+        fi
+        
+        # Copy .htaccess if exists (Apache/OLS rewrite rules)
+        if [ -f "$wordpress_dir/.htaccess" ]; then
+            if cp "$wordpress_dir/.htaccess" "$temp_dir/files/" 2>/dev/null; then
+                log_message ".htaccess copied successfully"
+            else
+                log_message "WARNING: Failed to copy .htaccess (non-critical)"
+            fi
+        fi
+        
+        # Create a marker file so restore script knows this is lightweight
+        echo "lightweight" > "$temp_dir/files/.backup_mode"
         
         # Calculate files backup size
         local files_size=$(du -sh "$temp_dir/files" | cut -f1)
-        log_message "WordPress files size: $files_size"
+        log_message "Lightweight backup size: $files_size"
         return 0
     else
-        log_message "ERROR: Failed to copy WordPress files"
-        return 1
+        log_message "Creating full files backup..."
+        
+        # Copy entire WordPress directory
+        if cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null; then
+            log_message "WordPress files copied successfully"
+            
+            # Calculate files backup size
+            local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+            log_message "WordPress files size: $files_size"
+            return 0
+        else
+            log_message "ERROR: Failed to copy WordPress files"
+            return 1
+        fi
     fi
 }
 
 # Parse command line arguments
-while getopts "w:o:h" opt; do
+while getopts "w:o:le:h" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
             ;;
         o)
             OUTPUT_DIR="$OPTARG"
+            ;;
+        l)
+            LIGHTWEIGHT=true
+            ;;
+        e)
+            EMAIL_TO="$OPTARG"
             ;;
         h)
             SHOW_HELP=true
@@ -446,24 +586,48 @@ check_dependencies
 # Generate timestamp and backup filename
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 WORDPRESS_FOLDER_NAME=$(basename "$WORDPRESS_DIR")
-BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}.zip"
+if [ "$LIGHTWEIGHT" = true ]; then
+    BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}_lightweight.zip"
+else
+    BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}.zip"
+fi
 BACKUP_PATH="$OUTPUT_DIR/$BACKUP_FILENAME"
 
-log_message "Starting WordPress Universal Backup process"
+log_message "Starting WordPress Backup process"
 log_message "WordPress directory: $WORDPRESS_DIR"
 log_message "Output directory: $OUTPUT_DIR"
 log_message "Backup filename: $BACKUP_FILENAME"
+log_message "Backup mode: $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight (wp-content + wp-config.php + .htaccess)" || echo "Full (entire WordPress directory)")"
 log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker" || echo "Native")"
 log_message "Database type: $DB_TYPE"
+if [ -n "$EMAIL_TO" ]; then
+    log_message "Email notification: $EMAIL_TO"
+fi
+
+# Initialize log file for email report
+init_log_file
+log_message "Log file initialized: $LOG_FILE"
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
 mkdir -p "$TEMP_DIR/files"
 
-# Cleanup function
+# Cleanup function (also sends email notification if configured)
 cleanup() {
+    local exit_code=$?
+
+    # Send email notification based on exit code
+    if [ -n "$EMAIL_TO" ] && [ -n "$LOG_FILE" ] && [ -f "$LOG_FILE" ]; then
+        if [ $exit_code -eq 0 ]; then
+            send_email_notification "SUCCESS" "$exit_code"
+        else
+            send_email_notification "FAILED" "$exit_code"
+        fi
+    fi
+
     log_message "Cleaning up temporary files..."
     rm -rf "$TEMP_DIR"
+    rm -f "$LOG_FILE"
 }
 
 # Set trap to cleanup on exit
@@ -528,5 +692,6 @@ else
     log_message "WARNING: Backup integrity verification failed"
 fi
 
-log_message "WordPress Universal Backup process completed"
+log_message "WordPress Backup process completed"
 log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER container)" || echo "Native ($DB_TYPE service)")"
+exit 0
