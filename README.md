@@ -399,9 +399,19 @@ The email report contains:
 3. **Target container**: Uses the container recorded in `.backup_info`, or scans `docker-compose.yml` from the same compose directory as the original backup, falling back to inspecting running containers whose images match the detected webserver type.
 4. **Default target path**: Auto-selected per type — `/etc/apache2` (apache), `/usr/local/lsws/conf` (openlitespeed), `/etc/nginx` (nginx). Override with `-f`.
 
+**Preflight checks** (run before extracting the backup):
+- **Docker mode**: verifies the target container exists and is running (FATAL if not). If running, also checks whether the container's image looks like the backup's webserver type — mismatch is a WARN (you may be migrating config between different webserver images intentionally).
+- **Native mode**: detects the webserver process(es) running on the host via `pgrep -x` and `systemctl is-active`. Reports mismatch as WARN (e.g. backup is nginx but host runs apache). If no webserver process is detected at all, emits a WARN — this is normal for fresh hosts or during migration.
+- All preflight results appear in the log and the email report under the **Preflight Checks** section.
+- **Severity**:
+  - `FATAL` → aborts the restore. Re-run with `--force` to override.
+  - `WARN` → logs and proceeds (use `--force` to silence).
+  - `OK` → informational.
+- `--force` bypasses preflight entirely (logs `[SKIP] --force flag set`).
+
 **Safety behavior**:
 - Before overwriting an existing target directory, the script renames it to `<target>.backup.<timestamp>` and tracks the path. If the restore **succeeds**, these safety backups are automatically removed. If the restore **fails at any point**, they are **preserved** and listed in the log so you can recover manually.
-- Use `--force` to skip the safety backup entirely (faster, but riskier).
+- Use `--force` to skip both the safety backup and the preflight checks (faster, but riskier).
 - After restore, the script verifies presence of key config files for the detected webserver type and attempts a graceful reload (`apachectl -k graceful` / `nginx -s reload` / `lswsctrl reload`). Reload failures are non-fatal — they only emit a warning.
 
 > ⚠️ **Note**: Restoring webserver configuration is a privileged operation. The script must be able to write to `/etc/...` (run with `sudo`) or invoke `docker exec` against the target container. For Docker, the container must be running.

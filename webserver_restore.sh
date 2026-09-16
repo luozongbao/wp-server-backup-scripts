@@ -143,6 +143,11 @@ send_email_notification() {
         echo "Finished at     : $(date '+%Y-%m-%d %H:%M:%S')"
         echo "Host            : $(hostname)"
         echo ""
+        if [ -n "${PREFLIGHT_RESULTS:-}" ]; then
+            echo "----- Preflight Checks -----"
+            echo -e "$PREFLIGHT_RESULTS"
+            echo ""
+        fi
         echo "----- Restore Log -----"
         if [ -f "$LOG_FILE" ]; then
             cat "$LOG_FILE"
@@ -349,6 +354,194 @@ safety_backup_target() {
             return 1
         fi
     fi
+    return 0
+}
+
+# Map a webserver type to the process names that indicate it's running on the host
+_webservver_process_names() {
+    case "$1" in
+        apache) echo "apache2 httpd" ;;
+        openlitespeed) echo "lshttpd openlitespeed litespeed" ;;
+        nginx) echo "nginx" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Map a webserver type to image substrings used to detect docker container image
+_webservver_image_patterns() {
+    case "$1" in
+        apache) echo "apache|httpd" ;;
+        openlitespeed) echo "openlitespeed|ols|lsws|litespeed" ;;
+        nginx) echo "nginx" ;;
+        *) echo "" ;;
+    esac
+}
+
+# Check whether any process matching the webserver type is running on the host.
+# Echoes "yes" or "no". Uses pgrep -x (exact match) against the configured process list,
+# then falls back to systemctl is-active.
+_native_webserver_running() {
+    local type="$1"
+    local names
+    names=$(_webservver_process_names "$type")
+    if [ -z "$names" ]; then
+        echo "no"
+        return 0
+    fi
+
+    for n in $names; do
+        if pgrep -x "$n" >/dev/null 2>&1; then
+            echo "yes"
+            return 0
+        fi
+    done
+
+    # Fallback: systemctl is-active (covers systemd-managed services)
+    if command -v systemctl >/dev/null 2>&1; then
+        for svc in $names; do
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                echo "yes"
+                return 0
+            fi
+        done
+    fi
+
+    echo "no"
+    return 0
+}
+
+# Detect the webserver type currently running on the host (best effort).
+# Returns one of: apache | openlitespeed | nginx | ""
+_native_running_webserver_type() {
+    for t in apache nginx openlitespeed; do
+        local r
+        r=$(_native_webserver_running "$t")
+        if [ "$r" = "yes" ]; then
+            echo "$t"
+            return 0
+        fi
+    done
+    echo ""
+    return 0
+}
+
+# Check whether the docker container is running.
+# Echoes "running" | "stopped" | "missing"
+_docker_container_state() {
+    local container="$1"
+    if [ -z "$container" ]; then
+        echo "missing"
+        return 0
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "missing"
+        return 0
+    fi
+    local state
+    state=$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)
+    if [ -z "$state" ]; then
+        echo "missing"
+    elif [ "$state" = "true" ]; then
+        echo "running"
+    else
+        echo "stopped"
+    fi
+    return 0
+}
+
+# Detect webserver type from the image of a docker container.
+# Returns one of: apache | openlitespeed | nginx | ""
+_docker_container_webserver_type() {
+    local container="$1"
+    if [ -z "$container" ] || ! command -v docker >/dev/null 2>&1; then
+        echo ""
+        return 0
+    fi
+    local image
+    image=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null)
+    if [ -z "$image" ]; then
+        echo ""
+        return 0
+    fi
+
+    local t pat
+    for t in apache nginx openlitespeed; do
+        pat=$(_webservver_image_patterns "$t")
+        if echo "$image" | grep -qiE "$pat"; then
+            echo "$t"
+            return 0
+        fi
+    done
+    echo ""
+    return 0
+}
+
+# Aggregator: run all preflight checks and decide whether to proceed.
+# Returns:
+#   0   = proceed (all checks ok, or only warnings, or --force is set)
+#   1   = fatal (do not proceed). Caller should NOT continue.
+# Sets PREFLIGHT_RESULTS to a multi-line human-readable summary suitable for logs/email.
+preflight_check_restore() {
+    local backup_type="$1"
+    local is_docker="$2"
+    local container="$3"
+
+    PREFLIGHT_RESULTS=""
+    local fatal=0
+
+    if [ -z "$backup_type" ]; then
+        PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [WARN] Could not determine webserver type from backup (skipping type checks)"
+        echo "$PREFLIGHT_RESULTS"
+        return 0
+    fi
+
+    if [ "$is_docker" = true ]; then
+        # Docker mode checks
+        local state
+        state=$(_docker_container_state "$container")
+        case "$state" in
+            running)
+                PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [OK]   Container '$container' is running"
+                # Check image matches backup type
+                local img_type
+                img_type=$(_docker_container_webserver_type "$container")
+                if [ -n "$img_type" ] && [ "$img_type" != "$backup_type" ]; then
+                    PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [WARN] Backup type is '$backup_type' but container image looks like '$img_type'"
+                elif [ -n "$img_type" ]; then
+                    PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [OK]   Container image matches backup type ('$backup_type')"
+                fi
+                ;;
+            stopped)
+                PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [FATAL] Container '$container' exists but is NOT running — cannot restore into it"
+                fatal=1
+                ;;
+            missing)
+                PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [FATAL] Container '$container' does not exist (or docker not available)"
+                fatal=1
+                ;;
+        esac
+    else
+        # Native mode checks
+        local running_type
+        running_type=$(_native_running_webserver_type)
+        if [ -z "$running_type" ]; then
+            PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [WARN] No webserver process detected on host (no nginx/apache2/httpd/lshttpd running)"
+            PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n         (this is OK if you are restoring to a fresh host before starting the webserver)"
+        else
+            PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [OK]   Detected webserver process on host: '$running_type'"
+            if [ "$running_type" != "$backup_type" ]; then
+                PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [WARN] Backup type is '$backup_type' but host is running '$running_type' — restore will overwrite a different webserver's config"
+            else
+                PREFLIGHT_RESULTS="${PREFLIGHT_RESULTS}\n  - [OK]   Host webserver type matches backup type ('$backup_type')"
+            fi
+        fi
+    fi
+
+    if [ $fatal -ne 0 ]; then
+        echo -e "$PREFLIGHT_RESULTS"
+        return 1
+    fi
+    echo -e "$PREFLIGHT_RESULTS"
     return 0
 }
 
@@ -767,6 +960,24 @@ log_message "Webserver type : $WEBSERVER_TYPE"
 log_message "Target         : $TARGET"
 log_message "Mode           : $([ "$DRY_RUN" = true ] && echo "DRY-RUN" || echo "APPLY")"
 log_message "Force          : $FORCE"
+
+# Preflight checks: verify target is reachable and (softly) that the running webserver matches the backup type.
+# Aborts only on FATAL (e.g. Docker container not running). Mismatch / no-process on host → WARN only.
+log_message "Running preflight checks..."
+if [ "$FORCE" = true ]; then
+    log_message "  - [SKIP] --force flag set; bypassing preflight checks"
+    PREFLIGHT_RESULTS="  - [SKIP] Bypassed by --force"
+else
+    if ! preflight_check_restore "$WEBSERVER_TYPE" "$IS_DOCKER" "$WEBSERVER_CONTAINER" > "$TEMP_DIR/preflight.txt" 2>&1; then
+        log_message "Preflight FAILED — aborting restore:"
+        cat "$TEMP_DIR/preflight.txt" | sed 's/^/  /'
+        log_message "Re-run with --force to override preflight checks."
+        exit 1
+    fi
+    PREFLIGHT_RESULTS=$(cat "$TEMP_DIR/preflight.txt")
+    log_message "Preflight results:"
+    echo "$PREFLIGHT_RESULTS" | sed 's/^/  /'
+fi
 
 # Safety backup existing config (unless --force)
 if [ "$FORCE" != true ]; then
