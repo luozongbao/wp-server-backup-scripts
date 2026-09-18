@@ -1077,13 +1077,31 @@ restore_database_docker() {
     
     docker_restore_cmd="$docker_restore_cmd $DB_NAME"
     
-    # Execute database restore
-    if eval "$docker_restore_cmd" < "$sql_file" 2>/dev/null; then
+    # Execute database restore. Capture stdout to a tmpfile so we don't
+    # leak DB content (multi-row INSERT...VALUES rows, etc.) to the user's
+    # terminal on a successful import. If the command fails, we surface
+    # the captured output alongside the error message.
+    local _restore_stdout _restore_stderr _restore_rc
+    _restore_stdout=$(mktemp)
+    _restore_stderr=$(mktemp)
+    trap "rm -f '$_restore_stdout' '$_restore_stderr'" RETURN
+    eval "$docker_restore_cmd" < "$sql_file" > "$_restore_stdout" 2> "$_restore_stderr"
+    _restore_rc=$?
+    if [ "$_restore_rc" = 0 ]; then
         log_message "Database restored successfully using Docker"
         return 0
     else
         log_message "ERROR: Failed to restore database using Docker"
         log_message "Please check database credentials and container status"
+        # Surface captured output only on failure (truncated to last 30 lines).
+        if [ -s "$_restore_stderr" ]; then
+            log_message "MySQL stderr (last 30 lines):"
+            tail -n 30 "$_restore_stderr" | sed 's/^/  [mysql] /'
+        fi
+        if [ -s "$_restore_stdout" ]; then
+            log_message "MySQL stdout (last 30 lines):"
+            tail -n 30 "$_restore_stdout" | sed 's/^/  [mysql] /'
+        fi
         return 1
     fi
 }
@@ -1114,13 +1132,30 @@ restore_database_native() {
     
     restore_cmd="$restore_cmd $DB_NAME"
     
-    # Execute database restore
-    if eval "$restore_cmd" < "$sql_file" 2>/dev/null; then
+    # Execute database restore. Capture stdout to a tmpfile so we don't
+    # leak DB content (multi-row INSERT...VALUES rows, etc.) to the user's
+    # terminal on a successful import. If the command fails, we surface
+    # the captured output alongside the error message.
+    local _restore_stdout _restore_stderr _restore_rc
+    _restore_stdout=$(mktemp)
+    _restore_stderr=$(mktemp)
+    trap "rm -f '$_restore_stdout' '$_restore_stderr'" RETURN
+    eval "$restore_cmd" < "$sql_file" > "$_restore_stdout" 2> "$_restore_stderr"
+    _restore_rc=$?
+    if [ "$_restore_rc" = 0 ]; then
         log_message "Database restored successfully using native $DB_TYPE"
         return 0
     else
         log_message "ERROR: Failed to restore database using native $DB_TYPE"
         log_message "Please check database credentials and service availability"
+        if [ -s "$_restore_stderr" ]; then
+            log_message "MySQL stderr (last 30 lines):"
+            tail -n 30 "$_restore_stderr" | sed 's/^/  [mysql] /'
+        fi
+        if [ -s "$_restore_stdout" ]; then
+            log_message "MySQL stdout (last 30 lines):"
+            tail -n 30 "$_restore_stdout" | sed 's/^/  [mysql] /'
+        fi
         return 1
     fi
 }
@@ -1129,10 +1164,13 @@ restore_database_native() {
 detect_old_url() {
     local wp_config_path="$1"
 
-    # Try to extract siteurl from the SQL file in the backup
+    # Try to extract siteurl from the SQL file in the backup.
+    # IMPORTANT: Use 'grep -m 1' to stop after the first match (not 'head -1'
+    # which only stops after a newline, and would leak the rest of a
+    # multi-line INSERT that contains serialized data spanning many lines).
     if [ -f "$TEMP_DIR/database.sql" ]; then
         local detected_url
-        detected_url=$(grep -oE "siteurl.*'https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null | head -1 | grep -oE "https?://[^']+")
+        detected_url=$(grep -oE "'https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null | grep -m 1 -oE "https?://[^']+")
         if [ -n "$detected_url" ]; then
             echo "$detected_url"
             return 0
@@ -1213,15 +1251,31 @@ run_db_query() {
     db_cmd=$(build_db_query_cmd)
     local query_file
     query_file=$(mktemp)
-    # 'trap ... RETURN' fires when this function returns, no matter how
-    # (success, error, or early-return). Guarantees the temp file is cleaned
-    # up even if a command between this point and the return fails.
-    trap "rm -f '$query_file'" RETURN
+    # Capture stdout+stderr to temp files; only surface on failure.
+    # mysql/mariadb may print table data to stdout during UPDATE statements
+    # (e.g. when re-reading triggers, or with verbose modes) - we MUST
+    # suppress stdout to avoid leaking DB content into the restore log.
+    local _qd_stdout _qd_stderr
+    _qd_stdout=$(mktemp)
+    _qd_stderr=$(mktemp)
+    trap "rm -f '$query_file' '$_qd_stdout' '$_qd_stderr'" RETURN
     # Write query to file with no shell expansion (printf preserves $ literally)
     printf '%s\n' "$query" > "$query_file"
-    # Pipe into the command; db_cmd ends with the DB name (no -e flag)
-    $db_cmd < "$query_file" 2>/dev/null
+    # Pipe into the command; redirect ALL output to temp files.
+    # db_cmd ends with the DB name (no -e flag).
+    $db_cmd < "$query_file" > "$_qd_stdout" 2> "$_qd_stderr"
     local rc=$?
+    if [ "$rc" != 0 ]; then
+        # On failure, surface captured output (truncated) for debugging
+        if [ -s "$_qd_stderr" ]; then
+            log_message "DB query stderr (last 20 lines):"
+            tail -n 20 "$_qd_stderr" | sed 's/^/  [query] /'
+        fi
+        if [ -s "$_qd_stdout" ]; then
+            log_message "DB query stdout (last 20 lines):"
+            tail -n 20 "$_qd_stdout" | sed 's/^/  [query] /'
+        fi
+    fi
     return $rc
 }
 
@@ -1232,7 +1286,7 @@ run_db_query_capture() {
     db_cmd=$(build_db_query_cmd)
     local query_file
     query_file=$(mktemp)
-    # trap RETURN ensures cleanup on any exit path from this function
+    # For capture we WANT stdout (that's the SELECT result), so only redirect stderr.
     trap "rm -f '$query_file'" RETURN
     printf '%s\n' "$query" > "$query_file"
     local output
