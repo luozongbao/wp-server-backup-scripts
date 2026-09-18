@@ -16,16 +16,30 @@ IS_DOCKER=false
 LIGHTWEIGHT=false
 EMAIL_TO=""
 EMAIL_FROM="admin@companydomain.com"
+# Container-direct mode: backup from a running WordPress Docker container
+# without requiring a host bind mount. Use when WordPress files live only
+# inside a Docker container (named volume) and no folder is mapped to host.
+WP_CONTAINER=""
+WP_CONTAINER_DOCROOT="/var/www/html"
 
 # Function to display help
 show_help() {
     echo "WordPress Backup Script"
     echo "================================"
     echo ""
-    echo "Usage: $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-h]"
+    echo "Usage:"
+    echo "  Host path:   $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-h]"
+    echo "  Container:   $0 -c WP_CONTAINER   [-o OUTPUT_DIR] [-l] [-e EMAIL] [-d DOCROOT] [-h]"
     echo ""
     echo "Options:"
-    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (required)"
+    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory on the host"
+    echo "                       (required if -c is not used)"
+    echo "  -c WP_CONTAINER      Name or ID of a running WordPress Docker container."
+    echo "                       Use this when WordPress files are NOT mapped to the host"
+    echo "                       (e.g. named volumes). Files are pulled via 'docker cp'."
+    echo "                       Mutually exclusive with -w."
+    echo "  -d DOCROOT           Document root inside the WordPress container"
+    echo "                       (default: /var/www/html, used with -c)"
     echo "  -o OUTPUT_DIR        Path to the backup output directory (optional, default: current directory)"
     echo "  -l                   Lightweight mode: backup only wp-content, wp-config.php,"
     echo "                       and .htaccess (optional, default: full backup)"
@@ -33,19 +47,24 @@ show_help() {
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
+    echo "  # Host path (folder mapped from container)"
     echo "  $0 -w /var/www/html/wordpress"
-    echo "  $0 -w /var/www/html/wordpress -o /backups"
-    echo "  $0 -w /home/user/website -o /home/user/backups"
-    echo "  $0 -w /var/www/html/wordpress -l -o /backups    (lightweight mode)"
-    echo "  $0 -w /var/www/html/wordpress -e admin@example.com"
+    echo "  $0 -w /var/www/html/wordpress -o /backups -l"
+    echo "  $0 -w /home/user/website -e admin@example.com"
+    echo ""
+    echo "  # Container-direct (WordPress lives only inside Docker)"
+    echo "  $0 -c my_project-wordpress-app -o /backups"
+    echo "  $0 -c my_project-wordpress-app -l -d /var/www/html -e admin@example.com"
     echo ""
     echo "Output format: [timestamp]_[wordpress-folder-name].zip"
     echo "Example: 20250530_143022_wordpress.zip"
     echo "          20250530_143022_wordpress_lightweight.zip (lightweight mode)"
+    echo "          20250530_143022_wp-dev-environment-wordpress-app.zip (container-direct)"
     echo ""
     echo "Features:"
     echo "  - Auto-detects Docker containers or native database services"
     echo "  - Supports both MySQL and MariaDB"
+    echo "  - Container-direct mode (-c) for WordPress Docker with no host bind mount"
     echo "  - Full mode: backs up entire WordPress directory + database"
     echo "  - Lightweight mode: backs up wp-content + wp-config.php + .htaccess + database"
     echo "  - Verifies backup integrity"
@@ -316,26 +335,308 @@ detect_native_database_service() {
 # Function to extract database configuration from wp-config.php
 extract_db_config() {
     local wp_config="$1/wp-config.php"
-    
+
     if [ ! -f "$wp_config" ]; then
         log_message "ERROR: wp-config.php not found in $1"
         return 1
     fi
-    
+
     # Extract database configuration
     DB_NAME=$(grep "define.*DB_NAME" "$wp_config" | sed -n "s/.*DB_NAME.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_USER=$(grep "define.*DB_USER" "$wp_config" | sed -n "s/.*DB_USER.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_PASSWORD=$(grep "define.*DB_PASSWORD" "$wp_config" | sed -n "s/.*DB_PASSWORD.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_HOST=$(grep "define.*DB_HOST" "$wp_config" | sed -n "s/.*DB_HOST.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
-    
+
     if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ] || [ -z "$DB_HOST" ]; then
         log_message "ERROR: Could not extract database configuration from wp-config.php"
         return 1
     fi
-    
+
     log_message "Database configuration extracted successfully"
     log_message "Database: $DB_NAME on $DB_HOST"
     return 0
+}
+
+# Function to extract DB config from inside a WordPress container.
+# Strategy:
+#   1) Try to read env vars WORDPRESS_DB_* from the container directly
+#      (official WordPress image injects these).
+#   2) Fall back to pulling wp-config.php and resolving getenv_docker()
+#      expressions by substituting env values.
+#   3) Fall back to parsing literal define() values in wp-config.php
+#      (works when wp-config.php uses static values instead of helpers).
+extract_db_config_from_container() {
+    local container="$1"
+    local docroot="$2"
+    local tmp_dir="$3"
+
+    log_message "Extracting DB configuration from container '$container'..."
+
+    local tmp_wp_config="$tmp_dir/wp-config.php"
+
+    # Pull wp-config.php (we may already have it, but make it idempotent)
+    if ! docker cp "$container:$docroot/wp-config.php" "$tmp_wp_config" 2>/dev/null; then
+        log_message "ERROR: Failed to copy wp-config.php from container '$container'"
+        return 1
+    fi
+
+    # Step 1: read env vars from container
+    local env_name env_user env_pass env_host
+    env_name=$(docker exec "$container" printenv WORDPRESS_DB_NAME 2>/dev/null || true)
+    env_user=$(docker exec "$container" printenv WORDPRESS_DB_USER 2>/dev/null || true)
+    env_pass=$(docker exec "$container" printenv WORDPRESS_DB_PASSWORD 2>/dev/null || true)
+    env_host=$(docker exec "$container" printenv WORDPRESS_DB_HOST 2>/dev/null || true)
+
+    # Step 2: parse getenv_docker() default values from wp-config.php so
+    # we can fall back to them when env vars are missing. Pattern:
+    #   getenv_docker('WORDPRESS_DB_NAME', 'wordpress')
+    local def_name def_user def_pass def_host
+    def_name=$(grep -E "getenv_docker\(\s*['\"]WORDPRESS_DB_NAME['\"]" "$tmp_wp_config" 2>/dev/null \
+        | sed -n "s/.*WORDPRESS_DB_NAME['\"][[:space:]]*,[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+    def_user=$(grep -E "getenv_docker\(\s*['\"]WORDPRESS_DB_USER['\"]" "$tmp_wp_config" 2>/dev/null \
+        | sed -n "s/.*WORDPRESS_DB_USER['\"][[:space:]]*,[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+    def_pass=$(grep -E "getenv_docker\(\s*['\"]WORDPRESS_DB_PASSWORD['\"]" "$tmp_wp_config" 2>/dev/null \
+        | sed -n "s/.*WORDPRESS_DB_PASSWORD['\"][[:space:]]*,[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+    def_host=$(grep -E "getenv_docker\(\s*['\"]WORDPRESS_DB_HOST['\"]" "$tmp_wp_config" 2>/dev/null \
+        | sed -n "s/.*WORDPRESS_DB_HOST['\"][[:space:]]*,[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+
+    # Step 3: parse literal define('DB_NAME', 'value') as final fallback
+    if [ -z "$def_name" ]; then
+        def_name=$(grep "define.*DB_NAME" "$tmp_wp_config" | sed -n "s/.*DB_NAME.*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | head -1)
+    fi
+    if [ -z "$def_user" ]; then
+        def_user=$(grep "define.*DB_USER" "$tmp_wp_config" | sed -n "s/.*DB_USER.*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | head -1)
+    fi
+    if [ -z "$def_pass" ]; then
+        def_pass=$(grep "define.*DB_PASSWORD" "$tmp_wp_config" | sed -n "s/.*DB_PASSWORD.*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | head -1)
+    fi
+    if [ -z "$def_host" ]; then
+        def_host=$(grep "define.*DB_HOST" "$tmp_wp_config" | sed -n "s/.*DB_HOST.*['\"]\\([^'\"]*\\)['\"].*/\\1/p" | head -1)
+    fi
+
+    DB_NAME="${env_name:-$def_name}"
+    DB_USER="${env_user:-$def_user}"
+    DB_PASSWORD="${env_pass:-$def_pass}"
+    DB_HOST="${env_host:-$def_host}"
+
+    if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ] || [ -z "$DB_HOST" ]; then
+        log_message "ERROR: Could not extract DB config from container env or wp-config.php"
+        return 1
+    fi
+
+    log_message "Database (resolved): $DB_NAME on $DB_HOST (user=$DB_USER, source=$([ -n "$env_name" ] && echo "env" || echo "wp-config.php"))"
+    return 0
+}
+
+# Function to read a file from inside a running container (used in container-direct mode)
+read_file_from_container() {
+    local container="$1"
+    local path="$2"
+
+    if ! docker exec "$container" test -f "$path" 2>/dev/null; then
+        return 1
+    fi
+    docker exec "$container" cat "$path" 2>/dev/null
+}
+
+# Function to validate that the WP container exists and is running, and copy
+# wp-config.php to a temp path so the rest of the script can extract DB info
+# uniformly from a file.
+prepare_container_direct_mode() {
+    local container="$1"
+    local docroot="$2"
+    local tmp_wp_config="$3"
+
+    log_message "Preparing container-direct mode for container: $container"
+    log_message "Document root inside container: $docroot"
+
+    # Verify container exists
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        log_message "ERROR: Container '$container' does not exist"
+        return 1
+    fi
+
+    # Verify container is running
+    local state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)
+    if [ "$state" != "true" ]; then
+        log_message "ERROR: Container '$container' is not running"
+        return 1
+    fi
+
+    # Verify docroot contains wp-config.php
+    if ! docker exec "$container" test -f "$docroot/wp-config.php" 2>/dev/null; then
+        log_message "ERROR: wp-config.php not found at $docroot/wp-config.php inside container '$container'"
+        return 1
+    fi
+
+    # Pull wp-config.php out so we can reuse extract_db_config() unchanged
+    if ! docker cp "$container:$docroot/wp-config.php" "$tmp_wp_config" 2>/dev/null; then
+        log_message "ERROR: Failed to copy wp-config.php out of container '$container'"
+        return 1
+    fi
+
+    log_message "Container-direct mode prepared successfully"
+    return 0
+}
+
+# Function to find the database container that pairs with the WordPress
+# container. Strategy:
+#   1) Look for docker-compose.yml near the WP container and match service
+#      names referenced by DB_HOST (e.g. "db") to a running container with
+#      a mysql/mariadb image.
+#   2) If DB_HOST is a DNS service name, look up docker network aliases.
+#   3) Fallback: scan all running mysql/mariadb containers and pick the one
+#      sharing at least one docker network with the WP container.
+#
+# IMPORTANT: This function is called via $(...) so its stdout is captured
+# as the container name. Therefore ALL log output must go to stderr (>&2).
+find_db_container_for_wp() {
+    local wp_container="$1"
+    local db_host="$2"
+
+    log_message "Resolving database container for '$wp_container' (DB_HOST='$db_host')..." >&2
+
+    # Normalize "host:port" or "host"
+    local db_service="${db_host%%:*}"
+
+    # Try to find docker-compose.yml near the WP container by inspecting its
+    # labels (compose sets label com.docker.compose.project.config_files).
+    local compose_file=""
+    local config_files=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$wp_container" 2>/dev/null || true)
+    if [ -n "$config_files" ] && [ "$config_files" != "<no value>" ]; then
+        # Take the first path in the (possibly comma-separated) list
+        compose_file="${config_files%%,*}"
+        if [ -f "$compose_file" ]; then
+            log_message "Found compose file via container labels: $compose_file" >&2
+        else
+            compose_file=""
+        fi
+    fi
+
+    # Strategy 1: match by service name in compose file
+    if [ -n "$compose_file" ]; then
+        # Find a service block whose name matches db_service OR whose
+        # container_name is set to db_service
+        local matched_container=""
+        local current_service=""
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_-]+):[[:space:]]*$ ]]; then
+                current_service="${BASH_REMATCH[1]}"
+            fi
+            if [[ "$line" =~ container_name:[[:space:]]*([^[:space:]]+) ]]; then
+                local cn="${BASH_REMATCH[1]}"
+                if [ "$cn" = "$db_service" ] || [ "$cn" = "${PROJECT_NAME:-}_${db_service}" ] || [ "$cn" = "${PROJECT_NAME:-}-${db_service}" ]; then
+                    matched_container="$cn"
+                fi
+            fi
+            if [ "$current_service" = "$db_service" ] && [ -z "$matched_container" ]; then
+                # Try to find a running container whose name starts with
+                # the project prefix + service name
+                local project=$(basename "$(dirname "$compose_file")")
+                local candidate="${project}-${db_service}"
+                if docker inspect "$candidate" >/dev/null 2>&1; then
+                    matched_container="$candidate"
+                fi
+            fi
+        done < "$compose_file"
+
+        if [ -n "$matched_container" ] && docker ps --format '{{.Names}}' | grep -qx "$matched_container"; then
+            echo "$matched_container"
+            return 0
+        fi
+    fi
+
+    # Strategy 2: a container literally named db_service (DB_HOST value)
+    if docker ps --format '{{.Names}}' | grep -qx "$db_service"; then
+        local candidate_state=$(docker inspect -f '{{.State.Running}}' "$db_service" 2>/dev/null)
+        if [ "$candidate_state" = "true" ]; then
+            echo "$db_service"
+            return 0
+        fi
+    fi
+
+    # Strategy 3: scan all running mysql/mariadb containers and pick the one
+    # sharing a network with the WP container
+    local wp_networks=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$wp_container" 2>/dev/null)
+    local candidates=$(docker ps --format '{{.Names}}\t{{.Image}}' | awk '$2 ~ /mysql|mariadb/ {print $1}')
+
+    for cand in $candidates; do
+        local cand_networks=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cand" 2>/dev/null)
+        for net in $wp_networks; do
+            if [[ " $cand_networks " == *" $net "* ]]; then
+                log_message "Picked DB container '$cand' via shared network '$net'" >&2
+                echo "$cand"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+# Pull WordPress files out of the container into a temp directory using
+# 'docker cp'. Used in container-direct mode.
+#
+# Note: wp-config.php is already in $temp_dir/files/ from
+# prepare_container_direct_mode(); we skip re-copying it so the archive
+# structure matches the host-path mode (which produces files/wp-config.php).
+backup_files_from_container() {
+    local container="$1"
+    local docroot="$2"
+    local temp_dir="$3"
+
+    if [ "$LIGHTWEIGHT" = true ]; then
+        log_message "Creating lightweight backup from container (wp-content, .htaccess)..."
+        log_message "(wp-config.php was already pulled in prepare step)"
+
+        # Copy wp-content
+        if docker exec "$container" test -d "$docroot/wp-content" >/dev/null 2>&1; then
+            if docker cp "$container:$docroot/wp-content" "$temp_dir/files/" 2>/dev/null; then
+                log_message "wp-content pulled from container"
+            else
+                log_message "ERROR: Failed to docker cp wp-content"
+                return 1
+            fi
+        else
+            log_message "WARNING: wp-content not found at $docroot/wp-content in container"
+        fi
+
+        # Copy .htaccess if present (wp-config.php already pulled in prepare step)
+        if docker exec "$container" test -f "$docroot/.htaccess" >/dev/null 2>&1; then
+            if docker cp "$container:$docroot/.htaccess" "$temp_dir/files/" 2>/dev/null; then
+                log_message ".htaccess pulled from container"
+            else
+                log_message "WARNING: Failed to docker cp .htaccess (non-critical)"
+            fi
+        fi
+
+        # Marker file so restore script knows this is lightweight
+        echo "lightweight" > "$temp_dir/files/.backup_mode"
+        local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+        log_message "Lightweight backup size: $files_size"
+        return 0
+    else
+        log_message "Creating full files backup from container..."
+        # docker cp requires a trailing /. to copy directory contents into
+        # $temp_dir/files/. We exclude wp-config.php from the bulk copy and
+        # restore it from the prepare step's file so we don't end up with
+        # two copies in the final archive with different mtimes.
+        if docker cp "$container:$docroot/." "$temp_dir/files/" 2>/dev/null; then
+            # Re-pull wp-config.php from container to ensure it is exactly
+            # what prepare step pulled (and to overwrite whatever bulk copy
+            # put there, since the bulk copy may differ in metadata).
+            if ! docker cp "$container:$docroot/wp-config.php" "$temp_dir/files/wp-config.php" 2>/dev/null; then
+                log_message "WARNING: Failed to refresh wp-config.php from container"
+            fi
+            log_message "WordPress files pulled from container successfully"
+            local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+            log_message "WordPress files size: $files_size"
+            return 0
+        else
+            log_message "ERROR: Failed to docker cp WordPress files from container"
+            return 1
+        fi
+    fi
 }
 
 # Function to create database backup (Docker)
@@ -353,18 +654,20 @@ backup_database_docker() {
     
     # Create database dump command for Docker
     local docker_dump_cmd=""
-    
+
     if [ "$DB_TYPE" = "mariadb" ]; then
         docker_dump_cmd="docker exec $DB_CONTAINER mariadb-dump -u$DB_USER"
     else
         docker_dump_cmd="docker exec $DB_CONTAINER mysqldump -u$DB_USER"
     fi
-    
+
     if [ -n "$DB_PASSWORD" ]; then
         docker_dump_cmd="$docker_dump_cmd -p$DB_PASSWORD"
     fi
-    
-    docker_dump_cmd="$docker_dump_cmd --single-transaction --routines --triggers $DB_NAME"
+
+    # MySQL 8 needs --no-tablespaces for non-root users (PROCESS privilege).
+    # Safe for MariaDB as well — ignored if the server doesn't recognize it.
+    docker_dump_cmd="$docker_dump_cmd --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
     
     # Execute database dump
     if eval "$docker_dump_cmd" > "$output_file" 2>/dev/null; then
@@ -403,8 +706,8 @@ backup_database_native() {
     if [ -n "$DB_PASSWORD" ]; then
         dump_cmd="$dump_cmd -p$DB_PASSWORD"
     fi
-    
-    dump_cmd="$dump_cmd --single-transaction --routines --triggers $DB_NAME"
+
+    dump_cmd="$dump_cmd --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
     
     # Execute database dump
     if eval "$dump_cmd" > "$output_file" 2>/dev/null; then
@@ -494,10 +797,16 @@ backup_files() {
 }
 
 # Parse command line arguments
-while getopts "w:o:le:h" opt; do
+while getopts "w:c:d:o:le:h" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
+            ;;
+        c)
+            WP_CONTAINER="$OPTARG"
+            ;;
+        d)
+            WP_CONTAINER_DOCROOT="$OPTARG"
             ;;
         o)
             OUTPUT_DIR="$OPTARG"
@@ -531,26 +840,35 @@ if [ "$SHOW_HELP" = true ]; then
 fi
 
 # Validate required parameters
-if [ -z "$WORDPRESS_DIR" ]; then
-    echo "ERROR: Missing required parameter -w (WordPress directory)"
+if [ -z "$WORDPRESS_DIR" ] && [ -z "$WP_CONTAINER" ]; then
+    echo "ERROR: Either -w WORDPRESS_DIR or -c WP_CONTAINER is required"
     echo ""
     show_help
     exit 1
 fi
 
-# Validate WordPress directory
-if [ ! -d "$WORDPRESS_DIR" ]; then
-    log_message "ERROR: WordPress directory does not exist: $WORDPRESS_DIR"
+if [ -n "$WORDPRESS_DIR" ] && [ -n "$WP_CONTAINER" ]; then
+    echo "ERROR: -w and -c are mutually exclusive. Use only one."
+    echo ""
+    show_help
     exit 1
 fi
 
-if [ ! -f "$WORDPRESS_DIR/wp-config.php" ]; then
-    log_message "ERROR: wp-config.php not found. Is this a valid WordPress installation?"
-    exit 1
-fi
+# Validate WordPress directory (host mode only)
+if [ -n "$WORDPRESS_DIR" ]; then
+    if [ ! -d "$WORDPRESS_DIR" ]; then
+        log_message "ERROR: WordPress directory does not exist: $WORDPRESS_DIR"
+        exit 1
+    fi
 
-# Convert to absolute path
-WORDPRESS_DIR=$(cd "$WORDPRESS_DIR" && pwd)
+    if [ ! -f "$WORDPRESS_DIR/wp-config.php" ]; then
+        log_message "ERROR: wp-config.php not found. Is this a valid WordPress installation?"
+        exit 1
+    fi
+
+    # Convert to absolute path
+    WORDPRESS_DIR=$(cd "$WORDPRESS_DIR" && pwd)
+fi
 
 # Validate output directory
 if [ ! -d "$OUTPUT_DIR" ]; then
@@ -565,14 +883,73 @@ fi
 # Convert to absolute path
 OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
-# Detect environment (Docker or Native)
-detect_docker_environment
+# Create temporary directory used for both database.sql and files/.
+# In container-direct mode we also pull wp-config.php into TEMP_DIR/files/
+# early so we can reuse extract_db_config() unchanged.
+TEMP_DIR=$(mktemp -d)
+mkdir -p "$TEMP_DIR/files"
+
+# Container-direct mode (-c) preparation:
+# We need to read wp-config.php from inside the running WP container, and we
+# also need a "filesystem view" of WordPress so the rest of the script can
+# reuse its host-style functions (extract_db_config, etc.) on the pulled
+# wp-config.php.
+CONTAINER_DIRECT=false
+
+if [ -n "$WP_CONTAINER" ]; then
+    CONTAINER_DIRECT=true
+    IS_DOCKER=true  # Always Docker when -c is used
+
+    if ! prepare_container_direct_mode "$WP_CONTAINER" "$WP_CONTAINER_DOCROOT" "$TEMP_DIR/files/wp-config.php"; then
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+
+    # Redirect extract_db_config to read from the pulled wp-config.php
+    WORDPRESS_DIR="$TEMP_DIR/files"
+fi
+
+# Detect environment (Docker or Native). In container-direct mode we skip
+# auto-detection because we already know the WP container and don't need a
+# host-side docker-compose.yml scan.
+if [ "$CONTAINER_DIRECT" = false ]; then
+    detect_docker_environment
+fi
 
 # Detect database configuration based on environment
 if [ "$IS_DOCKER" = true ]; then
-    if ! detect_docker_database_info; then
-        log_message "ERROR: Failed to detect Docker database configuration"
-        exit 1
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        # Container-direct: resolve DB config from container env vars first
+        # (official WordPress image exposes WORDPRESS_DB_* env), then fall
+        # back to parsing getenv_docker() defaults in wp-config.php.
+        if ! extract_db_config_from_container "$WP_CONTAINER" "$WP_CONTAINER_DOCROOT" "$TEMP_DIR/files"; then
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
+
+        # Now resolve the DB container from DB_HOST (e.g. "db:3306" -> "db")
+        DB_TYPE="mysql"
+        DB_CONTAINER=$(find_db_container_for_wp "$WP_CONTAINER" "$DB_HOST")
+        if [ -z "$DB_CONTAINER" ]; then
+            log_message "ERROR: Could not resolve database container for '$WP_CONTAINER' (DB_HOST='$DB_HOST')"
+            log_message "Hint: ensure the DB container is running and shares a docker network with the WordPress container"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
+
+        # Refine DB_TYPE by inspecting the resolved container image
+        local_db_image=$(docker inspect -f '{{.Config.Image}}' "$DB_CONTAINER" 2>/dev/null || true)
+        case "$local_db_image" in
+            *mariadb*) DB_TYPE="mariadb" ;;
+            *mysql*)   DB_TYPE="mysql" ;;
+        esac
+        log_message "Database container: $DB_CONTAINER (image=$local_db_image, type=$DB_TYPE)"
+    else
+        if ! detect_docker_database_info; then
+            log_message "ERROR: Failed to detect Docker database configuration"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
     fi
 else
     if ! detect_native_database_service; then
@@ -585,7 +962,11 @@ check_dependencies
 
 # Generate timestamp and backup filename
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
-WORDPRESS_FOLDER_NAME=$(basename "$WORDPRESS_DIR")
+if [ "$CONTAINER_DIRECT" = true ]; then
+    WORDPRESS_FOLDER_NAME="$WP_CONTAINER"
+else
+    WORDPRESS_FOLDER_NAME=$(basename "$WORDPRESS_DIR")
+fi
 if [ "$LIGHTWEIGHT" = true ]; then
     BACKUP_FILENAME="${TIMESTAMP}_${WORDPRESS_FOLDER_NAME}_lightweight.zip"
 else
@@ -594,7 +975,12 @@ fi
 BACKUP_PATH="$OUTPUT_DIR/$BACKUP_FILENAME"
 
 log_message "Starting WordPress Backup process"
-log_message "WordPress directory: $WORDPRESS_DIR"
+if [ "$CONTAINER_DIRECT" = true ]; then
+    log_message "WordPress container: $WP_CONTAINER (docroot: $WP_CONTAINER_DOCROOT)"
+    log_message "Files will be pulled via 'docker cp'"
+else
+    log_message "WordPress directory: $WORDPRESS_DIR"
+fi
 log_message "Output directory: $OUTPUT_DIR"
 log_message "Backup filename: $BACKUP_FILENAME"
 log_message "Backup mode: $([ "$LIGHTWEIGHT" = true ] && echo "Lightweight (wp-content + wp-config.php + .htaccess)" || echo "Full (entire WordPress directory)")"
@@ -608,9 +994,8 @@ fi
 init_log_file
 log_message "Log file initialized: $LOG_FILE"
 
-# Create temporary directory
-TEMP_DIR=$(mktemp -d)
-mkdir -p "$TEMP_DIR/files"
+# TEMP_DIR is created earlier so we can pull wp-config.php into it during
+# container-direct setup. Skip recreating it here.
 
 # Cleanup function (also sends email notification if configured)
 cleanup() {
@@ -633,10 +1018,13 @@ cleanup() {
 # Set trap to cleanup on exit
 trap cleanup EXIT
 
-# Extract database configuration
-if ! extract_db_config "$WORDPRESS_DIR"; then
-    log_message "ERROR: Failed to extract database configuration"
-    exit 1
+# Extract database configuration. In container-direct mode, the DB config
+# was already extracted via extract_db_config_from_container() earlier.
+if [ "$CONTAINER_DIRECT" = false ]; then
+    if ! extract_db_config "$WORDPRESS_DIR"; then
+        log_message "ERROR: Failed to extract database configuration"
+        exit 1
+    fi
 fi
 
 # Create database backup based on environment
@@ -654,10 +1042,38 @@ else
 fi
 
 # Create files backup
-if ! backup_files "$WORDPRESS_DIR" "$TEMP_DIR"; then
-    log_message "ERROR: Files backup failed"
-    exit 1
+# In container-direct mode, files are pulled via 'docker cp' from the
+# WordPress container. In host mode, files are copied from WORDPRESS_DIR.
+if [ "$CONTAINER_DIRECT" = true ]; then
+    if ! backup_files_from_container "$WP_CONTAINER" "$WP_CONTAINER_DOCROOT" "$TEMP_DIR"; then
+        log_message "ERROR: Container files backup failed"
+        exit 1
+    fi
+else
+    if ! backup_files "$WORDPRESS_DIR" "$TEMP_DIR"; then
+        log_message "ERROR: Files backup failed"
+        exit 1
+    fi
 fi
+
+# Write a small .dbinfo sidecar at the root of the archive. This captures
+# the *resolved* database configuration (after getenv_docker() / env
+# expansion), so wp_restore.sh can read DB credentials without re-parsing
+# wp-config.php (which may use env-based helpers and produce wrong values
+# like "wordpress" instead of the real database name).
+cat > "$TEMP_DIR/.dbinfo" <<EOF
+DB_NAME=${DB_NAME}
+DB_USER=${DB_USER}
+DB_PASSWORD=${DB_PASSWORD}
+DB_HOST=${DB_HOST}
+DB_TYPE=${DB_TYPE}
+DB_CONTAINER=${DB_CONTAINER:-}
+BACKUP_MODE=$([ "$LIGHTWEIGHT" = true ] && echo "lightweight" || echo "full")
+SOURCE=$([ "$CONTAINER_DIRECT" = true ] && echo "container-direct" || echo "host")
+WP_CONTAINER=${WP_CONTAINER:-}
+WP_CONTAINER_DOCROOT=${WP_CONTAINER_DOCROOT:-}
+EOF
+log_message "Wrote resolved DB info to .dbinfo"
 
 # Create final zip archive
 log_message "Creating final backup archive..."
@@ -674,7 +1090,7 @@ zip_output=$(zip -r "$BACKUP_PATH" . 2>&1)
 if [ $? -eq 0 ]; then
     log_message "Backup completed successfully!"
     log_message "Backup file: $BACKUP_PATH"
-    
+
     # Display backup size
     BACKUP_SIZE=$(du -h "$BACKUP_PATH" | cut -f1)
     log_message "Total backup size: $BACKUP_SIZE"

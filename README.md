@@ -17,6 +17,7 @@ The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, A
 
 - ✅ **Two backup modes**: Full (entire WordPress directory) or Lightweight (`wp-content` + `wp-config.php` + `.htaccess`)
 - ✅ **Auto-detection**: Docker vs native environment, MySQL vs MariaDB
+- ✅ **Container-direct mode** (`-c`): back up and restore WordPress running in Docker **without** a host folder mapping — uses `docker cp` and a `.dbinfo` sidecar to carry the resolved DB credentials
 - ✅ **Single archive**: Files + database in one ZIP file
 - ✅ **Smart restore**: Automatically detects full vs lightweight backup; refuses to restore lightweight into an empty directory
 - ✅ **Post-restore customization**: Optional URL replacement, site title change, admin user creation — perfect for migrations to new domains
@@ -59,6 +60,63 @@ WordPress core (`wp-admin/`, `wp-includes/`) is **not** included since it can be
 > ⚠️ **IMPORTANT**: Restoring a lightweight backup requires the target directory to **already contain WordPress core files** (`wp-includes/`, `wp-admin/`) with a compatible version. If not, install WordPress first or use a full backup.
 
 The restore script **refuses to proceed** and exits with an error if the target is empty or missing core files, preventing a broken installation.
+
+## Container-Direct Mode (`-c`)
+
+> 🐳 **Use `-c` when WordPress runs in Docker without a host folder mapping** (e.g. only Docker named volumes are mounted). The script will read/write files and database **through the running container** using `docker cp` and `docker exec` — no host path required.
+
+This mode is designed for the official WordPress Docker image (`wordpress:cli`, `wordpress:apache`) and similar images that use `getenv_docker()` helpers in `wp-config.php` (so DB credentials live in container environment variables, not the file itself).
+
+### What `-c` does
+
+- **Backup (`wp_backup.sh -c`)** — pulls files out of the running WP container with `docker cp`, dumps the database via the **DB container** (auto-detected from compose labels / container networks), and writes a `.dbinfo` sidecar with the resolved DB credentials (so the literal `"wordpress"` placeholder from `getenv_docker()` never leaks into the archive).
+- **Restore (`wp_restore.sh -c`)** — pushes files back into the running WP container with `docker cp`, restores the database through the DB container. Reads `.dbinfo` from the backup to find the right DB container + credentials without re-parsing the (possibly env-driven) `wp-config.php`.
+
+### Quick Start
+
+```bash
+# Backup — read everything from inside the running WP container
+./wp_backup.sh -c my-project-wordpress-app -o /backups
+
+# Backup with a custom document root inside the container (default: /var/www/html)
+./wp_backup.sh -c my-project-wordpress-app -d /var/www/html -o /backups
+
+# Restore — push everything back into the running WP container
+./wp_restore.sh -b /backups/20260918_171946_my-project-wordpress-app.zip \
+  -c my-project-wordpress-app
+
+# Restore + URL replacement (e.g. swap dev domain for production)
+./wp_restore.sh -b backup.zip -c my-project-wordpress-app \
+  -u https://www.production.com \
+  -A admin -P 'N3wP@ss!' -E admin@production.com
+```
+
+### Limitations & Notes
+
+- The WP container **must be running**. `docker inspect` is used to verify state.
+- The DB container is auto-detected from `com.docker.compose.project.config_files` labels, shared compose-network names, and image-name heuristics. If auto-detect fails, inspect the backup's `.dbinfo` (it's a plain text file with `KEY=VALUE` lines) and verify the DB container name.
+- Lightweight container-direct restores still require `wp-includes/` to exist inside the container — same rule as the host-mode restore.
+- For DB dumps from **MySQL 8.0** containers, the script adds `--no-tablespaces` automatically (non-root users lack the `PROCESS` privilege).
+- Mutually exclusive with `-w` — pick either a host path or a container, not both.
+
+### `.dbinfo` sidecar format
+
+The backup ZIP contains a `.dbinfo` file at the archive root:
+
+```ini
+DB_NAME=<resolved db name>          # not the literal "wordpress" placeholder
+DB_USER=<db user>
+DB_PASSWORD=<db password>
+DB_HOST=<db host as seen by WP>     # e.g. "db:3306"
+DB_TYPE=<mysql|mariadb>
+DB_CONTAINER=<compose db service + project>
+BACKUP_MODE=<full|lightweight>
+SOURCE=<container-direct|native>
+WP_CONTAINER=<the container that was backed up>
+WP_CONTAINER_DOCROOT=<docroot inside the container>
+```
+
+This file is read by `wp_restore.sh` to skip `wp-config.php` parsing entirely (which would otherwise fail for env-driven configs).
 
 ## Quick Start
 
@@ -126,7 +184,9 @@ The restore script **refuses to proceed** and exits with an error if the target 
 ```
 
 **Options**:
-- `-w WORDPRESS_DIR`: Path to WordPress installation (required)
+- `-w WORDPRESS_DIR`: Path to WordPress installation (required, **mutually exclusive with `-c`**)
+- `-c WP_CONTAINER`: **Container-direct mode** — read files from the running WP container instead of a host path (no folder mapping required)
+- `-d DOCROOT`: Document root **inside the container** when using `-c` (default: `/var/www/html`)
 - `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
 - `-l`: Lightweight mode (backup only `wp-content`, `wp-config.php`, `.htaccess`)
 - `-e EMAIL`: Send backup report to this email address (optional, requires `msmtp`)
@@ -134,14 +194,18 @@ The restore script **refuses to proceed** and exits with an error if the target 
 
 **Examples**:
 ```bash
-# Full backup
+# Full backup (host path)
 ./wp_backup.sh -w /var/www/html/wordpress -o /backups
 
-# Lightweight backup
+# Lightweight backup (host path)
 ./wp_backup.sh -w /var/www/html/wordpress -l -o /backups
 
 # Backup with email notification
 ./wp_backup.sh -w /var/www/html/wordpress -o /backups -e admin@example.com
+
+# Container-direct: WP runs in Docker with no host folder mapping
+./wp_backup.sh -c my-project-wordpress-app -o /backups
+./wp_backup.sh -c my-project-wordpress-app -d /var/www/html -l -o /backups
 ```
 
 ### Email Notifications
@@ -197,10 +261,12 @@ Notification is sent automatically on both success and failure — even `exit 1`
 
 | Option | Description |
 |--------|-------------|
-| `-b BACKUP_FILE` | Path to the backup ZIP file (required) |
-| `-w WORDPRESS_DIR` | Path to WordPress installation directory (required) |
+| `-b BACKUP_FILE` | Path to the backup ZIP file (required, **not needed for `-f` fix mode**) |
+| `-w WORDPRESS_DIR` | Path to WordPress installation directory (**mutually exclusive with `-c`**) |
+| `-c WP_CONTAINER` | **Container-direct mode** — push files back into the running WP container (no host folder mapping required). Reads `.dbinfo` from the backup to find the DB container + credentials. |
+| `-d DOCROOT` | Document root **inside the container** when using `-c` (default: `/var/www/html`) |
 | `-u NEW_URL` | Replace all URLs in the database with this URL (e.g. `http://localhost:8088`) |
-| `-U OLD_URL` | Specify the URL to search for (default: auto-detect from `wp-config.php`) |
+| `-U OLD_URL` | Specify the URL to search for (default: auto-detect from `wp-config.php` or `.dbinfo`) |
 | `-t NEW_TITLE` | Set a new site title (updates `blogname` option) |
 | `-A ADMIN_USER` | Create or update an admin user (login) |
 | `-P ADMIN_PASSWORD` | Password for the admin user (requires `-A`) |
@@ -208,6 +274,7 @@ Notification is sent automatically on both success and failure — even `exit 1`
 | `--skip-files` | Skip file restoration (DB only) |
 | `--skip-db` | Skip database restoration (files only) |
 | `--dry-run` | Show what would happen, then exit without modifying anything |
+| `--fix-mode` / `-f` | Apply post-restore customizations to a live site **without** restoring from a backup |
 | `-h` | Show help message |
 
 **Examples**:
@@ -231,6 +298,15 @@ Notification is sent automatically on both success and failure — even `exit 1`
 
 # Restore files only (keep existing DB)
 ./wp_restore.sh -b files_backup.zip -w /var/www/site --skip-db
+
+# Container-direct restore (push into running WP container, no host mapping)
+./wp_restore.sh -b /backups/20260918_171946_my-project-wordpress-app.zip \
+  -c my-project-wordpress-app
+
+# Container-direct + URL replacement
+./wp_restore.sh -b backup.zip -c my-project-wordpress-app \
+  -u https://www.production.com \
+  -A admin -P 'N3wP@ss!' -E admin@production.com
 ```
 
 **Post-Restore Customizations**:
@@ -481,7 +557,8 @@ YYYYMMDD_HHMMSS_foldername.zip
 │   ├── wp-content/
 │   ├── wp-config.php
 │   └── ...
-└── database.sql
+├── database.sql
+└── .dbinfo                 ← Resolved DB credentials (container-direct only)
 ```
 
 ### Lightweight Mode
@@ -491,8 +568,11 @@ YYYYMMDD_HHMMSS_foldername_lightweight.zip
 │   ├── wp-content/         ← Themes, plugins, uploads
 │   ├── wp-config.php
 │   └── .htaccess (if exists)
-└── database.sql
+├── database.sql
+└── .dbinfo                 ← Resolved DB credentials (container-direct only)
 ```
+
+> 💡 The `.dbinfo` sidecar is only written when the backup was taken in **container-direct mode** (`-c`). It contains the **resolved** DB credentials (after env / `getenv_docker()` resolution) so a future restore doesn't have to re-parse `wp-config.php` — which would otherwise return the literal placeholder `"wordpress"` instead of the real DB name.
 
 ## Output Format
 

@@ -13,6 +13,20 @@ DB_TYPE=""
 DB_CONTAINER=""
 IS_DOCKER=false
 BACKUP_MODE=""
+# Resolved DB config from .dbinfo sidecar (preferred over parsing
+# wp-config.php, which may use env-based helpers and produce wrong values).
+BACKUP_DB_NAME=""
+BACKUP_DB_USER=""
+BACKUP_DB_PASSWORD=""
+BACKUP_DB_HOST=""
+BACKUP_DB_TYPE=""
+BACKUP_DB_CONTAINER=""
+BACKUP_SOURCE=""
+# Container-direct mode: restore files into a running WordPress Docker
+# container using 'docker cp' instead of writing to a host path. Use when
+# WordPress lives in a named volume (no host bind mount).
+WP_CONTAINER=""
+WP_CONTAINER_DOCROOT="/var/www/html"
 # Tracks backup paths created as safety net during restore (e.g. www.backup.<TS>).
 # These are auto-removed on SUCCESS, but PRESERVED on ERROR so the user can
 # roll back manually if anything went wrong mid-restore.
@@ -39,18 +53,25 @@ show_help() {
     echo "=================================="
     echo ""
     echo "Usage:"
-    echo "  Restore mode:   $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]"
-    echo "  Fix mode (-f):  $0 -f -w WORDPRESS_DIR [post-restore options]"
+    echo "  Restore (host):     $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]"
+    echo "  Restore (Docker):   $0 -b BACKUP_FILE -c WP_CONTAINER [options]"
+    echo "  Fix mode (-f):      $0 -f -w WORDPRESS_DIR [post-restore options]"
     echo ""
     echo "Required Options (restore mode):"
     echo "  -b BACKUP_FILE       Path to the backup ZIP file (required unless -f)"
-    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (always required)"
+    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory on the host"
+    echo "                       (required unless -c is used; mutually exclusive with -c)"
+    echo "  -c WP_CONTAINER      Name or ID of a running WordPress Docker container."
+    echo "                       Use this when WordPress files live inside Docker with"
+    echo "                       no host bind mount. Files are pushed via 'docker cp'."
+    echo "  -d DOCROOT           Document root inside the WordPress container"
+    echo "                       (default: /var/www/html, used with -c)"
     echo ""
     echo "Modes:"
     echo "  -f, --fix-mode       Fix mode: do NOT restore files or database. Only run"
     echo "                       post-restore customizations (-u, -t, -A) against the"
     echo "                       live site. -b is not needed; DB credentials are read from"
-    echo "                       the live WordPress installation at -w."
+    echo "                       the live WordPress installation at -w or -c."
     echo ""
     echo "Post-Restore Customization:"
     echo "  -u NEW_URL           Replace site URL throughout database (e.g., http://localhost:8088)"
@@ -82,6 +103,13 @@ show_help() {
     echo ""
     echo "  # Preview restore without making changes"
     echo "  $0 -b /backups/backup.zip -w /var/www/html/wordpress --dry-run"
+    echo ""
+    echo "  # Restore back into a Docker container (WordPress lives in a named volume)"
+    echo "  $0 -b /backups/backup.zip -c my_project-wordpress-app"
+    echo ""
+    echo "  # Restore into a container and change URL"
+    echo "  $0 -b /backups/backup.zip -c my_project-wordpress-app \\"
+    echo "     -U https://oldsite.com -u https://newsite.com"
     echo ""
     echo "  # FIX MODE: change live site URL only (no restore, no backup needed)"
     echo "  $0 -f -w /var/www/html/wordpress \\"
@@ -345,30 +373,75 @@ extract_backup() {
         cat "$temp_dir/backup_info.txt"
         echo ""
     fi
-    
+
+    # Load resolved DB config from .dbinfo sidecar if present. The sidecar
+    # contains the values AFTER env/getenv_docker() resolution, which is
+    # critical for Docker images that use env-driven wp-config.php
+    # (otherwise we'd get literal "wordpress" instead of the real DB name).
+    if [ -f "$temp_dir/.dbinfo" ]; then
+        log_message "Loading resolved DB config from .dbinfo sidecar..."
+        # Source each KEY=VALUE line (skip blanks/comments). Use a subshell
+        # so we can filter safely.
+        while IFS='=' read -r key val; do
+            case "$key" in
+                DB_NAME)      BACKUP_DB_NAME="$val" ;;
+                DB_USER)      BACKUP_DB_USER="$val" ;;
+                DB_PASSWORD)  BACKUP_DB_PASSWORD="$val" ;;
+                DB_HOST)      BACKUP_DB_HOST="$val" ;;
+                DB_TYPE)      BACKUP_DB_TYPE="$val" ;;
+                DB_CONTAINER) BACKUP_DB_CONTAINER="$val" ;;
+                BACKUP_MODE)  [ "$val" = "lightweight" ] && BACKUP_MODE="lightweight" ;;
+                SOURCE)       BACKUP_SOURCE="$val" ;;
+                WP_CONTAINER) BACKUP_WP_CONTAINER="$val" ;;
+                WP_CONTAINER_DOCROOT) BACKUP_WP_CONTAINER_DOCROOT="$val" ;;
+            esac
+        done < "$temp_dir/.dbinfo"
+        log_message "  DB: $BACKUP_DB_NAME on $BACKUP_DB_HOST (type=$BACKUP_DB_TYPE)"
+        log_message "  Source: $BACKUP_SOURCE"
+    fi
+
     return 0
 }
 
 # Function to extract database configuration from backup wp-config.php
 extract_db_config() {
     local wp_config="$1/wp-config.php"
-    
+
+    # Prefer the resolved values from the .dbinfo sidecar (written by
+    # wp_backup.sh). This avoids wrong defaults like "wordpress" when the
+    # original wp-config.php uses getenv_docker() or similar env helpers.
+    if [ -n "$BACKUP_DB_NAME" ] && [ -n "$BACKUP_DB_USER" ] && [ -n "$BACKUP_DB_HOST" ]; then
+        DB_NAME="$BACKUP_DB_NAME"
+        DB_USER="$BACKUP_DB_USER"
+        DB_PASSWORD="$BACKUP_DB_PASSWORD"
+        DB_HOST="$BACKUP_DB_HOST"
+        if [ -n "$BACKUP_DB_TYPE" ]; then
+            DB_TYPE="$BACKUP_DB_TYPE"
+        fi
+        if [ -n "$BACKUP_DB_CONTAINER" ]; then
+            DB_CONTAINER="$BACKUP_DB_CONTAINER"
+        fi
+        log_message "Database config from .dbinfo sidecar"
+        log_message "Database: $DB_NAME on $DB_HOST (container: ${DB_CONTAINER:-unknown})"
+        return 0
+    fi
+
     if [ ! -f "$wp_config" ]; then
         log_message "ERROR: wp-config.php not found in $1"
         return 1
     fi
-    
+
     # Extract database configuration
     DB_NAME=$(grep "define.*DB_NAME" "$wp_config" | sed -n "s/.*DB_NAME.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_USER=$(grep "define.*DB_USER" "$wp_config" | sed -n "s/.*DB_USER.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_PASSWORD=$(grep "define.*DB_PASSWORD" "$wp_config" | sed -n "s/.*DB_PASSWORD.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_HOST=$(grep "define.*DB_HOST" "$wp_config" | sed -n "s/.*DB_HOST.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
-    
+
     if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ] || [ -z "$DB_HOST" ]; then
         log_message "ERROR: Could not extract database configuration from wp-config.php"
         return 1
     fi
-    
+
     log_message "Database configuration extracted successfully"
     log_message "Database: $DB_NAME on $DB_HOST"
     return 0
@@ -773,6 +846,137 @@ update_admin_user() {
     log_message "Admin user '$ADMIN_USER' (ID=$existing_id) is configured as administrator"
 }
 
+# Function to restore WordPress files into a Docker container using 'docker cp'.
+# Used in container-direct mode (-c). The backup is restored INTO the
+# container (no host bind mount required) using the document root path
+# supplied with -d (default /var/www/html).
+restore_files_to_container() {
+    local container="$1"
+    local docroot="$2"
+    local backup_wp_dir="$3"
+
+    # Validate container is running
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        log_message "ERROR: Container '$container' does not exist"
+        return 1
+    fi
+    local state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)
+    if [ "$state" != "true" ]; then
+        log_message "ERROR: Container '$container' is not running"
+        return 1
+    fi
+
+    if [ "$BACKUP_MODE" = "lightweight" ]; then
+        log_message "Restoring WordPress files to container '$container' (lightweight mode)..."
+
+        # For lightweight restore in container-direct mode, we can't easily
+        # check for wp-includes inside the container via a quick stat — use
+        # 'docker exec test -d' instead.
+        if ! docker exec "$container" test -d "$docroot/wp-includes" >/dev/null 2>&1; then
+            log_message "WARNING: Target container docroot does not appear to contain WordPress core (no wp-includes found)."
+            log_message "         Lightweight backup only contains wp-content + wp-config.php + .htaccess."
+            log_message "         You need to install WordPress core in the container first, then run this restore again."
+            return 1
+        fi
+
+        # Push wp-content
+        if [ -d "$backup_wp_dir/wp-content" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_message "[DRY-RUN] Would docker cp wp-content -> $container:$docroot/"
+            else
+                # Backup existing wp-content inside container by renaming it
+                if docker exec "$container" test -d "$docroot/wp-content" >/dev/null 2>&1; then
+                    local ts=$(date +%Y%m%d_%H%M%S)
+                    log_message "Backing up existing wp-content inside container to wp-content.backup.$ts"
+                    docker exec "$container" sh -c "mv '$docroot/wp-content' '$docroot/wp-content.backup.$ts'" 2>/dev/null || true
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}/wp-content.backup.$ts")
+                fi
+                # docker cp expects a directory; source ends without / for directories
+                if docker cp "$backup_wp_dir/wp-content" "$container:$docroot/" 2>/dev/null; then
+                    log_message "wp-content restored to container"
+                else
+                    log_message "ERROR: Failed to docker cp wp-content to container"
+                    return 1
+                fi
+            fi
+        fi
+
+        # Push wp-config.php
+        if [ -f "$backup_wp_dir/wp-config.php" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_message "[DRY-RUN] Would docker cp wp-config.php -> $container:$docroot/"
+            else
+                if docker exec "$container" test -f "$docroot/wp-config.php" >/dev/null 2>&1; then
+                    local ts=$(date +%Y%m%d_%H%M%S)
+                    log_message "Backing up existing wp-config.php inside container to wp-config.php.backup.$ts"
+                    docker exec "$container" sh -c "mv '$docroot/wp-config.php' '$docroot/wp-config.php.backup.$ts'" 2>/dev/null || true
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}/wp-config.php.backup.$ts")
+                fi
+                if docker cp "$backup_wp_dir/wp-config.php" "$container:$docroot/" 2>/dev/null; then
+                    log_message "wp-config.php restored to container"
+                else
+                    log_message "ERROR: Failed to docker cp wp-config.php to container"
+                    return 1
+                fi
+            fi
+        else
+            log_message "ERROR: wp-config.php not found in backup"
+            return 1
+        fi
+
+        # Push .htaccess
+        if [ -f "$backup_wp_dir/.htaccess" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_message "[DRY-RUN] Would docker cp .htaccess -> $container:$docroot/"
+            else
+                if docker exec "$container" test -f "$docroot/.htaccess" >/dev/null 2>&1; then
+                    local ts=$(date +%Y%m%d_%H%M%S)
+                    log_message "Backing up existing .htaccess inside container to .htaccess.backup.$ts"
+                    docker exec "$container" sh -c "mv '$docroot/.htaccess' '$docroot/.htaccess.backup.$ts'" 2>/dev/null || true
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}/.htaccess.backup.$ts")
+                fi
+                if docker cp "$backup_wp_dir/.htaccess" "$container:$docroot/" 2>/dev/null; then
+                    log_message ".htaccess restored to container"
+                else
+                    log_message "WARNING: Failed to docker cp .htaccess (non-critical)"
+                fi
+            fi
+        fi
+
+        log_message "Lightweight restore to container completed"
+        return 0
+    else
+        log_message "Restoring WordPress files to container '$container' (full mode)..."
+
+        if [ "$DRY_RUN" = true ]; then
+            log_message "[DRY-RUN] Would docker cp $backup_wp_dir/. -> $container:$docroot/"
+            log_message "[DRY-RUN] (existing files would be backed up inside container first)"
+            return 0
+        fi
+
+        # Backup entire docroot inside container by renaming it
+        if docker exec "$container" test -d "$docroot" >/dev/null 2>&1; then
+            local ts=$(date +%Y%m%d_%H%M%S)
+            log_message "Backing up existing docroot inside container to $docroot.backup.$ts"
+            docker exec "$container" sh -c "mv '$docroot' '$docroot.backup.$ts'" 2>/dev/null || true
+            RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}.backup.$ts")
+            # Recreate empty docroot
+            docker exec "$container" mkdir -p "$docroot" 2>/dev/null
+        else
+            docker exec "$container" mkdir -p "$docroot" 2>/dev/null
+        fi
+
+        # Push everything. docker cp requires src/. for directory contents.
+        if docker cp "$backup_wp_dir"/. "$container:$docroot/" 2>/dev/null; then
+            log_message "WordPress files restored to container successfully"
+            return 0
+        else
+            log_message "ERROR: Failed to docker cp WordPress files to container"
+            return 1
+        fi
+    fi
+}
+
 # Function to restore WordPress files
 restore_files() {
     local backup_wp_dir="$1"
@@ -954,7 +1158,7 @@ restore_files() {
 
 # Parse command line arguments
 # Allow long options: --skip-files, --skip-db, --dry-run, --fix-mode
-ARGS=$(getopt -o "b:w:u:U:t:A:P:E:fh" -l "skip-files,skip-db,dry-run,fix-mode" -- "$@" 2>/dev/null)
+ARGS=$(getopt -o "b:w:c:d:u:U:t:A:P:E:fh" -l "skip-files,skip-db,dry-run,fix-mode" -- "$@" 2>/dev/null)
 if [ $? -ne 0 ]; then
     show_help
     exit 1
@@ -969,6 +1173,15 @@ while [ $# -gt 0 ]; do
             ;;
         -w)
             WORDPRESS_DIR="$2"
+            shift 2
+            ;;
+        -c)
+            WP_CONTAINER="$2"
+            CONTAINER_DIRECT=true
+            shift 2
+            ;;
+        -d)
+            WP_CONTAINER_DOCROOT="$2"
             shift 2
             ;;
         -u)
@@ -1038,9 +1251,15 @@ fi
 
 # Validate required parameters based on mode
 if [ "$FIX_MODE" = true ]; then
-    # Fix mode: -w required, -b NOT required, at least one post-restore option required
-    if [ -z "$WORDPRESS_DIR" ]; then
-        echo "ERROR: Fix mode (-f) requires -w WORDPRESS_DIR"
+    # Fix mode: -w OR -c required, -b NOT required, at least one post-restore option required
+    if [ -z "$WORDPRESS_DIR" ] && [ -z "$WP_CONTAINER" ]; then
+        echo "ERROR: Fix mode (-f) requires -w WORDPRESS_DIR or -c WP_CONTAINER"
+        echo ""
+        show_help
+        exit 1
+    fi
+    if [ -n "$WORDPRESS_DIR" ] && [ -n "$WP_CONTAINER" ]; then
+        echo "ERROR: -w and -c are mutually exclusive. Use only one."
         echo ""
         show_help
         exit 1
@@ -1059,7 +1278,7 @@ if [ "$FIX_MODE" = true ]; then
         log_message "NOTE: --skip-files / --skip-db ignored in fix mode (-f)"
     fi
 else
-    # Restore mode: -b and -w both required
+    # Restore mode: -b required, AND (-w OR -c) required
     if [ -z "$BACKUP_FILE" ]; then
         echo "ERROR: Missing required parameter -b (backup file). Use -f for fix mode."
         echo ""
@@ -1067,8 +1286,15 @@ else
         exit 1
     fi
 
-    if [ -z "$WORDPRESS_DIR" ]; then
-        echo "ERROR: Missing required parameter -w (WordPress directory)"
+    if [ -z "$WORDPRESS_DIR" ] && [ -z "$WP_CONTAINER" ]; then
+        echo "ERROR: Either -w WORDPRESS_DIR or -c WP_CONTAINER is required"
+        echo ""
+        show_help
+        exit 1
+    fi
+
+    if [ -n "$WORDPRESS_DIR" ] && [ -n "$WP_CONTAINER" ]; then
+        echo "ERROR: -w and -c are mutually exclusive. Use only one."
         echo ""
         show_help
         exit 1
@@ -1099,20 +1325,65 @@ fi
 if [ -n "$BACKUP_FILE" ]; then
     BACKUP_FILE=$(realpath "$BACKUP_FILE")
 fi
-WORDPRESS_DIR=$(realpath "$WORDPRESS_DIR")
+if [ -n "$WORDPRESS_DIR" ]; then
+    WORDPRESS_DIR=$(realpath "$WORDPRESS_DIR")
+fi
 
-# Detect environment (Docker or Native)
-detect_docker_environment
-
-# Detect database configuration based on environment
-if [ "$IS_DOCKER" = true ]; then
-    if ! detect_docker_database_info; then
-        log_message "ERROR: Failed to detect Docker database configuration"
-        exit 1
+# Detect environment (Docker or Native). Skip auto-detect compose-file probing
+# in container-direct mode (-c): the user explicitly told us which container
+# to restore into, and .dbinfo sidecar carries the DB target.
+if [ "$CONTAINER_DIRECT" = true ]; then
+    log_message "Container-direct restore mode (-c): skipping compose-file auto-detection"
+    # Reuse DB info from .dbinfo sidecar if present (preferred); otherwise
+    # fall back to docker container inspection of the WP container.
+    IS_DOCKER=true
+    if [ -n "$BACKUP_DB_HOST" ] && [ -n "$BACKUP_DB_NAME" ]; then
+        DB_HOST="$BACKUP_DB_HOST"
+        DB_NAME="$BACKUP_DB_NAME"
+        DB_USER="$BACKUP_DB_USER"
+        DB_PASSWORD="$BACKUP_DB_PASSWORD"
+        DB_TYPE="${BACKUP_DB_TYPE:-mysql}"
+        DB_CONTAINER="$BACKUP_DB_CONTAINER"
+        log_message "Using DB config from .dbinfo: $DB_NAME@$DB_HOST (type=$DB_TYPE)"
+    else
+        # Fall back: inspect WP container for env vars (may not be set if backup
+        # was made before .dbinfo existed).
+        if docker inspect "$WP_CONTAINER" >/dev/null 2>&1; then
+            DB_HOST=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_HOST"' 2>/dev/null)
+            DB_NAME=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_NAME"' 2>/dev/null)
+            DB_USER=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_USER"' 2>/dev/null)
+            DB_PASSWORD=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_PASSWORD"' 2>/dev/null)
+            if [ -n "$DB_HOST" ] && [ -n "$DB_NAME" ]; then
+                log_message "Read DB config from WP container env vars"
+                log_message "Database: $DB_NAME on $DB_HOST"
+            else
+                log_message "ERROR: Cannot determine DB config (no .dbinfo sidecar and no env vars on container)"
+                exit 1
+            fi
+        else
+            log_message "ERROR: Container '$WP_CONTAINER' does not exist"
+            exit 1
+        fi
+    fi
+    # Resolve DB_CONTAINER from DB_HOST if it's a compose service name (foo:3306)
+    if [ -z "$DB_CONTAINER" ] && [ -n "$DB_HOST" ]; then
+        svc="${DB_HOST%%:*}"
+        DB_CONTAINER="${PROJECT_NAME}-${svc}"
+        unset svc
     fi
 else
-    if ! detect_native_database_service; then
-        log_message "WARNING: Database service auto-detection may not be accurate"
+    detect_docker_environment
+
+    # Detect database configuration based on environment
+    if [ "$IS_DOCKER" = true ]; then
+        if ! detect_docker_database_info; then
+            log_message "ERROR: Failed to detect Docker database configuration"
+            exit 1
+        fi
+    else
+        if ! detect_native_database_service; then
+            log_message "WARNING: Database service auto-detection may not be accurate"
+        fi
     fi
 fi
 
@@ -1121,9 +1392,13 @@ check_dependencies
 
 log_message "Starting WordPress Restore process"
 log_message "Backup file: $BACKUP_FILE"
-log_message "WordPress directory: $WORDPRESS_DIR"
+if [ "$CONTAINER_DIRECT" = true ]; then
+    log_message "Target WP container: $WP_CONTAINER (docroot: $WP_CONTAINER_DOCROOT)"
+else
+    log_message "WordPress directory: $WORDPRESS_DIR"
+fi
 log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker" || echo "Native")"
-log_message "Database type: $DB_TYPE"
+log_message "Database type: ${DB_TYPE:-unknown}"
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
@@ -1148,7 +1423,20 @@ cleanup_safety_backups() {
     log_message "Removing preserved safety backups (restore completed successfully):"
     local b
     for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
-        if [ -n "$b" ] && [ -e "$b" ]; then
+        if [ -z "$b" ]; then continue; fi
+        # Container-direct safety backups are tracked with a docker:// prefix:
+        #   docker://<container>:<abs_path_in_container>
+        # Host-path backups are passed straight to rm -rf.
+        if [[ "$b" == docker://* ]]; then
+            local rest="${b#docker://}"
+            local container="${rest%%:*}"
+            local cpath="${rest#*:}"
+            if [ -n "$container" ] && [ -n "$cpath" ]; then
+                log_message "  Removing (in container $container): $cpath"
+                docker exec "$container" rm -rf "$cpath" 2>/dev/null \
+                    || log_message "  WARNING: Failed to remove $cpath in $container"
+            fi
+        elif [ -e "$b" ]; then
             log_message "  Removing: $b"
             rm -rf "$b" 2>/dev/null || log_message "  WARNING: Failed to remove $b"
         fi
@@ -1168,7 +1456,13 @@ die() {
         log_message "Pre-restore backups PRESERVED for manual rollback:"
         local b
         for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
-            if [ -n "$b" ] && [ -e "$b" ]; then
+            if [ -z "$b" ]; then continue; fi
+            if [[ "$b" == docker://* ]]; then
+                local rest="${b#docker://}"
+                local container="${rest%%:*}"
+                local cpath="${rest#*:}"
+                log_message "  - (in container $container) $cpath"
+            elif [ -e "$b" ]; then
                 log_message "  - $b"
             fi
         done
@@ -1247,7 +1541,11 @@ if [ "$DRY_RUN" = true ]; then
         log_message "Restore DB:         $([ "$SKIP_DB" = true ] && echo "NO (--skip-db)" || echo "YES")"
         log_message "Restore files:      $([ "$SKIP_FILES" = true ] && echo "NO (--skip-files)" || echo "YES")"
     fi
-    log_message "Target dir:         $WORDPRESS_DIR"
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        log_message "Target container:   $WP_CONTAINER (docroot: $WP_CONTAINER_DOCROOT)"
+    else
+        log_message "Target dir:         $WORDPRESS_DIR"
+    fi
     log_message "Environment:        $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER)" || echo "Native ($DB_TYPE)")"
     log_message "Database:           $DB_NAME @ $DB_HOST"
     [ -n "$NEW_URL" ] && log_message "URL replacement:    ${OLD_URL:-<auto-detect>} -> $NEW_URL"
@@ -1290,8 +1588,15 @@ if [ "$FIX_MODE" = true ]; then
 elif [ "$SKIP_FILES" = true ]; then
     log_message "Skipping file restoration (--skip-files)"
 else
-    if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
-        die "Files restoration failed"
+    # Dispatch: container-direct mode uses docker cp; otherwise restore to host
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        if ! restore_files_to_container "$WP_CONTAINER" "$WP_CONTAINER_DOCROOT" "$BACKUP_WP_DIR"; then
+            die "Files restoration to container failed"
+        fi
+    else
+        if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
+            die "Files restoration failed"
+        fi
     fi
 fi
 
