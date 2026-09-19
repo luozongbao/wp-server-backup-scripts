@@ -32,12 +32,29 @@ show_help() {
     echo "                       Most users do not need this option."
     echo "  -h                   Show this help message"
     echo ""
+    echo "Environment variables (Docker mode, optional):"
+    echo "  WEBSERVER_SERVICE    Force the webserver service name instead of auto-detecting."
+    echo "                       Useful when the webserver service is not the first one"
+    echo "                       whose image matches the webserver type."
+    echo "                       Example: export WEBSERVER_SERVICE=webserver"
+    echo ""
+    echo "  You can also mark the webserver service explicitly in docker-compose.yml:"
+    echo "       services:"
+    echo "         webserver:"
+    echo "           image: litespeedtech/openlitespeed:latest"
+    echo "           labels:"
+    echo "             - \"wp-backup=webserver\"   # <-- explicit marker"
+    echo ""
+    echo "  Port matching in compose files honours \${VAR:-default} interpolation,"
+    echo "  so .env values (e.g. WEB_PORT=8080) are considered when auto-detecting."
+    echo ""
     echo "Examples:"
     echo "  $0                                  (auto-detect everything — recommended)"
     echo "  $0 -o /backups"
     echo "  $0 -o /backups -e admin@example.com"
     echo "  $0 -f /etc/apache2                   (override source path)"
     echo "  $0 -f /etc/nginx/sites-enabled      (backup only a subset)"
+    echo "  WEBSERVER_SERVICE=litespeed $0 -o /backups    (force service name)"
     echo ""
     echo "Output format: [timestamp]_[type]_config_backup.zip"
     echo "Example: 20250530_143022_nginx_config_backup.zip"
@@ -48,6 +65,13 @@ show_help() {
     echo "  - Native installs (apache/openlitespeed/nginx from packages or processes)"
     echo "  - Docker installs (compose files and well-known container images)"
     echo "  - Standard config paths for each webserver type"
+    echo ""
+    echo "Docker service resolution priority (highest first):"
+    echo "  1. Label 'wp-backup: webserver' on the service          (explicit)"
+    echo "  2. \$WEBSERVER_SERVICE env var                            (explicit override)"
+    echo "  3. Image matches webserver type + ports expose 80/443/   (heuristic)"
+    echo "     8080/8443 (resolves \${VAR} from compose .env)"
+    echo "  4. First service whose image matches webserver type     (legacy fallback)"
     echo ""
     echo "Features:"
     echo "  - Supports Apache, OpenLiteSpeed, LiteSpeed Enterprise, Nginx"
@@ -379,7 +403,108 @@ detect_docker_environment() {
     return 1
 }
 
+# Load .env variables from $DOCKER_COMPOSE_DIR/.env so we can resolve
+# ${WEB_PORT:-80} style interpolations when matching port mappings.
+# Outputs KEY=VALUE pairs (one per line) so callers can source them safely.
+load_compose_env() {
+    local env_file="$DOCKER_COMPOSE_DIR/.env"
+    [ -f "$env_file" ] || return 0
+
+    # Only accept lines matching NAME=VALUE (docker-compose convention).
+    # Skip comments and blank lines. Values may be quoted.
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        /^[A-Za-z_][A-Za-z0-9_]*=/ {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            # Strip optional leading "export "
+            sub(/^export[[:space:]]+/, "", line)
+            print line
+        }
+    ' "$env_file" 2>/dev/null
+}
+
+# Resolve a docker-compose port-spec string with possible ${VAR:-default}
+# interpolation. Echoes the host port (the part before ':').
+# Examples:
+#   "${WEB_PORT:-80}:80"            -> "80" (when WEB_PORT unset)
+#   "${WEB_PORT:-8080}:80"          -> "8080"
+#   "80:80"                         -> "80"
+#   "127.0.0.1:8080:80"             -> "8080"
+resolve_host_port() {
+    local spec="$1"
+    local env_line
+    # Read env into shell vars (sourced in subshell to avoid leaking into parent).
+    while IFS= read -r env_line; do
+        [ -n "$env_line" ] || continue
+        # shellcheck disable=SC2086
+        case "$env_line" in
+            *=*) eval "local ${env_line%%=*}=\"\${env_line#*=}\"" ;;
+        esac
+    done <<< "$(load_compose_env)"
+
+    # Replace ${VAR:-default} and ${VAR} occurrences in the spec.
+    # Use bash parameter expansion to evaluate the result.
+    local expanded="$spec"
+    # Repeat substitution to handle nested patterns (rare but cheap).
+    local prev=""
+    while [ "$expanded" != "$prev" ]; do
+        prev="$expanded"
+        # ${VAR:-default}
+        if [[ "$expanded" =~ \$\{([A-Za-z_][A-Za-z0-9_]*):-([[:print:]]+)\} ]]; then
+            local var="${BASH_REMATCH[1]}"
+            local def="${BASH_REMATCH[2]}"
+            local val="${!var:-$def}"
+            expanded="${expanded//\$\{$var:-${BASH_REMATCH[2]}\}/$val}"
+        fi
+        # ${VAR}
+        if [[ "$expanded" =~ \$\{([A-Za-z_][A-Za-z0-9_]*)\} ]]; then
+            local var="${BASH_REMATCH[1]}"
+            local val="${!var:-}"
+            expanded="${expanded//\$\{$var\}/$val}"
+        fi
+    done
+
+    # Strip surrounding quotes.
+    expanded="${expanded%\"}"; expanded="${expanded#\"}"
+    expanded="${expanded%\'}"; expanded="${expanded#\'}"
+
+    # Handle IP-prefixed form: "IP:HOST:CONTAINER" -> take middle part.
+    # Also handle quoted list: "\"80:80\"" -> already stripped above.
+    local IFS=':'
+    local parts=( $expanded )
+    case "${#parts[@]}" in
+        2) echo "${parts[0]}";;
+        3) echo "${parts[1]}";;
+        *) echo "${parts[0]}";;
+    esac
+}
+
+# Build a regex that matches common webserver port specs (resolved form).
+# Used by the port-based heuristic in detect_docker_webservver_info().
+_webservver_port_regex() {
+    case "$1" in
+        # Match 80, 443, 8080, 8443 (Apache/OLS/Nginx defaults).
+        # Also match common alt-ports users expose webserver on.
+        apache|nginx|openlitespeed)
+            echo '^(80|443|8080|8443)$'
+            ;;
+        *)
+            echo '^(80|443|8080|8443)$'
+            ;;
+    esac
+}
+
 # Function to detect webserver container + image type from docker-compose.yml
+#
+# Resolution priority (highest first):
+#   A. Label `wp-backup: webserver` on the service  (explicit user intent)
+#   B. $WEBSERVER_SERVICE env var                    (explicit override)
+#   C. Port-based heuristic: image matches + ports expose webserver port
+#      (resolved through $DOCKER_COMPOSE_DIR/.env if present)
+#   D. Fallback: first service whose image matches the webserver type
+#      (legacy behaviour — preserves backward compatibility)
 detect_docker_webservver_info() {
     local compose_file="$DOCKER_COMPOSE_DIR/docker-compose.yml"
 
@@ -408,35 +533,267 @@ detect_docker_webservver_info() {
 
     log_message "Detected webserver type: $WEBSERVER_TYPE"
 
-    # Find webserver service block
     local service_name=""
-    service_name=$(awk -v t="$WEBSERVER_TYPE" '
-        BEGIN { IGNORECASE=1 }
-        /^[A-Za-z0-9_.-]+:[[:space:]]*$/ {
-            current=$1; sub(/:$/, "", current); in_service=0
+    local pick_reason=""
+
+    # -------------------------------------------------------------------
+    # Walk the file once, tracking the current service header by indent
+    # level. When we hit a 'wp-backup: webserver' (or shorthand
+    # 'wp-backup=webserver') label, the owning service is whoever the most
+    # recent service header was. Robust to tab/spaces and leading-tab test
+    # fixtures because we use lead() to count leading whitespace.
+    local label_svc
+    label_svc=$(awk '
+        function lead() {
+            m = match($0, /[^[:space:]]/); return (m == 0 ? length($0) : m - 1)
         }
-        /^[A-Za-z0-9_.-]+:/ {
-            line=$0
-            if (line ~ /^[^ ]/) in_service=1
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        {
+            ind = lead()
+            raw = $0
+            sub(/^[[:space:]]*/, "", raw)
         }
-        in_service && /image:/ {
-            img=$2
-            if (img ~ t) { print current; exit }
+        raw ~ /^(services|version|networks|volumes|configs|secrets):[[:space:]]*$/ {
+            if (raw == "services:") { in_svc=1; current_svc=""; svc_indent=-1; next }
+            in_svc=0; next
+        }
+        in_svc && raw ~ /^[A-Za-z0-9_.-]+:[[:space:]]*$/ {
+            key = raw; sub(/:[[:space:]]*$/, "", key)
+            if (current_svc == "" || ind <= svc_indent) {
+                current_svc = key; svc_indent = ind
+            }
+        }
+        in_svc && raw ~ /wp-backup[[:space:]]*[:=][[:space:]]*.*webserver/ {
+            print current_svc; exit
         }
     ' "$compose_file" 2>/dev/null)
+    if [ -n "$label_svc" ]; then
+        service_name="$label_svc"
+        pick_reason="label wp-backup=webserver"
+    fi
 
+    
+        # -------------------------------------------------------------------
+    # Priority B: $WEBSERVER_SERVICE env var override
+    # -------------------------------------------------------------------
+    if [ -z "$service_name" ] && [ -n "${WEBSERVER_SERVICE:-}" ]; then
+        # Verify the named service exists in the compose file.
+        if grep -qE "^[[:space:]]*${WEBSERVER_SERVICE}:[[:space:]]*$" "$compose_file" 2>/dev/null; then
+            service_name="$WEBSERVER_SERVICE"
+            pick_reason="WEBSERVER_SERVICE env var"
+        else
+            log_message "WARNING: WEBSERVER_SERVICE='$WEBSERVER_SERVICE' not found in $compose_file — ignoring"
+        fi
+    fi
+
+    # -------------------------------------------------------------------
+    # Priority C: port-based heuristic (image match + webserver port exposed)
+    # -------------------------------------------------------------------
     if [ -z "$service_name" ]; then
-        # Fallback: pick the first service block that mentions webserver image
-        service_name=$(grep -B1 -iE "image:.*(apache|httpd|nginx|openlitespeed|ols|lsws|litespeed)" "$compose_file" \
-            | grep -oE "^  [A-Za-z0-9_.-]+:" | head -1 | sed 's/^  //; s/:$//')
+        local port_regex
+        port_regex=$(_webservver_port_regex "$WEBSERVER_TYPE")
+
+        # Iterate services. For each service block, collect image + ports.
+        # If image matches webserver type AND any resolved host port matches
+        # the webserver port regex -> pick this service.
+        service_name=$(awk -v type="$WEBSERVER_TYPE" -v pregex="$port_regex" '
+            BEGIN { IGNORECASE=1 }
+            function reset(   i) {
+                current=""; svc_image=""; in_svc=0
+                for (i in ports) delete ports[i]
+                np=0
+            }
+            function commit_if_match(   img) {
+                if (!in_svc || current == "") return
+                img=svc_image
+                if (img == "") return
+                if (img !~ type) return
+                if (np == 0) return
+                # Check any port against regex. Pregex is anchored with ^...$
+                # so use match() not exact equality.
+                for (i = 1; i <= np; i++) {
+                    if (ports[i] ~ pregex) { print current; exit }
+                }
+            }
+            /^[^[:space:]].*:$/ && !/^[[:space:]]/ {
+                # Commit previous service before starting a new top-level key
+                # that is NOT a service (e.g. "services:", "version:").
+                # A service key is followed by a service block indented with 2 spaces.
+                # We use a simple heuristic: if the previous line had an
+                # indented child, treat the next top-level as a new section.
+                # (Awk one-pass: commit when we see the next non-service top key.)
+                if (in_svc && current != "") {
+                    commit_if_match()
+                    if (matched) exit
+                }
+                reset()
+                current=$0; sub(/:$/, "", current)
+                in_svc=1
+            }
+            /^[[:space:]]+image:/ {
+                line=$0
+                sub(/^[[:space:]]+image:[[:space:]]*/, "", line)
+                svc_image=line
+            }
+            /^[[:space:]]+ports:/ { in_ports=1; next }
+            in_ports && /^[[:space:]]+-[[:space:]]/ {
+                line=$0
+                sub(/^[[:space:]]+-[[:space:]]*/, "", line)
+                np++
+                ports[np]=line
+                next
+            }
+            in_ports && !/^[[:space:]]+-[[:space:]]/ && !/^[[:space:]]*$/ {
+                in_ports=0
+            }
+            END {
+                commit_if_match()
+            }
+        ' "$compose_file" 2>/dev/null)
+
+        # Port matching with .env interpolation: awk handles structure,
+        # bash resolves ${VAR:-default} in each port spec.
+        if [ -z "$service_name" ]; then
+            # Re-scan with bash, resolving ${VAR:-default} interpolations
+            # from .env. Skip top-level reserved keys so we never treat
+            # `services:` as a service name.
+            local _svc="" _img="" _in_ports=0 _cur_svc=""
+            local _type_pat
+            case "$WEBSERVER_TYPE" in
+                apache)         _type_pat="apache|httpd" ;;
+                openlitespeed)  _type_pat="openlitespeed|ols|lsws|litespeed" ;;
+                nginx)          _type_pat="nginx" ;;
+                *)              _type_pat="" ;;
+            esac
+
+            while IFS= read -r line; do
+                # Skip blank lines and comments.
+                [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+                # Top-level key (no leading whitespace).
+                if ! [[ "$line" =~ ^[[:space:]] ]]                     && [[ "$line" =~ ^([A-Za-z0-9_.-]+):[[:space:]]*$ ]]; then
+                    local key="${BASH_REMATCH[1]}"
+                    case "$key" in
+                        services|version|networks|volumes|configs|secrets|name)
+                            # Reserved top-level key — NOT a service.
+                            # Clear current service so we don't mis-attribute
+                            # subsequent image: lines to it.
+                            _cur_svc=""
+                            _img=""
+                            _in_ports=0
+                            continue
+                            ;;
+                        *)
+                            # Real service header.
+                            _cur_svc="$key"
+                            _img=""
+                            _in_ports=0
+                            ;;
+                    esac
+                    continue
+                fi
+
+                # Indented line under a service.
+                if [[ "$line" =~ ^[[:space:]]+image:[[:space:]]*(.+)$ ]]; then
+                    _img="${BASH_REMATCH[1]}"
+                    _img="${_img%\"}"; _img="${_img#\"}"
+                    _img="${_img%'}"; _img="${_img#'}"
+                elif [[ "$line" =~ ^[[:space:]]+ports:[[:space:]]*$ ]]; then
+                    _in_ports=1
+                elif [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.+)$ ]] && [ "$_in_ports" = 1 ]; then
+                    local spec="${BASH_REMATCH[1]}"
+                    local host_port
+                    host_port=$(resolve_host_port "$spec")
+                    host_port="${host_port%,}"
+                    if [ -z "$service_name" ] \
+                        && [ -n "$_cur_svc" ] \
+                        && [ -n "$_img" ] \
+                        && [ -n "$_type_pat" ] \
+                        && echo "$_img" | grep -qiE "$_type_pat"; then
+                        case "$host_port" in
+                            80|443|8080|8443)
+                                service_name="$_cur_svc"
+                                pick_reason="port-based heuristic (port=$host_port)"
+                                ;;
+                        esac
+                    fi
+                fi
+            done < "$compose_file"
+        else
+            pick_reason="port-based heuristic (structure match)"
+        fi
+    fi
+
+    # -------------------------------------------------------------------
+    # Priority D: fallback — first service whose image matches (legacy).
+    # -------------------------------------------------------------------
+    if [ -z "$service_name" ]; then
+        log_message "Port-based heuristic found no match; falling back to image match"
+
+        # Two-pass approach (same pattern as Priority A):
+        #   1. Find all "image: ..." lines whose value matches webserver type.
+        #   2. For each, walk backwards to find the nearest non-indented
+        #      top-level key that is NOT a reserved key (services:, version:, ...).
+        #   3. First such key wins; this is the legacy "first matching service" rule.
+        local type_pat
+        case "$WEBSERVER_TYPE" in
+            apache)         type_pat="apache|httpd" ;;
+            openlitespeed)  type_pat="openlitespeed|ols|lsws|litespeed" ;;
+            nginx)          type_pat="nginx" ;;
+            *)              type_pat="" ;;
+        esac
+
+        local image_lns
+        if [ -n "$type_pat" ]; then
+            image_lns=$(grep -nEi "^[[:space:]]+image:[[:space:]]*($type_pat)" "$compose_file" 2>/dev/null                 | cut -d: -f1)
+        fi
+
+        for img_ln in $image_lns; do
+            local i found_svc=""
+            for i in $(seq $((img_ln-1)) -1 1); do
+                local prev_line
+                prev_line=$(sed -n "${i}p" "$compose_file" 2>/dev/null)
+                [[ "$prev_line" =~ ^[[:space:]] ]] && continue
+                [[ -z "$prev_line" || "$prev_line" =~ ^[[:space:]]*# ]] && continue
+                if [[ "$prev_line" =~ ^([A-Za-z0-9_.-]+):[[:space:]]*$ ]]; then
+                    local key="${BASH_REMATCH[1]}"
+                    case "$key" in
+                        services|version|networks|volumes|configs|secrets|name)
+                            # Reached `services:` without finding a service
+                            # header above this image line. Treat the image
+                            # as belonging to no named service (skip).
+                            break
+                            ;;
+                        *)
+                            found_svc="$key"
+                            break 2
+                            ;;
+                    esac
+                fi
+            done
+            if [ -n "$found_svc" ]; then
+                service_name="$found_svc"
+                break
+            fi
+        done
+
+        # Last-resort fallback: scan for image line, take previous non-indented line.
+        if [ -z "$service_name" ] && [ -n "$type_pat" ]; then
+            service_name=$(grep -B1 -iE "^[[:space:]]+image:[[:space:]]*($type_pat)" "$compose_file"                 | grep -oE "^[[:space:]]+[A-Za-z0-9_.-]+:" | head -1 | sed 's/^[[:space:]]*//; s/:$//')
+        fi
+
+        if [ -n "$service_name" ]; then
+            pick_reason="image-name fallback (legacy)"
+        fi
     fi
 
     if [ -z "$service_name" ]; then
         log_message "ERROR: Could not determine webserver service name from compose file"
+        log_message "Hint: set WEBSERVER_SERVICE=<service-name> or add label 'wp-backup: webserver' to the service."
         return 1
     fi
 
-    log_message "Webserver service: $service_name"
+    log_message "Webserver service: $service_name (picked by: $pick_reason)"
 
     # Try to find a container_name, otherwise resolve via docker compose ps
     local container_line=$(grep -A 20 "^[[:space:]]*${service_name}:[[:space:]]*$" "$compose_file" \
@@ -741,7 +1098,10 @@ if [ ! -d "$(dirname "$BACKUP_PATH")" ]; then
     exit 1
 fi
 
-zip_output=$(zip -r "$BACKUP_PATH" . 2>&1)
+# -X strips "extra attributes" (UID, GID, timestamps) so the archive is
+# portable across hosts with different users — safe to restore on a fresh
+# box without inheriting the source machine's owner.
+zip_output=$(zip -rX "$BACKUP_PATH" . 2>&1)
 if [ $? -eq 0 ]; then
     log_message "Backup completed successfully!"
     log_message "Backup file: $BACKUP_PATH"
