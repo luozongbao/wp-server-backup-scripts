@@ -23,6 +23,10 @@ The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, A
 - ✅ **Single archive**: Files + database in one ZIP file
 - ✅ **Smart restore**: Automatically detects full vs lightweight backup; refuses to restore lightweight into an empty directory
 - ✅ **Post-restore customization**: Optional URL replacement, site title change, admin user creation — perfect for migrations to new domains
+- ✅ **Post-restore wp-config.php patch**: After a successful DB import, `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` and `$table_prefix` are rewritten in the restored `wp-config.php` to match the credentials that actually imported the data — so WordPress can connect without manual editing
+- ✅ **Ownership restore (chown)**: Restored files are `chown`'d to match the original target's owner (host mode via `--reference=`, Docker mode via `docker exec chown` against the UID:GID detected inside the container). Prevents "Permission denied" on uploads/plugin updates when the web server runs as a non-root UID (e.g. `nobody`, `www-data`, `33`, `1000`)
+- ✅ **Portable archives**: Backups use `zip -X` to strip the source machine's UID/GID from the archive, so backups can be restored on a fresh host with a different user without inheriting stale ownership
+- ✅ **Root required for restore**: `wp_restore.sh` aborts with a clear "use sudo" message at startup if not run as root — only root can `chown` to other UIDs, and a non-root restore leaves files un-writable by the web server
 - ✅ **Dry-run mode**: Preview changes before applying them (`--dry-run`)
 - ✅ **Integrity verification**: Backup is verified after creation
 - ✅ **Email notifications**: Optional backup report via `msmtp` (`-e email`)
@@ -388,7 +392,9 @@ On the target stack, the compose project name is different — so `old-stack-db`
 4. **Confirm** the destructive action (auto-confirmed with `-y`/`--yes`, skipped in `--dry-run`).
 5. **`DROP`** the live tables (`SET FOREIGN_KEY_CHECKS=0` for clean ordering).
 6. **Import** the backup's `database.sql` using the **live** credentials.
-7. **Patch** `$table_prefix` (and `$wpdb->prefix`) in the live `wp-config.php` to match the backup's prefix, so the imported tables are correctly recognised.
+7. **Patch `wp-config.php`** so the restored site can connect:
+   - **`$table_prefix`** (and `$wpdb->prefix`) → rewritten to match the backup's prefix, since the live tables were just dropped and the imported SQL uses the backup's prefix.
+   - **`DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST`** → rewritten to match the credentials that actually imported the DB. Runs in **both** reset-db and non-reset-db modes (the `DB_*` vars at this point are whatever the import actually used). Skipped automatically if the creds already match.
 
 ### Mode behavior
 
@@ -428,19 +434,21 @@ On the target stack, the compose project name is different — so `old-stack-db`
 
 ## Recovery Process
 
-1. **Validation**: Verify backup file integrity and structure
-2. **Extraction**: Extract backup contents to temporary directory
-3. **Mode detection**: Auto-detect full vs lightweight via `.backup_mode` marker
-4. **Configuration**: Read database settings from the backup's `wp-config.php` and/or `.dbinfo` sidecar
-5. **Environment detection**: Determine restoration method (Docker/Native)
-6. **DB container resolution** (Docker mode only): Two-pass — best-effort before backup extraction, then a final authoritative pass using the [5-step fallback chain](#smart-db-container-discovery) once `DB_HOST` is known
-6a. **Reset-DB flow** (if enabled): Read live wp-config.php → drop tables with the live prefix → use live credentials for the rest of the restore → patch live `wp-config.php`'s `$table_prefix` after file restore
-7. **Database restoration**: Restore database using the appropriate method (`docker exec mysql ...` for Docker, `mysql -h ...` for native)
-8. **File restoration**: Restore based on detected mode
-   - **Full mode**: Replace the entire WordPress directory
-   - **Lightweight mode**: Restore only `wp-content/`, `wp-config.php`, `.htaccess` into the existing WordPress installation
-9. **Post-restore customizations** (optional): URL replacement, site title change, admin user create/update
-10. **Verification**: Confirm successful restoration
+1. **Root check** (`wp_restore.sh` only): abort with a "use sudo" hint if not running as UID 0 — only root can `chown` restored files to the web server's UID.
+2. **Validation**: Verify backup file integrity and structure
+3. **Extraction**: Extract backup contents to temporary directory
+4. **Mode detection**: Auto-detect full vs lightweight via `.backup_mode` marker
+5. **Configuration**: Read database settings from the backup's `wp-config.php` and/or `.dbinfo` sidecar
+6. **Environment detection**: Determine restoration method (Docker/Native)
+7. **DB container resolution** (Docker mode only): Two-pass — best-effort before backup extraction, then a final authoritative pass using the [5-step fallback chain](#smart-db-container-discovery) once `DB_HOST` is known
+7a. **Reset-DB flow** (if enabled): Read live wp-config.php → drop tables with the live prefix → use live credentials for the rest of the restore → patch live `wp-config.php`'s `$table_prefix` after file restore
+8. **Database restoration**: Restore database using the appropriate method (`docker exec mysql ...` for Docker, `mysql -h ...` for native)
+9. **File restoration**: Restore based on detected mode, then chown to match the original target's owner
+   - **Full mode**: Replace the entire WordPress directory; `chown -R --reference=<original>` (host) or `docker exec chown -R UID:GID` (Docker) so the web server can read/write
+   - **Lightweight mode**: Restore only `wp-content/`, `wp-config.php`, `.htaccess`; chown each via `--reference=<safety-backup>` (host) or `docker exec chown UID:GID` (Docker)
+10. **wp-config.php patching**: After DB import succeeds, rewrite `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST` in the restored `wp-config.php` to match the import creds (plus `$table_prefix` if reset-db was used). Lets WordPress connect on first request without manual editing.
+11. **Post-restore customizations** (optional): URL replacement, site title change, admin user create/update
+12. **Verification**: Confirm successful restoration
 
 ## Webserver Backup & Restore
 
@@ -792,6 +800,16 @@ If `brkdbuser` cannot execute `UPDATE`/`INSERT` during post-restore customizatio
 docker exec -it <db_container> mariadb -uroot -p
 GRANT ALL PRIVILEGES ON *.* TO 'brkdbuser'@'%';
 FLUSH PRIVILEGES;
+```
+
+### "Permission denied" on uploads / plugin updates after restore
+The web server runs as a non-root UID (commonly `nobody`, `www-data`, `33`, or `1000` for OpenLiteSpeed) and cannot write files owned by `root`. `wp_restore.sh` runs `chown -R` after every file restore using the original target's UID:GID as the reference, but it requires `sudo` to do so. If you see this error, re-run the restore with `sudo ./wp_restore.sh ...`.
+
+### "wp_restore.sh: this script must be run as root (use sudo)" at startup
+`wp_restore.sh` aborts before any heavy work (extraction, `docker cp`, DB import) when the effective UID is non-zero. This is intentional — `chown` to another user's UID is only permitted for UID 0. Re-run with `sudo`:
+
+```bash
+sudo ./wp_restore.sh -b /backups/site.zip -w /var/www/html/wordpress
 ```
 
 ### "Could not determine target webserver container" (webserver_restore.sh)

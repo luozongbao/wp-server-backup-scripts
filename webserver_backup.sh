@@ -1098,7 +1098,10 @@ if [ ! -d "$(dirname "$BACKUP_PATH")" ]; then
     exit 1
 fi
 
-zip_output=$(zip -r "$BACKUP_PATH" . 2>&1)
+# -X strips "extra attributes" (UID, GID, timestamps) so the archive is
+# portable across hosts with different users — safe to restore on a fresh
+# box without inheriting the source machine's owner.
+zip_output=$(zip -rX "$BACKUP_PATH" . 2>&1)
 if [ $? -eq 0 ]; then
     log_message "Backup completed successfully!"
     log_message "Backup file: $BACKUP_PATH"
