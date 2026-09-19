@@ -743,15 +743,72 @@ read_live_wp_config() {
     fi
 
     if [ "$uses_env_helpers" = true ]; then
-        log_message "Live wp-config.php uses getenv_docker() — resolving real credentials from WP container env"
-        if [ -z "$target_container" ]; then
-            log_message "WARN: getenv_docker() detected but -c was not provided; falling back to literal values"
+        log_message "Live wp-config.php uses getenv_docker() — resolving real credentials from container env"
+        # Pick the best container to ask for env vars:
+        #   - In -c mode: WP_CONTAINER has them (typical WP docker image).
+        #   - In -w mode with a separate DB container (e.g. OpenLiteSpeed as
+        #     webserver + mariadb as DB): the WEB container has no
+        #     WORDPRESS_DB_* env vars; ask the DB container instead. The DB
+        #     container is the one that actually received MYSQL_USER/
+        #     MYSQL_PASSWORD/MYSQL_DATABASE env vars (mariadb/mysql image
+        #     convention) which is what getenv_docker() falls back to.
+        local env_source=""
+        if [ -n "$target_container" ]; then
+            env_source="$target_container"
+        elif [ -n "${DB_CONTAINER:-}" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+            env_source="$DB_CONTAINER"
+            log_message "  Reading env from DB container '$env_source' (WP container has no env helpers in -w mode)"
         else
+            log_message "WARN: getenv_docker() detected but no container available to read env from; falling back to literal values"
+        fi
+
+        if [ -n "$env_source" ]; then
             local env_name env_user env_pass env_host
-            env_name=$(docker exec "$target_container" sh -c 'echo "$WORDPRESS_DB_NAME"' 2>/dev/null)
-            env_user=$(docker exec "$target_container" sh -c 'echo "$WORDPRESS_DB_USER"' 2>/dev/null)
-            env_pass=$(docker exec "$target_container" sh -c 'echo "$WORDPRESS_DB_PASSWORD"' 2>/dev/null)
-            env_host=$(docker exec "$target_container" sh -c 'echo "$WORDPRESS_DB_HOST"' 2>/dev/null)
+            env_name=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_NAME"' 2>/dev/null)
+            env_user=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_USER"' 2>/dev/null)
+            env_pass=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_PASSWORD"' 2>/dev/null)
+            env_host=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_HOST"' 2>/dev/null)
+            # If WORDPRESS_DB_* env vars are absent, fall back to MYSQL_*
+            # (mariadb/mysql official image convention). The DB_HOST that
+            # WordPress uses inside its container is the DB service name
+            # (e.g. "database" / "db"), not the host's loopback — so for
+            # DB_HOST we prefer the service name from the compose project
+            # of the DB container. As a final fallback use "localhost".
+            if [ -z "$env_name" ]; then
+                env_name=$(docker exec "$env_source" sh -c 'echo "$MYSQL_DATABASE"' 2>/dev/null)
+            fi
+            if [ -z "$env_user" ]; then
+                env_user=$(docker exec "$env_source" sh -c 'echo "$MYSQL_USER"' 2>/dev/null)
+            fi
+            if [ -z "$env_pass" ]; then
+                env_pass=$(docker exec "$env_source" sh -c 'echo "$MYSQL_PASSWORD"' 2>/dev/null)
+            fi
+            if [ -z "$env_pass" ]; then
+                env_pass=$(docker exec "$env_source" sh -c 'echo "$MARIADB_PASSWORD"' 2>/dev/null)
+            fi
+            if [ -z "$env_name" ]; then
+                env_name=$(docker exec "$env_source" sh -c 'echo "$MARIADB_DATABASE"' 2>/dev/null)
+            fi
+            if [ -z "$env_user" ]; then
+                env_user=$(docker exec "$env_source" sh -c 'echo "$MARIADB_USER"' 2>/dev/null)
+            fi
+            # DB_HOST: prefer the compose service name (what WordPress
+            # uses to reach the DB), not the literal "localhost". Derive
+            # it from the DB container's compose project name.
+            if [ -z "$env_host" ] && [ "${IS_DOCKER:-false}" = true ]; then
+                env_host=$(docker inspect "$env_source" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null)
+                # If no compose label, try stripping the project prefix
+                if [ -z "$env_host" ]; then
+                    local db_name="$env_source"
+                    local db_base="${db_name%-[0-9]*}"
+                    if [ "$db_base" != "$db_name" ]; then
+                        env_host="${db_base##*-}"
+                    else
+                        env_host="${db_name##*-}"
+                    fi
+                fi
+            fi
+            [ -z "$env_host" ] && env_host="localhost"
             # Use env vars when present and non-placeholder.
             [ -n "$env_name" ] && [ "$env_name" != "wordpress" ] && lname="$env_name"
             [ -n "$env_user" ] && [ "$env_user" != "example username" ] && luser="$env_user"
