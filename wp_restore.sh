@@ -995,37 +995,75 @@ patch_wp_config_db_creds() {
         return 1
     fi
 
-    # Read current values; bail early if everything already matches.
-    local cur_name cur_user cur_host
-    cur_name=$(grep "define.*DB_NAME"     "$actual_path" | sed -n "s/.*DB_NAME.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
-    cur_user=$(grep "define.*DB_USER"     "$actual_path" | sed -n "s/.*DB_USER.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
-    cur_host=$(grep "define.*DB_HOST"     "$actual_path" | sed -n "s/.*DB_HOST.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
-    if [ "$cur_name" = "$new_name" ] && [ "$cur_user" = "$new_user" ] && [ "$cur_host" = "$new_host" ]; then
-        log_message "DB creds already match (name/user/host) — skipping patch"
-        [ "$in_container" = true ] && rm -f "$actual_path"
-        return 0
-    fi
-
     if [ "$DRY_RUN" = true ]; then
-        log_message "[DRY-RUN] Would patch DB creds in $wp_config_path (DB_HOST $cur_host -> $new_host, DB_USER $cur_user -> $new_user, DB_NAME $cur_name -> $new_name)"
+        log_message "[DRY-RUN] Would patch DB creds in $wp_config_path (DB_HOST -> $new_host, DB_USER -> $new_user, DB_NAME -> $new_name)"
         [ "$in_container" = true ] && rm -f "$actual_path"
         return 0
     fi
 
-    # Escape slashes for sed (only used in the host field, e.g. "db" or
-    # "127.0.0.1:3306"). Use ASCII Unit Separator as delimiter to avoid
-    # colliding with the slashes in the patterns themselves.
+    # Escape slashes for sed. Use ASCII Unit Separator as delimiter to avoid
+    # colliding with the slashes in the patterns themselves. Special chars to
+    # escape: the sed delimiter (\x1f), backslash, and the sed ampersand (which
+    # means "the matched text" in the replacement).
     local sep=$'\x1f'
     local new_name_esc new_user_esc new_pass_esc new_host_esc
-    new_name_esc=$(printf '%s' "$new_name" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
-    new_user_esc=$(printf '%s' "$new_user" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
-    new_pass_esc=$(printf '%s' "$new_pass" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
-    new_host_esc=$(printf '%s' "$new_host" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
+    _sed_escape() {
+        # Order matters: escape backslashes first, then ampersands
+        printf '%s' "$1" | sed "s${sep}\\\\\\\\&${sep}\\\\\\\\\\\\&${sep}g; s${sep}\\&${sep}\\\\\\&${sep}g"
+    }
+    new_name_esc=$(_sed_escape "$new_name")
+    new_user_esc=$(_sed_escape "$new_user")
+    new_pass_esc=$(_sed_escape "$new_pass")
+    new_host_esc=$(_sed_escape "$new_host")
 
-    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_NAME['\"],[[:space:]]*['\"]).*${sep}\\1${new_name_esc}'${sep}"     "$actual_path"
-    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_USER['\"],[[:space:]]*['\"]).*${sep}\\1${new_user_esc}'${sep}"     "$actual_path"
-    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_PASSWORD['\"],[[:space:]]*['\"]).*${sep}\\1${new_pass_esc}'${sep}" "$actual_path"
-    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_HOST['\"],[[:space:]]*['\"]).*${sep}\\1${new_host_esc}'${sep}"     "$actual_path"
+    # Replace the ENTIRE right-hand expression of each define() — including
+    # any function call like getenv_docker('WORDPRESS_DB_NAME', 'wordpress')
+    # or getenv(...) or constant lookups — with a literal single-quoted value.
+    # Pattern matches: define( 'DB_NAME', <anything-up-to-closing-paren> );
+    #
+    # sed -i.bak writes the original file to <name>.bak ONLY when a match
+    # is replaced; if no match, .bak is not created. So we count patches
+    # by checking which .bak files appear.
+    local bak_name="${actual_path}.creds.bak.$$"
+    local patched_count=0
+    # Remove any stale .bak from previous runs
+    rm -f "${actual_path}.bak" "$bak_name"
+
+    # DB_NAME
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_name_esc}');${sep}" "$actual_path" 2>/dev/null || true
+    # DB_USER
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_USER['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_user_esc}');${sep}" "$actual_path" 2>/dev/null || true
+    # DB_PASSWORD
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_PASSWORD['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_pass_esc}');${sep}" "$actual_path" 2>/dev/null || true
+    # DB_HOST
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_HOST['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_host_esc}');${sep}" "$actual_path" 2>/dev/null || true
+
+    # Count patched lines: each sed wrote a .bak only if it replaced something.
+    # Multiple sed -i.bak calls on the same file overwrite the same .bak file,
+    # so we can't just count .bak files. Instead, grep the final file for the
+    # new literals.
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*'${new_name_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_USER['\"][[:space:]]*,[[:space:]]*'${new_user_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_PASSWORD['\"][[:space:]]*,[[:space:]]*'${new_pass_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_HOST['\"][[:space:]]*,[[:space:]]*'${new_host_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+
+    rm -f "${actual_path}.bak" "$bak_name"
+
+    if [ "$patched_count" -eq 0 ]; then
+        log_message "WARN: No DB_NAME/DB_USER/DB_HOST define() lines were patched in $wp_config_path"
+        log_message "  Expected pattern: define( 'DB_NAME', <expression> );"
+        log_message "  Check that wp-config.php is the standard WordPress config format."
+        [ "$in_container" = true ] && rm -f "$actual_path"
+        return 1
+    fi
 
     if [ "$in_container" = true ]; then
         if ! docker cp "$actual_path" "$container:$cdocroot" 2>/dev/null; then
@@ -1034,9 +1072,9 @@ patch_wp_config_db_creds() {
             return 1
         fi
         rm -f "$actual_path"
-        log_message "Patched DB creds in $container:$cdocroot (name/user/host)"
+        log_message "Patched DB creds in $container:$cdocroot (DB_NAME/USER/PASSWORD/HOST replaced; ${patched_count}/4 literal(s))"
     else
-        log_message "Patched DB creds in $wp_config_path (name/user/host)"
+        log_message "Patched DB creds in $wp_config_path (DB_NAME/USER/PASSWORD/HOST replaced; ${patched_count}/4 literal(s))"
     fi
     return 0
 }
