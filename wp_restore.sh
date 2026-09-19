@@ -2539,29 +2539,70 @@ else
     fi
 fi
 
+# READ LIVE WP-CONFIG (always in restore mode, even without -r / -c)
+# Read credentials + table_prefix from the LIVE wp-config.php on the target
+# (host for -w, container for -c) BEFORE we overwrite files. These are
+# the credentials WordPress will actually need to connect after restore,
+# regardless of what the backup says. The destructive part (DROP tables)
+# only runs when RESET_DB is enabled.
+#
+# Soft-fail: if the target has no wp-config.php yet (fresh directory, no
+# pre-existing WP install), we just WARN and continue. The patch block
+# below will then fall back to the backup's .dbinfo values for creds.
+if [ "$FIX_MODE" != true ] && [ "$BACKUP_FILE" ]; then
+    log_message ""
+    log_message "========== READING LIVE WP-CONFIG =========="
+    if ! read_live_wp_config; then
+        log_message "WARN: No live wp-config.php on target — falling back to backup's .dbinfo for creds"
+        log_message "  (This is normal when restoring into a brand-new/empty target directory)"
+        # Fall back: derive LIVE_DB_* from what extract_db_config set, so
+        # the post-restore patch block still has something to work with.
+        LIVE_DB_NAME="${DB_NAME:-}"
+        LIVE_DB_USER="${DB_USER:-}"
+        LIVE_DB_PASSWORD="${DB_PASSWORD:-}"
+        LIVE_DB_HOST="${DB_HOST:-}"
+        # In Docker mode without an obvious DB_HOST, derive it from the
+        # compose service name of DB_CONTAINER (what WordPress actually
+        # uses to reach the DB inside the docker network).
+        if [ -z "$LIVE_DB_HOST" ] || [ "$LIVE_DB_HOST" = "db:3306" ]; then
+            if [ -n "${DB_CONTAINER:-}" ]; then
+                local_lhost=$(docker inspect "$DB_CONTAINER" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null)
+                if [ -z "$local_lhost" ]; then
+                    local_db_name="$DB_CONTAINER"
+                    local_db_base="${local_db_name%-[0-9]*}"
+                    if [ "$local_db_base" != "$local_db_name" ]; then
+                        local_lhost="${local_db_base##*-}"
+                    else
+                        local_lhost="${local_db_name##*-}"
+                    fi
+                fi
+                [ -n "$local_lhost" ] && LIVE_DB_HOST="$local_lhost"
+            fi
+        fi
+    fi
+    log_message "==========================================="
+    log_message ""
+fi
+
 # RESET-DB FLOW (only when explicitly enabled or auto-enabled by -c mode)
 # If RESET_DB=true, we discard all DB_* / DB_CONTAINER values from the backup
 # (which may refer to the source stack) and instead read creds from the LIVE
 # wp-config.php on the target host/container. We then DROP all tables matching
 # the live $table_prefix before importing the backup's SQL.
+# Note: read_live_wp_config() was already called above; here we just do the
+# destructive part (DROP / list / confirm) plus the table_prefix handling.
 if [ "$RESET_DB" = true ]; then
     log_message ""
-    log_message "========== RESET-DB FLOW =========="
+    log_message "========== RESET-DB FLOW (DESTRUCTIVE) =========="
 
-    # 1. Read live credentials from the target.
-    if ! read_live_wp_config; then
-        log_message "ERROR: Failed to read live wp-config.php (reset-db flow aborted)"
-        exit 1
-    fi
-
-    # 2. Read the backup's table prefix (so we can patch the live wp-config
+    # 1. Read the backup's table prefix (so we can patch the live wp-config
     #    to use it post-restore, preserving the live credentials).
     if ! read_backup_table_prefix "$BACKUP_WP_DIR"; then
         log_message "ERROR: Failed to read backup \$table_prefix (reset-db flow aborted)"
         exit 1
     fi
 
-    # 3. List tables currently using the LIVE prefix (these will be dropped).
+    # 2. List tables currently using the LIVE prefix (these will be dropped).
     #    list_tables_with_prefix echoes the count on stdout; capture it.
     DROP_TABLE_COUNT=$(list_tables_with_prefix "$LIVE_DB_NAME" "$LIVE_DB_USER" "$LIVE_DB_PASSWORD" "$LIVE_DB_HOST" 2>/dev/null) || {
         log_message "ERROR: Failed to enumerate live tables (reset-db flow aborted)"
@@ -2572,7 +2613,7 @@ if [ "$RESET_DB" = true ]; then
     [ -z "$DROP_TABLE_COUNT" ] && DROP_TABLE_COUNT=0
     log_message "Live tables matching prefix '$LIVE_DB_PREFIX': $DROP_TABLE_COUNT"
 
-    # 4. Confirm destructive action unless we're in dry-run or have -y/--yes.
+    # 3. Confirm destructive action unless we're in dry-run or have -y/--yes.
     confirm_destructive_action "drop $DROP_TABLE_COUNT tables with prefix '$LIVE_DB_PREFIX' in database '$LIVE_DB_NAME' and import the backup"
 
     if [ "$DRY_RUN" = true ]; then
@@ -2580,7 +2621,7 @@ if [ "$RESET_DB" = true ]; then
         log_message "[DRY-RUN] Would import $TEMP_DIR/database.sql into $LIVE_DB_NAME @ $LIVE_DB_HOST"
         log_message "[DRY-RUN] Would override DB_* with live credentials for restore"
     else
-        # 5. Drop the live tables.
+        # 4. Drop the live tables.
         if [ "$DROP_TABLE_COUNT" -gt 0 ]; then
             if ! drop_tables_for_prefix "$LIVE_DB_NAME" "$LIVE_DB_USER" "$LIVE_DB_PASSWORD" "$LIVE_DB_HOST" "$LIVE_DB_PREFIX"; then
                 log_message "ERROR: Failed to drop live tables (reset-db flow aborted — backup NOT yet imported)"
@@ -2591,15 +2632,32 @@ if [ "$RESET_DB" = true ]; then
         fi
     fi
 
-    # 6. Override DB_* and DB_CONTAINER with live values for the actual restore.
+    # 5. Override DB_* and re-resolve DB_CONTAINER were moved out of the
+    #    RESET_DB block: they now happen unconditionally for restore mode
+    #    (so the DB import command always uses live credentials, even when
+    #    --reset-db is not requested). See the "Override DB_* with LIVE
+    #    credentials" block earlier in the script.
+    log_message "=================================="
+    log_message ""
+fi
+
+# Override DB_* with LIVE credentials (read earlier in this run) so the
+# database import command — and any subsequent code that consults DB_* —
+# targets the live stack, NOT the stale .dbinfo values from the backup
+# (which typically point at the source stack that no longer exists).
+# Skip when LIVE_DB_* was set via the soft-fail fallback above (a flag
+# would be cleaner, but checking DB_NAME==LIVE_DB_NAME is enough — after
+# the read_live_wp_config path they always differ from the backup values
+# because LIVE comes from getenv_docker() resolution or the DB container's
+# env, which never match the backup's stale .dbinfo).
+if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ "$LIVE_DB_NAME" != "$DB_NAME" ]; then
     DB_NAME="$LIVE_DB_NAME"
     DB_USER="$LIVE_DB_USER"
     DB_PASSWORD="$LIVE_DB_PASSWORD"
     DB_HOST="$LIVE_DB_HOST"
-    log_message "Using LIVE credentials for restore: $DB_NAME @ $DB_HOST"
-
-    # 7. Re-resolve DB_CONTAINER for the live DB_HOST (the backup's container
-    #    name typically refers to the source stack and won't exist here).
+    log_message "DB_* overridden with LIVE credentials for import: $DB_NAME @ $DB_HOST"
+    # Re-resolve DB_CONTAINER for the live DB_HOST (backup's container
+    # name typically refers to the source stack and won't exist here).
     if [ "$IS_DOCKER" = true ]; then
         if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
             log_message "Re-resolving DB container for live DB_HOST='$DB_HOST'..."
@@ -2618,8 +2676,6 @@ if [ "$RESET_DB" = true ]; then
         fi
         log_message "Resolved DB_CONTAINER='$DB_CONTAINER' for live DB_HOST='$DB_HOST'"
     fi
-    log_message "=================================="
-    log_message ""
 fi
 
 # Validate conflicting flags (restore mode only — fix mode flags already warned above)
@@ -2735,15 +2791,17 @@ if [ "$RESET_DB" = true ] && [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" != true 
     log_message ""
 fi
 
-# POST-RESTORE: patch DB credentials in wp-config.php to match the creds
-# that ACTUALLY imported the database (DB_NAME/USER/PASSWORD/HOST). The
-# backup's wp-config.php may point at the source stack's container or DB
-# user, which doesn't exist on the target. If we don't patch this, WordPress
-# will 500 right after restore. Runs in both reset-db and non-reset-db
-# modes (the DB_* vars at this point are the creds used for the import).
-if [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" != true ] && [ -n "${DB_NAME:-}" ] && [ -n "${DB_USER:-}" ]; then
+# POST-RESTORE: patch DB credentials in wp-config.php to match the LIVE
+# credentials (LIVE_DB_*) that WordPress will need to actually connect.
+# The backup's wp-config.php may point at the source stack's container
+# or DB user (e.g. "db:3306", a container that no longer exists) and
+# would 500 right after restore. This runs in EVERY restore mode unless
+# we're in fix-mode (where no restore happens). It's independent of
+# --skip-files / --skip-db because either way the wp-config.php on disk
+# needs to point at the live target's DB after we're done.
+if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ -n "${LIVE_DB_USER:-}" ]; then
     log_message ""
-    log_message "Patching wp-config.php DB credentials to match restore target ($DB_NAME @ $DB_HOST)..."
+    log_message "Patching wp-config.php DB credentials to match restore target ($LIVE_DB_NAME @ $LIVE_DB_HOST)..."
     # Decide target path format based on mode (same rule as reset-db block above).
     if [ "$CONTAINER_DIRECT" = true ]; then
         WP_CONFIG_TARGET_C="${WP_CONTAINER}:${WP_CONTAINER_DOCROOT}/wp-config.php"
@@ -2753,7 +2811,7 @@ if [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" != true ] && [ -n "${DB_NAME:-}" ]
     if [ "$DRY_RUN" = true ]; then
         log_message "[DRY-RUN] Would patch DB creds in $WP_CONFIG_TARGET_C"
     else
-        if ! patch_wp_config_db_creds "$WP_CONFIG_TARGET_C" "$DB_NAME" "$DB_USER" "${DB_PASSWORD:-}" "${DB_HOST:-localhost}"; then
+        if ! patch_wp_config_db_creds "$WP_CONFIG_TARGET_C" "$LIVE_DB_NAME" "$LIVE_DB_USER" "${LIVE_DB_PASSWORD:-}" "${LIVE_DB_HOST:-localhost}"; then
             log_message "WARNING: Failed to patch DB credentials in wp-config.php"
             log_message "  You may need to manually edit DB_NAME/DB_USER/DB_PASSWORD/DB_HOST"
             log_message "  to match the live database."
