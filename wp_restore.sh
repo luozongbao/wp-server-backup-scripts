@@ -1745,6 +1745,20 @@ restore_files() {
             fi
         else
             log_message "WARNING: Target directory exists. Contents will be replaced."
+            # Capture owner/group/mode of the existing target BEFORE we move it
+            # away. The WordPress container (e.g. litespeedtech/openlitespeed)
+            # runs as 'nobody:nogroup' and the bind-mounted host path must
+            # match that ownership, otherwise PHP/OLS cannot write uploads,
+            # caches, or update plugins/themes. By recording the original
+            # ownership here and reapplying it to the freshly-created target_dir
+            # and its contents below, we keep the container working after
+            # restore — and we also let cleanup_safety_backups() actually
+            # remove the renamed backup (otherwise 'rm -rf' as the restore
+            # user fails with 'Permission denied' on nobody-owned files).
+            local target_owner target_group target_mode
+            target_owner=$(stat -c '%u' "$target_dir")
+            target_group=$(stat -c '%g' "$target_dir")
+            target_mode=$(stat -c '%a' "$target_dir")
             # Backup existing directory — tracked for cleanup on success
             local backup_existing="$target_dir.backup.$(date +%Y%m%d_%H%M%S)"
             log_message "Creating backup of existing directory: $backup_existing"
@@ -1753,7 +1767,28 @@ restore_files() {
                 return 1
             fi
             RESTORE_SAFETY_BACKUPS+=("$backup_existing")
+            # Recreate target_dir, then restore its original ownership/mode.
+            # The WordPress container (e.g. litespeedtech/openlitespeed) runs
+            # as 'nobody:nogroup' and the bind-mounted host path must match
+            # that ownership — otherwise PHP/OLS can't write uploads, cache,
+            # or update plugins/themes. 'mkdir' alone would create a dir
+            # owned by the restore user (zongbao), so we chown/chmod it back
+            # to the original. This requires root; if we're not root, we log
+            # a clear hint and the user can either re-run with sudo or let
+            # the container fix it (note: the OLS image's entrypoint does
+            # NOT chown /var/www, so sudo really is needed in that case).
             mkdir -p "$target_dir"
+            if [ "$(id -u)" = "0" ]; then
+                chown --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                    || chown "${target_owner}:${target_group}" "$target_dir" 2>/dev/null || true
+                chmod --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                    || chmod "$target_mode" "$target_dir" 2>/dev/null || true
+            else
+                log_message "WARNING: Running as non-root ($(id -un)); cannot chown '$target_dir' to ${target_owner}:${target_group}." \
+                    "If WordPress runs in a Docker container with a different UID (e.g. nobody:65534)," \
+                    "re-run this script with sudo so the restored files match the container user." \
+                    "Skipping ownership restore — files will be owned by $(id -un)."
+            fi
         fi
         
         # Copy WordPress files from backup.
@@ -1765,6 +1800,26 @@ restore_files() {
         shopt -s dotglob
         if cp -r "$backup_wp_dir"/. "$target_dir"/; then
             shopt -u dotglob
+            # Restore the original target_dir ownership/mode onto every file
+            # we just copied. The 'cp -r' above created files owned by the
+            # restore user (zongbao), which would break the WordPress
+            # container running as 'nobody' (uploads, cache writes, plugin
+            # updates all fail). Using --reference=backup_existing (which we
+            # just moved out of the way) preserves the exact uid:gid the
+            # container was using. Falls back gracefully if we lack permission
+            # (e.g. running as non-root).
+            if [ -n "${target_owner:-}" ] && [ -n "${target_group:-}" ]; then
+                if [ "$(id -u)" = "0" ]; then
+                    chown -R --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                        || chown -R "${target_owner}:${target_group}" "$target_dir" 2>/dev/null \
+                        || log_message "WARNING: Could not chown restored files to ${target_owner}:${target_group}"
+                else
+                    # Non-root: cannot chown. The warning was already emitted
+                    # before 'cp -r' ran, so don't repeat it here — but make
+                    # sure the user sees the perms issue at least once.
+                    :
+                fi
+            fi
             log_message "WordPress files restored successfully"
 
             # Verify dotfiles (e.g. .htaccess) actually made it across — a missing
@@ -2107,7 +2162,18 @@ cleanup_safety_backups() {
             fi
         elif [ -e "$b" ]; then
             log_message "  Removing: $b"
-            rm -rf "$b" 2>/dev/null || log_message "  WARNING: Failed to remove $b"
+            if ! rm -rf "$b" 2>/dev/null; then
+                # The pre-restore backup may be owned by a different user
+                # (e.g. 'nobody' from the WordPress container's bind mount),
+                # so the restore user (e.g. zongbao) can't remove it. Try
+                # chmod'ing the tree first to gain write access to directories,
+                # then retry. Best-effort: if we still can't remove it, log a
+                # warning so the user knows to clean up manually (e.g. via
+                # 'docker run --rm -v ... alpine rm -rf' or sudo).
+                chmod -R u+rwX "$b" 2>/dev/null || true
+                rm -rf "$b" 2>/dev/null \
+                    || log_message "  WARNING: Failed to remove $b (owned by a different user? try: sudo rm -rf \"$b\")"
+            fi
         fi
     done
     RESTORE_SAFETY_BACKUPS=()
