@@ -31,6 +31,14 @@ WP_CONTAINER_DOCROOT="/var/www/html"
 # These are auto-removed on SUCCESS, but PRESERVED on ERROR so the user can
 # roll back manually if anything went wrong mid-restore.
 declare -a RESTORE_SAFETY_BACKUPS=()
+# Bind-mount destinations detected on the WP container that fall under the
+# restore docroot (e.g. /var/www/html/wp-content/themes/MyTheme when the
+# user bind-mounts ./mytheme/ into the container). Populated by
+# detect_container_bind_mounts() in -c mode. These paths are USER-MANAGED
+# on the host: the restore script must NOT recursively chown or rm -rf
+# through them, or it will silently wipe or re-own files the user owns
+# outside the container. See issue/issue1.md.
+declare -a WP_CONTAINER_BIND_MOUNTS=()
 
 # Post-restore customization options
 NEW_URL=""                  # Replace site URL throughout database (e.g., http://localhost:8088)
@@ -1766,6 +1774,98 @@ update_admin_user() {
     log_message "Admin user '$ADMIN_USER' (ID=$existing_id) is configured as administrator"
 }
 
+# Inspect the WP container's mounts and populate WP_CONTAINER_BIND_MOUNTS
+# with any bind-mount (Type=bind) whose Destination starts with the given
+# docroot. Also logs a clear summary so the user can see which subpaths
+# the script will treat as user-managed. Safe to call multiple times — it
+# dedups by clearing the array first. Sets the global array; returns 0
+# on success, 1 if the container can't be inspected.
+#
+# Why this matters: when a user bind-mounts e.g. ./mytheme/ into
+# /var/www/html/wp-content/themes/MyTheme, that directory is OWNED BY THE
+# USER on the host. The restore script's recursive 'chown -R wp-content'
+# and the cleanup 'docker exec rm -rf wp-content.backup.<ts>' both walk
+# through bind mounts and therefore operate on the host's user-owned
+# files — silently wiping them (see issue/issue1.md). By collecting the
+# bind-mount destinations here and excluding them from those operations,
+# the restore stays confined to the parts of the docroot that are truly
+# container-managed (i.e. the named volume).
+detect_container_bind_mounts() {
+    local container="$1"
+    local docroot="$2"
+    WP_CONTAINER_BIND_MOUNTS=()
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        return 1
+    fi
+    # docker inspect .Mounts is JSON; pull Destination + Type per mount with
+    # @json range. We rely on json parsing via shell word-splitting rather
+    # than jq so the script stays dependency-free.
+    local raw
+    raw=$(docker inspect "$container" \
+        --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Destination}}
+{{end}}{{end}}' 2>/dev/null || true)
+    if [ -z "$raw" ]; then
+        return 0
+    fi
+    local m
+    while IFS= read -r m; do
+        # Only care about bind mounts UNDER the docroot (e.g. /var/www/html/wp-content/...).
+        # The docroot itself is typically a named volume, never a bind mount in our
+        # supported compose layouts; ignore exact-match too for safety.
+        if [ -n "$m" ] && [ "$m" != "$docroot" ] \
+            && [[ "$m" == "$docroot"/* ]]; then
+            WP_CONTAINER_BIND_MOUNTS+=("$m")
+        fi
+    done <<< "$raw"
+    if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+        log_message "Detected ${#WP_CONTAINER_BIND_MOUNTS[@]} bind mount(s) under $docroot (user-managed; will be excluded from chown/cleanup):"
+        local bm
+        for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+            log_message "  - $bm"
+        done
+    fi
+    return 0
+}
+
+# Return 0 (true) if $1 is equal to — or a parent of — any path in
+# WP_CONTAINER_BIND_MOUNTS. Used to skip chown -R and rm -rf recursion
+# into user-owned subtrees. $1 is an absolute path inside the container.
+path_is_under_bind_mount() {
+    local p="$1"
+    [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -eq 0 ] && return 1
+    local bm
+    for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+        if [ "$p" = "$bm" ] || [[ "$p" == "$bm"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Build a space-separated set of `-path <glob>` exclusions suitable for
+# passing to `find ... -prune -o ...`. E.g. for bind mounts
+# /var/www/html/wp-content/themes/MyTheme and
+# /var/www/html/wp-content/plugins/MyPlugin, returns:
+#   -path /var/www/html/wp-content/themes/MyTheme -o -path /var/www/html/wp-content/themes/MyTheme/* -o -path /var/www/html/wp-content/plugins/MyPlugin -o -path /var/www/html/wp-content/plugins/MyPlugin/*
+# Caller is expected to wrap this in find's \( ... \) and append the actions, e.g.:
+#   find "$root" \( $(build_find_exclusions_for_bind_mounts) \) -prune -o -exec chown ... {} +
+#
+# IMPORTANT: do NOT emit a leading `-o`. find treats that as "binary -o with
+# no left operand" and errors out with 'invalid expression'. The first
+# token must be a `-path` test.
+build_find_exclusions_for_bind_mounts() {
+    local out=""
+    local bm
+    for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+        if [ -z "$out" ]; then
+            out="-path $bm -o -path ${bm}/*"
+        else
+            out="$out -o -path $bm -o -path ${bm}/*"
+        fi
+    done
+    printf '%s' "$out"
+}
+
 # Function to restore WordPress files into a Docker container using 'docker cp'.
 # Used in container-direct mode (-c). The backup is restored INTO the
 # container (no host bind mount required) using the document root path
@@ -1785,6 +1885,11 @@ restore_files_to_container() {
         log_message "ERROR: Container '$container' is not running"
         return 1
     fi
+
+    # Detect user-managed bind mounts under the docroot so we don't chown
+    # or rm -rf through them (issue/issue1.md). Idempotent — safe to call
+    # on every container-direct restore.
+    detect_container_bind_mounts "$container" "$docroot"
 
     if [ "$BACKUP_MODE" = "lightweight" ]; then
         log_message "Restoring WordPress files to container '$container' (lightweight mode)..."
@@ -1811,7 +1916,14 @@ restore_files_to_container() {
                     log_message "Backing up existing wp-content inside container to wp-content.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/wp-content' '$docroot/wp-content.backup.$ts'" 2>/dev/null || true
                     wp_content_inside_backup="${docroot}/wp-content.backup.$ts"
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
+                    # Only register for auto-cleanup if it doesn't contain a
+                    # bind mount — otherwise rm -rf would walk through the
+                    # bind mount and wipe user-owned host files (issue/issue1.md).
+                    if ! path_is_under_bind_mount "$wp_content_inside_backup"; then
+                        RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
+                    else
+                        log_message "  NOTE: Skipping auto-cleanup of $wp_content_inside_backup — contains bind-mounted subpath(s) the user manages on the host."
+                    fi
                 fi
                 # docker cp expects a directory; source ends without / for directories
                 if docker cp "$backup_wp_dir/wp-content" "$container:$docroot/" 2>/dev/null; then
@@ -1827,8 +1939,25 @@ restore_files_to_container() {
                     fi
                     [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
                     if [ -n "$target_owner_group" ]; then
-                        docker exec "$container" chown -R "$target_owner_group" "$docroot/wp-content" 2>/dev/null \
-                            || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container"
+                        # Skip bind-mounted subpaths: they belong to the user on the
+                        # host, not to the container's webserver UID. Recursively
+                        # chowning them would silently re-own files outside the
+                        # container (issue/issue1.md).
+                        if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+                            local chown_exclusions
+                            chown_exclusions=$(build_find_exclusions_for_bind_mounts)
+                            docker exec "$container" sh -c "find '$docroot/wp-content' \( $chown_exclusions \) -prune -o -exec chown '$target_owner_group' {} +" 2>/dev/null \
+                                || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container (bind-mount-aware)"
+                            # Make sure each bind-mount destination itself has the
+                            # right owner too (the directory entry, not just contents).
+                            local bm
+                            for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+                                docker exec "$container" chown "$target_owner_group" "$bm" 2>/dev/null || true
+                            done
+                        else
+                            docker exec "$container" chown -R "$target_owner_group" "$docroot/wp-content" 2>/dev/null \
+                                || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container"
+                        fi
                     fi
                     log_message "wp-content restored to container"
                 else
@@ -1849,7 +1978,11 @@ restore_files_to_container() {
                     log_message "Backing up existing wp-config.php inside container to wp-config.php.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/wp-config.php' '$docroot/wp-config.php.backup.$ts'" 2>/dev/null || true
                     wp_config_inside_backup="${docroot}/wp-config.php.backup.$ts"
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_config_inside_backup}")
+                    if ! path_is_under_bind_mount "$wp_config_inside_backup"; then
+                        RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_config_inside_backup}")
+                    else
+                        log_message "  NOTE: Skipping auto-cleanup of $wp_config_inside_backup — contains bind-mounted subpath(s) the user manages on the host."
+                    fi
                 fi
                 if docker cp "$backup_wp_dir/wp-config.php" "$container:$docroot/" 2>/dev/null; then
                     local target_owner_group=""
@@ -1883,7 +2016,11 @@ restore_files_to_container() {
                     log_message "Backing up existing .htaccess inside container to .htaccess.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/.htaccess' '$docroot/.htaccess.backup.$ts'" 2>/dev/null || true
                     htaccess_inside_backup="${docroot}/.htaccess.backup.$ts"
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${htaccess_inside_backup}")
+                    if ! path_is_under_bind_mount "$htaccess_inside_backup"; then
+                        RESTORE_SAFETY_BACKUPS+=("docker://${container}:${htaccess_inside_backup}")
+                    else
+                        log_message "  NOTE: Skipping auto-cleanup of $htaccess_inside_backup — contains bind-mounted subpath(s) the user manages on the host."
+                    fi
                 fi
                 if docker cp "$backup_wp_dir/.htaccess" "$container:$docroot/" 2>/dev/null; then
                     local target_owner_group=""
@@ -1920,7 +2057,15 @@ restore_files_to_container() {
             log_message "Backing up existing docroot inside container to $docroot.backup.$ts"
             docker exec "$container" sh -c "mv '$docroot' '$docroot.backup.$ts'" 2>/dev/null || true
             docroot_inside_backup="${docroot}.backup.$ts"
-            RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot_inside_backup}")
+            # Full-mode backup is the docroot itself, which may contain bind mounts.
+            # Refuse to auto-clean it: rm -rf would walk into the bind mount and
+            # wipe user-owned host files (issue/issue1.md). The user can remove it
+            # manually once they've verified the restore.
+            if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+                log_message "  NOTE: Skipping auto-cleanup of $docroot_inside_backup — contains bind-mounted subpath(s) the user manages on the host. Remove manually after verifying."
+            else
+                RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot_inside_backup}")
+            fi
             # Recreate empty docroot
             docker exec "$container" mkdir -p "$docroot" 2>/dev/null
         else
@@ -1939,8 +2084,21 @@ restore_files_to_container() {
                 target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot_inside_backup" 2>/dev/null || true)
             fi
             if [ -n "$target_owner_group" ]; then
-                docker exec "$container" chown -R "$target_owner_group" "$docroot" 2>/dev/null \
-                    || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container"
+                # Skip bind-mounted subpaths in the recursive chown: those
+                # paths are owned by the user on the host (issue/issue1.md).
+                if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+                    local chown_exclusions
+                    chown_exclusions=$(build_find_exclusions_for_bind_mounts)
+                    docker exec "$container" sh -c "find '$docroot' \( $chown_exclusions \) -prune -o -exec chown '$target_owner_group' {} +" 2>/dev/null \
+                        || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container (bind-mount-aware)"
+                    local bm
+                    for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+                        docker exec "$container" chown "$target_owner_group" "$bm" 2>/dev/null || true
+                    done
+                else
+                    docker exec "$container" chown -R "$target_owner_group" "$docroot" 2>/dev/null \
+                        || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container"
+                fi
             fi
             log_message "WordPress files restored to container successfully"
             return 0
@@ -2497,9 +2655,20 @@ cleanup_safety_backups() {
             local container="${rest%%:*}"
             local cpath="${rest#*:}"
             if [ -n "$container" ] && [ -n "$cpath" ]; then
-                log_message "  Removing (in container $container): $cpath"
-                docker exec "$container" rm -rf "$cpath" 2>/dev/null \
-                    || log_message "  WARNING: Failed to remove $cpath in $container"
+                # Defense in depth: never rm -rf a safety backup that is or
+                # contains a bind-mounted subpath. rm -rf would walk into the
+                # bind mount and silently delete user-owned host files
+                # (issue/issue1.md). Normally detect_container_bind_mounts()
+                # already filtered these out at registration time, but we
+                # re-check here so any future caller can't reintroduce the bug.
+                if [ "$container" = "$WP_CONTAINER" ] && path_is_under_bind_mount "$cpath"; then
+                    log_message "  Skipping (in container $container): $cpath"
+                    log_message "    -> contains bind-mounted subpath(s); user-managed on the host. Remove manually if no longer required."
+                else
+                    log_message "  Removing (in container $container): $cpath"
+                    docker exec "$container" rm -rf "$cpath" 2>/dev/null \
+                        || log_message "  WARNING: Failed to remove $cpath in $container"
+                fi
             fi
         elif [ -e "$b" ]; then
             log_message "  Removing: $b"
