@@ -11,6 +11,35 @@ add new features; major releases introduce breaking changes.
 ## [Unreleased]
 
 ### Added
+- (none yet)
+
+### Fixed
+- (none yet)
+
+### Removed
+- (none yet)
+
+---
+
+## v.1.1.0 — Ownership Restore & Service Detection Hardening
+
+**Tag:** `v.1.1.0`
+**Date:** 2026-09-19
+
+This release hardens three areas of the restore pipeline that previously left
+the webserver in a broken or unreliable state after a restore:
+
+1. **Webserver config ownership on restore** — `webserver_restore.sh` now matches
+   the file ownership to what the running webserver expects (per-type defaults:
+   Apache → `root:www-data`, Nginx → `root:root`, OpenLiteSpeed → `nobody:nogroup`).
+2. **`wp_restore.sh` wp-config.php patching** — handles `getenv_docker()` and
+   `getenv()` forms (not just literal strings), so the official WordPress Docker
+   image restores cleanly without "Error establishing a database connection".
+3. **Webserver service detection** — robust against `docker-compose.yml` files
+   that declare multiple webserver-image services, mixed tab/space indentation,
+   and `${VAR:-default}` port interpolation from compose `.env` files.
+
+### Added
 
 **Live-config-aware wp-config.php patching (always on)** (`wp_restore.sh`).
 
@@ -96,7 +125,7 @@ Key user-facing additions:
   and `${VAR:-default}` interpolations are resolved against `.env` first.
 
 ### Removed
-- (none yet)
+- (none)
 
 ---
 
