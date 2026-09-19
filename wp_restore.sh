@@ -1360,11 +1360,40 @@ detect_old_url() {
     local wp_config_path="$1"
 
     # Try to extract siteurl from the SQL file in the backup.
-    # IMPORTANT: Use 'grep -m 1' to stop after the first match (not 'head -1'
-    # which only stops after a newline, and would leak the rest of a
-    # multi-line INSERT that contains serialized data spanning many lines).
+    #
+    # IMPORTANT: We must look for the 'siteurl' / 'home' options specifically,
+    # NOT just any URL. WordPress SQL dumps virtually always contain
+    # 'https://wordpress.org/' (default commenter URL, bundled widget RSS
+    # feeds, theme/plugin default strings, etc.) — and that URL appears EARLIER
+    # in the dump than the real 'siteurl' option row, so a naive "first URL"
+    # grep would return 'https://wordpress.org/' and the script would then
+    # attempt to "replace" every wordpress.org reference with the user's
+    # local URL, corrupting the database.
+    #
+    # Pattern matches a wp_options INSERT row like:
+    #   INSERT INTO `wp_options` VALUES (1,'siteurl','http://proj.local','yes'), ...
+    # We anchor on the option_name ('siteurl' or 'home') so other URLs that
+    # happen to contain those strings as substrings cannot match.
     if [ -f "$TEMP_DIR/database.sql" ]; then
         local detected_url
+        # Try 'siteurl' first (authoritative site URL).
+        detected_url=$(grep -oE "'siteurl','https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null \
+            | grep -m 1 -oE "https?://[^']+")
+        # Fall back to 'home' option.
+        if [ -z "$detected_url" ]; then
+            detected_url=$(grep -oE "'home','https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null \
+                | grep -m 1 -oE "https?://[^']+")
+        fi
+        if [ -n "$detected_url" ]; then
+            echo "$detected_url"
+            return 0
+        fi
+
+        # Last-resort fallback: pick the first URL anywhere in the dump.
+        # This may return a non-site URL (e.g. https://wordpress.org/ from a
+        # bundled widget) and is therefore UNRELIABLE — only used if we
+        # genuinely cannot find a siteurl/home option row.
+        log_message "WARNING: Could not locate 'siteurl'/'home' options in SQL dump; falling back to first URL found (may be incorrect)"
         detected_url=$(grep -oE "'https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null | grep -m 1 -oE "https?://[^']+")
         if [ -n "$detected_url" ]; then
             echo "$detected_url"
