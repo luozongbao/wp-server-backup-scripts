@@ -173,6 +173,10 @@ show_help() {
     echo "  - Optional URL/title/admin replacement after restore"
     echo "  - Fix mode (-f) for site maintenance without a full restore"
     echo ""
+    echo "Note: This script MUST be run as root (use sudo)."
+    echo "      Restore needs to chown restored files to match the web server user"
+    echo "      (e.g. nobody:65534, www-data:33, or 1000:1000 for OLS)."
+    echo ""
     echo "Note: This script will restore both WordPress files and database from the backup"
     echo "      unless -f (fix mode) is used, in which case only the requested customizations"
     echo "      are applied to the live site."
@@ -1772,23 +1776,14 @@ restore_files() {
             # as 'nobody:nogroup' and the bind-mounted host path must match
             # that ownership — otherwise PHP/OLS can't write uploads, cache,
             # or update plugins/themes. 'mkdir' alone would create a dir
-            # owned by the restore user (zongbao), so we chown/chmod it back
-            # to the original. This requires root; if we're not root, we log
-            # a clear hint and the user can either re-run with sudo or let
-            # the container fix it (note: the OLS image's entrypoint does
-            # NOT chown /var/www, so sudo really is needed in that case).
+            # owned by the restore user, so we chown/chmod it back to the
+            # original. Root is guaranteed at this point (script aborts at
+            # startup if not).
             mkdir -p "$target_dir"
-            if [ "$(id -u)" = "0" ]; then
-                chown --reference="$backup_existing" "$target_dir" 2>/dev/null \
-                    || chown "${target_owner}:${target_group}" "$target_dir" 2>/dev/null || true
-                chmod --reference="$backup_existing" "$target_dir" 2>/dev/null \
-                    || chmod "$target_mode" "$target_dir" 2>/dev/null || true
-            else
-                log_message "WARNING: Running as non-root ($(id -un)); cannot chown '$target_dir' to ${target_owner}:${target_group}." \
-                    "If WordPress runs in a Docker container with a different UID (e.g. nobody:65534)," \
-                    "re-run this script with sudo so the restored files match the container user." \
-                    "Skipping ownership restore — files will be owned by $(id -un)."
-            fi
+            chown --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                || chown "${target_owner}:${target_group}" "$target_dir" 2>/dev/null || true
+            chmod --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                || chmod "$target_mode" "$target_dir" 2>/dev/null || true
         fi
         
         # Copy WordPress files from backup.
@@ -1802,28 +1797,20 @@ restore_files() {
             shopt -u dotglob
             # Restore the original target_dir ownership/mode onto every file
             # we just copied. The 'cp -r' above created files owned by the
-            # restore user (zongbao), which would break the WordPress
-            # container running as 'nobody' (uploads, cache writes, plugin
-            # updates all fail). Using --reference=backup_existing (which we
-            # just moved out of the way) preserves the exact uid:gid the
-            # container was using. Falls back gracefully if we lack permission
-            # (e.g. running as non-root).
-            if [ -n "${target_owner:-}" ] && [ -n "${target_group:-}" ]; then
-                if [ "$(id -u)" = "0" ]; then
+                # restore user, which would break the WordPress container
+                # running as 'nobody' (uploads, cache writes, plugin updates
+                # all fail). Using --reference=backup_existing (which we just
+                # moved out of the way) preserves the exact uid:gid the
+                # container was using. Root is guaranteed at this point.
+                if [ -n "${target_owner:-}" ] && [ -n "${target_group:-}" ]; then
                     chown -R --reference="$backup_existing" "$target_dir" 2>/dev/null \
                         || chown -R "${target_owner}:${target_group}" "$target_dir" 2>/dev/null \
                         || log_message "WARNING: Could not chown restored files to ${target_owner}:${target_group}"
-                else
-                    # Non-root: cannot chown. The warning was already emitted
-                    # before 'cp -r' ran, so don't repeat it here — but make
-                    # sure the user sees the perms issue at least once.
-                    :
                 fi
-            fi
-            log_message "WordPress files restored successfully"
+                log_message "WordPress files restored successfully"
 
-            # Verify dotfiles (e.g. .htaccess) actually made it across — a missing
-            # .htaccess will silently break pretty-permalinks on Apache/OLS.
+                # Verify dotfiles (e.g. .htaccess) actually made it across — a missing
+                # .htaccess will silently break pretty-permalinks on Apache/OLS.
             local missing_dotfiles=()
             for df in "$backup_wp_dir"/.[!.]*; do
                 [ -e "$df" ] || continue
@@ -1961,6 +1948,18 @@ done
 if [ "$SHOW_HELP" = true ]; then
     show_help
     exit 0
+fi
+
+# Require root (sudo). Restore needs to chown restored files to match the
+# web-server user (e.g. nobody:65534, www-data:33, 1000:1000 for OLS image)
+# — only root can chown to other UIDs. Fail loudly BEFORE any heavy work
+# (unzip, docker cp, DB import) starts so the user doesn't waste minutes
+# only to get a half-restored site.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: This script must be run as root (use sudo)" >&2
+    echo "       Example: sudo $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]" >&2
+    echo "       Restore needs to chown restored files to match the web server user." >&2
+    exit 1
 fi
 
 # Validate required parameters based on mode
