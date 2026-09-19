@@ -13,6 +13,20 @@ DB_TYPE=""
 DB_CONTAINER=""
 IS_DOCKER=false
 BACKUP_MODE=""
+# Resolved DB config from .dbinfo sidecar (preferred over parsing
+# wp-config.php, which may use env-based helpers and produce wrong values).
+BACKUP_DB_NAME=""
+BACKUP_DB_USER=""
+BACKUP_DB_PASSWORD=""
+BACKUP_DB_HOST=""
+BACKUP_DB_TYPE=""
+BACKUP_DB_CONTAINER=""
+BACKUP_SOURCE=""
+# Container-direct mode: restore files into a running WordPress Docker
+# container using 'docker cp' instead of writing to a host path. Use when
+# WordPress lives in a named volume (no host bind mount).
+WP_CONTAINER=""
+WP_CONTAINER_DOCROOT="/var/www/html"
 # Tracks backup paths created as safety net during restore (e.g. www.backup.<TS>).
 # These are auto-removed on SUCCESS, but PRESERVED on ERROR so the user can
 # roll back manually if anything went wrong mid-restore.
@@ -32,6 +46,32 @@ FIX_MODE=false              # If true, skip restore entirely; only run post-rest
                             # (URL/title/admin) against the live site. In this mode
                             # -b is OPTIONAL (no backup needed) and -w is required so we can read
                             # wp-config.php to get DB credentials from the live installation.
+# Reset-DB flow: read credentials + table_prefix from the LIVE wp-config.php
+# (target container/host BEFORE we overwrite files), DROP all tables with
+# that prefix, then IMPORT the backup's database. Finally, patch the
+# restored wp-config.php so its $table_prefix matches the backup (creds
+# stay from the live config so they always work).
+#
+# In -c mode (container-direct) this is the DEFAULT — solves the
+# "container from .dbinfo doesn't exist anymore" cross-stack restore
+# problem by ignoring .dbinfo entirely and trusting the live config that
+# WordPress actually uses to connect. In -w mode it's opt-in (-r/--reset-db)
+# because host-mode restores are more sensitive to destructive ops.
+RESET_DB=false
+ASSUME_YES=false            # -y/--yes: skip confirmation prompts
+# Live-target credentials read BEFORE file restore. Used by reset-db flow.
+LIVE_DB_NAME=""
+LIVE_DB_USER=""
+LIVE_DB_PASSWORD=""
+LIVE_DB_HOST=""
+LIVE_DB_PREFIX=""
+# Backup-side table_prefix read from the backup's wp-config.php. Used to
+# patch the restored wp-config.php after a reset-db import.
+BACKUP_TABLE_PREFIX=""
+# When live wp-config uses getenv_docker() helpers and the container has
+# lost its env vars, fall back to prompting the user for creds.
+LIVE_DB_CREDENTIALS_PROMPTED=false
+LIVE_WP_CONFIG=""            # tmp path to live wp-config.php pulled from target
 
 # Function to display help
 show_help() {
@@ -39,18 +79,25 @@ show_help() {
     echo "=================================="
     echo ""
     echo "Usage:"
-    echo "  Restore mode:   $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]"
-    echo "  Fix mode (-f):  $0 -f -w WORDPRESS_DIR [post-restore options]"
+    echo "  Restore (host):     $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]"
+    echo "  Restore (Docker):   $0 -b BACKUP_FILE -c WP_CONTAINER [options]"
+    echo "  Fix mode (-f):      $0 -f -w WORDPRESS_DIR [post-restore options]"
     echo ""
     echo "Required Options (restore mode):"
     echo "  -b BACKUP_FILE       Path to the backup ZIP file (required unless -f)"
-    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory (always required)"
+    echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory on the host"
+    echo "                       (required unless -c is used; mutually exclusive with -c)"
+    echo "  -c WP_CONTAINER      Name or ID of a running WordPress Docker container."
+    echo "                       Use this when WordPress files live inside Docker with"
+    echo "                       no host bind mount. Files are pushed via 'docker cp'."
+    echo "  -d DOCROOT           Document root inside the WordPress container"
+    echo "                       (default: /var/www/html, used with -c)"
     echo ""
     echo "Modes:"
     echo "  -f, --fix-mode       Fix mode: do NOT restore files or database. Only run"
     echo "                       post-restore customizations (-u, -t, -A) against the"
     echo "                       live site. -b is not needed; DB credentials are read from"
-    echo "                       the live WordPress installation at -w."
+    echo "                       the live WordPress installation at -w or -c."
     echo ""
     echo "Post-Restore Customization:"
     echo "  -u NEW_URL           Replace site URL throughout database (e.g., http://localhost:8088)"
@@ -64,6 +111,17 @@ show_help() {
     echo "  --skip-files         Skip file restoration (DB only)"
     echo "  --skip-db            Skip database restoration (files only)"
     echo "  --dry-run            Show what would be done without executing"
+    echo ""
+    echo "Reset-DB Flow (read live wp-config.php + DROP/IMPORT):"
+    echo "  -r, --reset-db       DESTRUCTIVE: read credentials + table_prefix from the"
+    echo "                       LIVE wp-config.php (target container/host BEFORE file"
+    echo "                       restore), DROP all tables with that prefix, IMPORT"
+    echo "                       the backup's database, then patch the restored"
+    echo "                       wp-config.php so its \$table_prefix matches the backup"
+    echo "                       (creds stay from live config so WordPress can connect)."
+    echo "                       Skips .dbinfo entirely — fixes cross-stack restores."
+    echo "                       Default in -c mode; opt-in in -w mode."
+    echo "  -y, --yes            Skip the DROP-TABLES confirmation prompt"
     echo ""
     echo "Other:"
     echo "  -h                   Show this help message"
@@ -83,6 +141,19 @@ show_help() {
     echo "  # Preview restore without making changes"
     echo "  $0 -b /backups/backup.zip -w /var/www/html/wordpress --dry-run"
     echo ""
+    echo "  # Cross-stack restore with -c: drop live tables, import, patch prefix"
+    echo "  $0 -b /backups/szreypower.zip -c wp-dev-environment-wordpress-app -y"
+    echo ""
+    echo "  # Host-mode reset-db (opt-in):"
+    echo "  $0 -b /backups/backup.zip -w /var/www/html --reset-db -y"
+    echo ""
+    echo "  # Restore back into a Docker container (WordPress lives in a named volume)"
+    echo "  $0 -b /backups/backup.zip -c my_project-wordpress-app"
+    echo ""
+    echo "  # Restore into a container and change URL"
+    echo "  $0 -b /backups/backup.zip -c my_project-wordpress-app \\"
+    echo "     -U https://oldsite.com -u https://newsite.com"
+    echo ""
     echo "  # FIX MODE: change live site URL only (no restore, no backup needed)"
     echo "  $0 -f -w /var/www/html/wordpress \\"
     echo "     -U https://oldsite.com -u https://newsite.com"
@@ -101,6 +172,10 @@ show_help() {
     echo "  - Handles environment-specific restoration methods"
     echo "  - Optional URL/title/admin replacement after restore"
     echo "  - Fix mode (-f) for site maintenance without a full restore"
+    echo ""
+    echo "Note: This script MUST be run as root (use sudo)."
+    echo "      Restore needs to chown restored files to match the web server user"
+    echo "      (e.g. nobody:65534, www-data:33, or 1000:1000 for OLS)."
     echo ""
     echo "Note: This script will restore both WordPress files and database from the backup"
     echo "      unless -f (fix mode) is used, in which case only the requested customizations"
@@ -197,44 +272,199 @@ detect_docker_environment() {
     return 1
 }
 
+# Function to find a running DB container by reading wp-config.php's DB_HOST.
+# WordPress Docker stacks normally set DB_HOST to the compose service name
+# (e.g. "db"), and docker-compose prefixes container names with the project
+# name (e.g. "<project>-db-1" or "<project>-db"). We try several strategies
+# so we can connect to whatever DB is actually running for this stack,
+# even if the compose file lives outside WORDPRESS_DIR.
+#
+# Strategy order:
+#   1. Exact match: a running container literally named "$DB_HOST"
+#   2. Compose v2: "<project>-<service>-1" (suffix "-1")
+#   3. Compose v2: "<project>-<service>" (no suffix)
+#   4. DB container reachable from a known WP container via shared network
+#   5. Any running container whose image is mariadb/mysql
+#
+# Sets DB_CONTAINER on success, leaves it untouched on failure.
+resolve_db_container_from_running_stack() {
+    local db_host="${1:-}"
+    [ -z "$db_host" ] && return 1
+    # Strip optional port (e.g. "db:3306" -> "db")
+    local svc="${db_host%%:*}"
+    [ -z "$svc" ] && return 1
+
+    # Skip obvious non-container hosts
+    case "$svc" in
+        localhost|127.0.0.1|0.0.0.0|::1) return 1 ;;
+    esac
+
+    if ! command -v docker &>/dev/null; then
+        return 1
+    fi
+
+    local running
+    running=$(docker ps --format '{{.Names}}' 2>/dev/null) || return 1
+    [ -z "$running" ] && return 1
+
+    # 1. Exact match
+    if echo "$running" | grep -qx "$svc"; then
+        DB_CONTAINER="$svc"
+        log_message "Resolved DB container (exact name): $DB_CONTAINER"
+        return 0
+    fi
+
+    # 2/3. Compose project prefixes — derive project name from any running
+    # WordPress container on the host so we don't guess wrong.
+    local project=""
+    if [ -n "$WP_CONTAINER" ]; then
+        # WP container was supplied via -c: "<project>-<service>-N" or
+        # "<project>-<service>". Strip trailing "-<digits>" then the service.
+        local base="${WP_CONTAINER%-[0-9]*}"
+        if [ "$base" != "$WP_CONTAINER" ]; then
+            project="${base%-*}"
+        else
+            project="${WP_CONTAINER%-*}"
+        fi
+    fi
+    if [ -z "$project" ]; then
+        # Try a WordPress container discovered from the running list
+        local wp_candidate
+        wp_candidate=$(echo "$running" | grep -E "(wordpress|wp)$|-wordpress-[0-9]+$|-wp-[0-9]+$" | head -1)
+        if [ -n "$wp_candidate" ]; then
+            local base="${wp_candidate%-[0-9]*}"
+            project="${base%-*}"
+        fi
+    fi
+    if [ -n "$project" ]; then
+        for cand in "${project}-${svc}-1" "${project}-${svc}"; do
+            if echo "$running" | grep -qx "$cand"; then
+                DB_CONTAINER="$cand"
+                log_message "Resolved DB container (compose project '$project'): $DB_CONTAINER"
+                return 0
+            fi
+        done
+    fi
+
+    # 4. Network-based: any mariadb/mysql container that shares a network
+    # with a running WordPress container.
+    local wp_for_net=""
+    if [ -n "$WP_CONTAINER" ] && echo "$running" | grep -qx "$WP_CONTAINER"; then
+        wp_for_net="$WP_CONTAINER"
+    else
+        wp_for_net=$(echo "$running" | grep -E "(wordpress|wp)$|-wordpress-[0-9]+$|-wp-[0-9]+$" | head -1)
+    fi
+    if [ -n "$wp_for_net" ]; then
+        local wp_netids
+        wp_netids=$(docker inspect "$wp_for_net" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
+        for net in $wp_netids; do
+            local candidates
+            candidates=$(docker network inspect "$net" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null) || continue
+            for cand in $candidates; do
+                if [ "$cand" = "$wp_for_net" ]; then continue; fi
+                local img
+                img=$(docker inspect "$cand" --format '{{.Config.Image}}' 2>/dev/null)
+                case "$img" in
+                    *mariadb*|*mysql*) DB_CONTAINER="$cand"; log_message "Resolved DB container (shared network with WP): $DB_CONTAINER (image=$img)"; return 0 ;;
+                esac
+            done
+        done
+    fi
+
+    # 5. Last resort: any running mariadb/mysql container. Useful when the
+    # host only runs a single DB stack and we just don't know its name.
+    local any
+    any=$(docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+        | awk 'tolower($2) ~ /mariadb|mysql/ && $2 !~ /^(wordpress|wp):/ {print $1; exit}')
+    if [ -n "$any" ]; then
+        DB_CONTAINER="$any"
+        log_message "Resolved DB container (fallback: any running mariadb/mysql): $DB_CONTAINER"
+        return 0
+    fi
+
+    return 1
+}
+
 # Function to detect database type and container (for Docker)
 detect_docker_database_info() {
     local compose_file="$DOCKER_COMPOSE_DIR/docker-compose.yml"
-    
-    if [ ! -f "$compose_file" ]; then
-        log_message "ERROR: docker-compose.yml not found in $DOCKER_COMPOSE_DIR"
-        return 1
+    local compose_found=false
+
+    if [ -f "$compose_file" ]; then
+        compose_found=true
+        log_message "Analyzing docker-compose.yml for database configuration..."
+
+        # Detect database type from compose file
+        if grep -qi "mariadb" "$compose_file"; then
+            DB_TYPE="mariadb"
+            log_message "Detected database type: MariaDB (from compose)"
+        elif grep -qi "mysql" "$compose_file"; then
+            DB_TYPE="mysql"
+            log_message "Detected database type: MySQL (from compose)"
+        fi
+
+        # Try to derive a container name from the compose file. This is best-
+        # effort: many stacks rely on compose's default naming (<project>-
+        # <service>-N) rather than explicit container_name. We still record
+        # whatever we find but won't fail if it's empty.
+        local container_line=$(grep -A 10 -B 5 "mariadb\|mysql" "$compose_file" | grep -E "container_name:" | head -1)
+        if [ -n "$container_line" ]; then
+            DB_CONTAINER=$(echo "$container_line" | sed 's/.*container_name:\s*//' | tr -d '"' | tr -d "'" | xargs)
+            log_message "Database container (from compose container_name): $DB_CONTAINER"
+        else
+            local svc_line
+            svc_line=$(grep -B 5 -A 10 "mariadb\|mysql" "$compose_file" | grep -E "^\s*[a-zA-Z0-9_-]+:" | head -1 | sed 's/:\s*$//' | sed 's/^\s*//')
+            if [ -n "$svc_line" ]; then
+                DB_CONTAINER="$svc_line"
+                log_message "Database service name (from compose): $DB_CONTAINER"
+            fi
+        fi
+    elif [ -n "$DOCKER_COMPOSE_DIR" ]; then
+        log_message "WARN: docker-compose.yml not found in $DOCKER_COMPOSE_DIR"
     fi
-    
-    log_message "Analyzing docker-compose.yml for database configuration..."
-    
-    # Detect database type
-    if grep -qi "mariadb" "$compose_file"; then
-        DB_TYPE="mariadb"
-        log_message "Detected database type: MariaDB"
-    elif grep -qi "mysql" "$compose_file"; then
-        DB_TYPE="mysql"
-        log_message "Detected database type: MySQL"
+
+    # If DB_TYPE still unknown (compose missing or didn't mention mysql/
+    # mariadb), infer it from the BACKUP_DB_TYPE sidecar or default to mysql.
+    if [ -z "$DB_TYPE" ]; then
+        if [ -n "$BACKUP_DB_TYPE" ]; then
+            DB_TYPE="$BACKUP_DB_TYPE"
+            log_message "Detected database type from .dbinfo sidecar: $DB_TYPE"
+        else
+            DB_TYPE="mysql"
+            log_message "Assuming database type: mysql (default)"
+        fi
+    fi
+
+    # Always try to resolve a *running* container for the DB. We pass
+    # $DB_HOST (set by extract_db_config from wp-config.php / .dbinfo) so we
+    # can find the right container even when the compose file is absent or
+    # uses compose's default naming scheme.
+    if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+        if [ -z "${DB_HOST:-}" ] && [ -z "$DB_CONTAINER" ]; then
+            # Very early in the run, before the backup is extracted.
+            # The main flow will retry us once DB_HOST is populated from
+            # wp-config.php / .dbinfo. Stay quiet so we don't print a
+            # confusing failure message that gets immediately contradicted.
+            :
+        elif resolve_db_container_from_running_stack "${DB_HOST:-}"; then
+            : # DB_CONTAINER updated by helper
+        elif [ "$compose_found" = false ] && [ -z "$DB_CONTAINER" ]; then
+            log_message "ERROR: Could not determine database container (no compose file and no running container matches DB_HOST='${DB_HOST:-}')"
+            return 1
+        elif [ -z "$DB_CONTAINER" ]; then
+            log_message "ERROR: Could not determine database container from compose file"
+            return 1
+        else
+            log_message "WARN: Resolved container '$DB_CONTAINER' from compose file is not running; will try fallback discovery"
+            resolve_db_container_from_running_stack "${DB_HOST:-}" || true
+        fi
+    fi
+
+    if [ -n "$DB_CONTAINER" ]; then
+        log_message "Database container: $DB_CONTAINER (type=$DB_TYPE)"
     else
-        log_message "ERROR: Could not detect database type (MariaDB/MySQL) in docker-compose.yml"
-        return 1
+        log_message "Database container: <pending — will resolve after backup extraction>"
     fi
-    
-    # Find database container name
-    local container_line=$(grep -A 10 -B 5 "$DB_TYPE" "$compose_file" | grep -E "container_name:" | head -1)
-    if [ -n "$container_line" ]; then
-        DB_CONTAINER=$(echo "$container_line" | sed 's/.*container_name:\s*//' | tr -d '"' | tr -d "'" | xargs)
-    else
-        # Try to find service name if container_name is not specified
-        DB_CONTAINER=$(grep -B 5 -A 10 "$DB_TYPE" "$compose_file" | grep -E "^\s*[a-zA-Z0-9_-]+:" | head -1 | sed 's/:\s*$//' | sed 's/^\s*//')
-    fi
-    
-    if [ -z "$DB_CONTAINER" ]; then
-        log_message "ERROR: Could not determine database container name"
-        return 1
-    fi
-    
-    log_message "Database container: $DB_CONTAINER"
     return 0
 }
 
@@ -345,48 +575,682 @@ extract_backup() {
         cat "$temp_dir/backup_info.txt"
         echo ""
     fi
-    
+
+    # Load resolved DB config from .dbinfo sidecar if present. The sidecar
+    # contains the values AFTER env/getenv_docker() resolution, which is
+    # critical for Docker images that use env-driven wp-config.php
+    # (otherwise we'd get literal "wordpress" instead of the real DB name).
+    if [ -f "$temp_dir/.dbinfo" ]; then
+        log_message "Loading resolved DB config from .dbinfo sidecar..."
+        # Source each KEY=VALUE line (skip blanks/comments). Use a subshell
+        # so we can filter safely.
+        while IFS='=' read -r key val; do
+            case "$key" in
+                DB_NAME)      BACKUP_DB_NAME="$val" ;;
+                DB_USER)      BACKUP_DB_USER="$val" ;;
+                DB_PASSWORD)  BACKUP_DB_PASSWORD="$val" ;;
+                DB_HOST)      BACKUP_DB_HOST="$val" ;;
+                DB_TYPE)      BACKUP_DB_TYPE="$val" ;;
+                DB_CONTAINER) BACKUP_DB_CONTAINER="$val" ;;
+                BACKUP_MODE)  [ "$val" = "lightweight" ] && BACKUP_MODE="lightweight" ;;
+                SOURCE)       BACKUP_SOURCE="$val" ;;
+                WP_CONTAINER) BACKUP_WP_CONTAINER="$val" ;;
+                WP_CONTAINER_DOCROOT) BACKUP_WP_CONTAINER_DOCROOT="$val" ;;
+            esac
+        done < "$temp_dir/.dbinfo"
+        log_message "  DB: $BACKUP_DB_NAME on $BACKUP_DB_HOST (type=$BACKUP_DB_TYPE)"
+        log_message "  Source: $BACKUP_SOURCE"
+    fi
+
     return 0
 }
 
 # Function to extract database configuration from backup wp-config.php
 extract_db_config() {
     local wp_config="$1/wp-config.php"
-    
+
+    # Prefer the resolved values from the .dbinfo sidecar (written by
+    # wp_backup.sh). This avoids wrong defaults like "wordpress" when the
+    # original wp-config.php uses getenv_docker() or similar env helpers.
+    if [ -n "$BACKUP_DB_NAME" ] && [ -n "$BACKUP_DB_USER" ] && [ -n "$BACKUP_DB_HOST" ]; then
+        DB_NAME="$BACKUP_DB_NAME"
+        DB_USER="$BACKUP_DB_USER"
+        DB_PASSWORD="$BACKUP_DB_PASSWORD"
+        DB_HOST="$BACKUP_DB_HOST"
+        if [ -n "$BACKUP_DB_TYPE" ]; then
+            DB_TYPE="$BACKUP_DB_TYPE"
+        fi
+        if [ -n "$BACKUP_DB_CONTAINER" ]; then
+            DB_CONTAINER="$BACKUP_DB_CONTAINER"
+        fi
+        log_message "Database config from .dbinfo sidecar"
+        log_message "Database: $DB_NAME on $DB_HOST (container: ${DB_CONTAINER:-unknown})"
+        return 0
+    fi
+
     if [ ! -f "$wp_config" ]; then
         log_message "ERROR: wp-config.php not found in $1"
         return 1
     fi
-    
+
     # Extract database configuration
     DB_NAME=$(grep "define.*DB_NAME" "$wp_config" | sed -n "s/.*DB_NAME.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_USER=$(grep "define.*DB_USER" "$wp_config" | sed -n "s/.*DB_USER.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_PASSWORD=$(grep "define.*DB_PASSWORD" "$wp_config" | sed -n "s/.*DB_PASSWORD.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
     DB_HOST=$(grep "define.*DB_HOST" "$wp_config" | sed -n "s/.*DB_HOST.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
-    
+
     if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ] || [ -z "$DB_HOST" ]; then
         log_message "ERROR: Could not extract database configuration from wp-config.php"
         return 1
     fi
-    
+
     log_message "Database configuration extracted successfully"
     log_message "Database: $DB_NAME on $DB_HOST"
     return 0
 }
 
+# Read a single literal-value define() from wp-config.php (returns empty
+# string if not found). Used by read_live_wp_config() below.
+_wp_config_get_define() {
+    local key="$1" file="$2"
+    # Match: define( 'KEY', 'value' );  or  define( "KEY", "value" );
+    # Also: define('KEY', getenv_docker('NAME', 'fallback')) — handled by
+    # the caller separately.
+    grep -E "^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"]" "$file" 2>/dev/null \
+        | head -1 \
+        | sed -nE "s/.*['\"]${key}['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\\1/p"
+}
+
+# Read credentials + table_prefix from the LIVE wp-config.php on the target
+# (host path for -w, container for -c) — i.e. BEFORE we overwrite files.
+# This is what makes the reset-db flow work even when .dbinfo is stale.
+#
+# Sets: LIVE_DB_NAME, LIVE_DB_USER, LIVE_DB_PASSWORD, LIVE_DB_HOST,
+#       LIVE_DB_PREFIX (and a temporary $LIVE_WP_CONFIG file path used by
+#       the caller).
+#
+# Side effects: when live wp-config uses getenv_docker() (DB_* defaults to
+# literal "wordpress", "example username", "mysql") we try to resolve the
+# real values from the WP container's env vars. If that fails AND
+# ASSUME_YES is not set, we prompt the user for credentials. If the user
+# cancels, the function returns 1.
+read_live_wp_config() {
+    local target_path=""           # host path to live wp-config.php (-w mode)
+    local target_container=""      # container name (-c mode)
+    local docroot="/var/www/html"
+
+    if [ -n "$WORDPRESS_DIR" ]; then
+        target_path="$WORDPRESS_DIR/wp-config.php"
+    elif [ -n "$WP_CONTAINER" ]; then
+        target_container="$WP_CONTAINER"
+        docroot="$WP_CONTAINER_DOCROOT"
+    else
+        log_message "ERROR: read_live_wp_config() needs -w or -c to know where to look"
+        return 1
+    fi
+
+    # Pull live wp-config.php out to a tmp file we can grep on.
+    local tmp_wp=/tmp/live_wp_config_$$.php
+    if [ -n "$target_path" ]; then
+        if [ ! -f "$target_path" ]; then
+            log_message "ERROR: live wp-config.php not found at $target_path"
+            log_message "       Reset-db flow requires an existing WordPress installation on the target"
+            return 1
+        fi
+        cp "$target_path" "$tmp_wp" 2>/dev/null || {
+            log_message "ERROR: Cannot read $target_path"
+            return 1
+        }
+        log_message "Read live wp-config.php from $target_path"
+    else
+        if ! docker exec "$target_container" test -f "$docroot/wp-config.php" >/dev/null 2>&1; then
+            log_message "ERROR: live wp-config.php not found at $docroot in container '$target_container'"
+            return 1
+        fi
+        if ! docker cp "$target_container:$docroot/wp-config.php" "$tmp_wp" 2>/dev/null; then
+            log_message "ERROR: docker cp failed to pull $docroot/wp-config.php from $target_container"
+            return 1
+        fi
+        log_message "Pulled live wp-config.php from container '$target_container:$docroot'"
+    fi
+
+    # Extract literal values.
+    local lname luser lpass lhost lprefix
+    lname=$(_wp_config_get_define "DB_NAME"     "$tmp_wp")
+    luser=$(_wp_config_get_define "DB_USER"     "$tmp_wp")
+    lpass=$(_wp_config_get_define "DB_PASSWORD" "$tmp_wp")
+    lhost=$(_wp_config_get_define "DB_HOST"     "$tmp_wp")
+
+    # Extract $table_prefix (line like "$table_prefix = 'wp_';")
+    lprefix=$(grep -E "^[[:space:]]*\\\$(table_prefix|wpdb\\->prefix)" "$tmp_wp" 2>/dev/null \
+        | head -1 \
+        | sed -nE "s/.*['\"]([^'\"]*)['\"][[:space:]]*;.*/\\1/p")
+
+    # If table_prefix wasn't found, try the more lenient "= 'wp_';" pattern
+    if [ -z "$lprefix" ]; then
+        lprefix=$(grep -E "table_prefix" "$tmp_wp" 2>/dev/null \
+            | head -1 \
+            | sed -nE "s/.*=.*['\"]([^'\"]*)['\"].*/\\1/p")
+    fi
+
+    # Detect getenv_docker() usage: DB_* is set to a literal placeholder
+    # (e.g. "wordpress", "example username", "example password", "mysql")
+    # OR to a getenv_docker() call. In either case the literal value is
+    # not the real credential.
+    local uses_env_helpers=false
+    if grep -qE "getenv_docker\s*\(" "$tmp_wp" 2>/dev/null; then
+        uses_env_helpers=true
+    fi
+
+    if [ "$uses_env_helpers" = true ]; then
+        log_message "Live wp-config.php uses getenv_docker() — resolving real credentials from container env"
+        # Pick the best container to ask for env vars:
+        #   - In -c mode: WP_CONTAINER has them (typical WP docker image).
+        #   - In -w mode with a separate DB container (e.g. OpenLiteSpeed as
+        #     webserver + mariadb as DB): the WEB container has no
+        #     WORDPRESS_DB_* env vars; ask the DB container instead. The DB
+        #     container is the one that actually received MYSQL_USER/
+        #     MYSQL_PASSWORD/MYSQL_DATABASE env vars (mariadb/mysql image
+        #     convention) which is what getenv_docker() falls back to.
+        local env_source=""
+        if [ -n "$target_container" ]; then
+            env_source="$target_container"
+        elif [ -n "${DB_CONTAINER:-}" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+            env_source="$DB_CONTAINER"
+            log_message "  Reading env from DB container '$env_source' (WP container has no env helpers in -w mode)"
+        else
+            log_message "WARN: getenv_docker() detected but no container available to read env from; falling back to literal values"
+        fi
+
+        if [ -n "$env_source" ]; then
+            local env_name env_user env_pass env_host
+            env_name=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_NAME"' 2>/dev/null)
+            env_user=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_USER"' 2>/dev/null)
+            env_pass=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_PASSWORD"' 2>/dev/null)
+            env_host=$(docker exec "$env_source" sh -c 'echo "$WORDPRESS_DB_HOST"' 2>/dev/null)
+            # If WORDPRESS_DB_* env vars are absent, fall back to MYSQL_*
+            # (mariadb/mysql official image convention). The DB_HOST that
+            # WordPress uses inside its container is the DB service name
+            # (e.g. "database" / "db"), not the host's loopback — so for
+            # DB_HOST we prefer the service name from the compose project
+            # of the DB container. As a final fallback use "localhost".
+            if [ -z "$env_name" ]; then
+                env_name=$(docker exec "$env_source" sh -c 'echo "$MYSQL_DATABASE"' 2>/dev/null)
+            fi
+            if [ -z "$env_user" ]; then
+                env_user=$(docker exec "$env_source" sh -c 'echo "$MYSQL_USER"' 2>/dev/null)
+            fi
+            if [ -z "$env_pass" ]; then
+                env_pass=$(docker exec "$env_source" sh -c 'echo "$MYSQL_PASSWORD"' 2>/dev/null)
+            fi
+            if [ -z "$env_pass" ]; then
+                env_pass=$(docker exec "$env_source" sh -c 'echo "$MARIADB_PASSWORD"' 2>/dev/null)
+            fi
+            if [ -z "$env_name" ]; then
+                env_name=$(docker exec "$env_source" sh -c 'echo "$MARIADB_DATABASE"' 2>/dev/null)
+            fi
+            if [ -z "$env_user" ]; then
+                env_user=$(docker exec "$env_source" sh -c 'echo "$MARIADB_USER"' 2>/dev/null)
+            fi
+            # DB_HOST: prefer the compose service name (what WordPress
+            # uses to reach the DB), not the literal "localhost". Derive
+            # it from the DB container's compose project name.
+            if [ -z "$env_host" ] && [ "${IS_DOCKER:-false}" = true ]; then
+                env_host=$(docker inspect "$env_source" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null)
+                # If no compose label, try stripping the project prefix
+                if [ -z "$env_host" ]; then
+                    local db_name="$env_source"
+                    local db_base="${db_name%-[0-9]*}"
+                    if [ "$db_base" != "$db_name" ]; then
+                        env_host="${db_base##*-}"
+                    else
+                        env_host="${db_name##*-}"
+                    fi
+                fi
+            fi
+            [ -z "$env_host" ] && env_host="localhost"
+            # Use env vars when present and non-placeholder.
+            [ -n "$env_name" ] && [ "$env_name" != "wordpress" ] && lname="$env_name"
+            [ -n "$env_user" ] && [ "$env_user" != "example username" ] && luser="$env_user"
+            [ -n "$env_pass" ] && [ "$env_pass" != "example password" ] && lpass="$env_pass"
+            [ -n "$env_host" ] && [ "$env_host" != "mysql" ] && lhost="$env_host"
+        fi
+    fi
+
+    # Final check — if we still have placeholders, prompt the user.
+    local needs_prompt=false
+    if [ -z "$lname" ] || [ "$lname" = "wordpress" ]; then needs_prompt=true; fi
+    if [ -z "$luser" ] || [ "$luser" = "example username" ]; then needs_prompt=true; fi
+    if [ -z "$lhost" ]; then needs_prompt=true; fi
+
+    if [ "$needs_prompt" = true ]; then
+        log_message ""
+        log_message "==================================================================="
+        log_message "  Live wp-config.php does not contain usable DB credentials."
+        if [ "$uses_env_helpers" = true ]; then
+            log_message "  It uses getenv_docker() but the WP container has no"
+            log_message "  WORDPRESS_DB_* env vars (or they still hold placeholders)."
+        fi
+        log_message "  Reset-db flow requires real credentials to connect to the DB."
+        log_message "  Please enter them now (or press Ctrl-C to abort)."
+        log_message "==================================================================="
+        log_message ""
+
+        local input
+        if [ -z "$lname" ] || [ "$lname" = "wordpress" ]; then
+            printf "DB name (current: '%s'): " "$lname"
+            read -r input
+            [ -n "$input" ] && lname="$input"
+        fi
+        if [ -z "$luser" ] || [ "$luser" = "example username" ]; then
+            printf "DB user (current: '%s'): " "$luser"
+            read -r input
+            [ -n "$input" ] && luser="$input"
+        fi
+        if [ -z "$lpass" ] || [ "$lpass" = "example password" ]; then
+            printf "DB password (current: '%s'): " "$lpass"
+            read -r input
+            [ -n "$input" ] && lpass="$input"
+        fi
+        if [ -z "$lhost" ]; then
+            printf "DB host (current: '%s'): " "$lhost"
+            read -r input
+            [ -n "$input" ] && lhost="$input"
+        fi
+        LIVE_DB_CREDENTIALS_PROMPTED=true
+
+        # Re-validate after prompting.
+        if [ -z "$lname" ] || [ -z "$luser" ] || [ -z "$lhost" ]; then
+            log_message "ERROR: DB credentials are still incomplete; cannot proceed"
+            rm -f "$tmp_wp" 2>/dev/null
+            return 1
+        fi
+    fi
+
+    # Default table_prefix if not detected (very unusual — wp-config.php
+    # almost always sets it).
+    if [ -z "$lprefix" ]; then
+        lprefix="wp_"
+        log_message "WARN: Could not detect \$table_prefix from live wp-config.php — defaulting to 'wp_'"
+    fi
+
+    LIVE_DB_NAME="$lname"
+    LIVE_DB_USER="$luser"
+    LIVE_DB_PASSWORD="$lpass"
+    LIVE_DB_HOST="$lhost"
+    LIVE_DB_PREFIX="$lprefix"
+    LIVE_WP_CONFIG="$tmp_wp"
+
+    log_message "Live DB config: $LIVE_DB_NAME on $LIVE_DB_HOST (prefix='$LIVE_DB_PREFIX')"
+    return 0
+}
+
+# Read the table_prefix from the BACKUP's wp-config.php (the file inside
+# the backup ZIP, which we extract to $TEMP_DIR/files/wp-config.php during
+# extract_backup()). Sets BACKUP_TABLE_PREFIX.
+read_backup_table_prefix() {
+    local wp_config="$BACKUP_WP_DIR/wp-config.php"
+    if [ ! -f "$wp_config" ]; then
+        log_message "ERROR: backup wp-config.php not found at $wp_config"
+        return 1
+    fi
+    local prefix
+    prefix=$(grep -E "^[[:space:]]*\\\$(table_prefix|wpdb\\->prefix)" "$wp_config" 2>/dev/null \
+        | head -1 \
+        | sed -nE "s/.*['\"]([^'\"]*)['\"][[:space:]]*;.*/\\1/p")
+    if [ -z "$prefix" ]; then
+        prefix=$(grep -E "table_prefix" "$wp_config" 2>/dev/null \
+            | head -1 \
+            | sed -nE "s/.*=.*['\"]([^'\"]*)['\"].*/\\1/p")
+    fi
+    if [ -z "$prefix" ]; then
+        prefix="wp_"
+        log_message "WARN: Could not detect \$table_prefix from backup wp-config.php — defaulting to 'wp_'"
+    fi
+    BACKUP_TABLE_PREFIX="$prefix"
+    log_message "Backup table prefix: '$BACKUP_TABLE_PREFIX'"
+    return 0
+}
+
+# Show tables matching $LIVE_DB_PREFIX in the live database. Returns the
+# count via stdout and a newline-separated list of tables in $DROP_TABLES.
+# Uses LIVE_DB_* creds. Works for both Docker and native.
+list_tables_with_prefix() {
+    DROP_TABLES=""
+    local query="SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='${LIVE_DB_NAME}' AND TABLE_NAME LIKE '${LIVE_DB_PREFIX}%';"
+
+    local output
+    if [ "$IS_DOCKER" = true ]; then
+        if [ "$DB_TYPE" = "mariadb" ]; then
+            output=$(docker exec "$DB_CONTAINER" mariadb -N -B -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
+        else
+            output=$(docker exec "$DB_CONTAINER" mysql -N -B -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
+        fi
+    else
+        if [ "$DB_TYPE" = "mariadb" ]; then
+            output=$(mariadb -N -B -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
+        else
+            output=$(mysql -N -B -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
+        fi
+    fi
+
+    DROP_TABLES="$output"
+    if [ -n "$DROP_TABLES" ]; then
+        echo "$DROP_TABLES" | wc -l | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+# DROP every table in $DROP_TABLES from $LIVE_DB_NAME. Runs via SET
+# FOREIGN_KEY_CHECKS=0 to avoid ordering issues. Idempotent — missing
+# tables are silently skipped (the DROP statement just errors, but we
+# suppress the error per-table).
+drop_tables_for_prefix() {
+    if [ -z "${DROP_TABLES:-}" ]; then
+        log_message "No tables matched prefix '$LIVE_DB_PREFIX' — nothing to drop"
+        return 0
+    fi
+
+    local count
+    count=$(echo "$DROP_TABLES" | wc -l | tr -d ' ')
+    log_message "Dropping $count table(s) with prefix '$LIVE_DB_PREFIX' from database '$LIVE_DB_NAME'..."
+
+    # Build a single SQL script: SET FK_CHECKS=0; DROP TABLE IF EXISTS x;
+    # DROP TABLE IF EXISTS y; ...; SET FK_CHECKS=1;
+    local sql="SET FOREIGN_KEY_CHECKS=0;\n"
+    while IFS= read -r table; do
+        [ -z "$table" ] && continue
+        # Backtick the identifier — table names in WP are ASCII but be safe.
+        sql="${sql}DROP TABLE IF EXISTS \`${table}\`;\n"
+    done <<< "$DROP_TABLES"
+    sql="${sql}SET FOREIGN_KEY_CHECKS=1;"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would DROP $count table(s) (not executed)"
+        echo "$sql" | head -5
+        return 0
+    fi
+
+    if [ "$IS_DOCKER" = true ]; then
+        if [ "$DB_TYPE" = "mariadb" ]; then
+            printf "%b" "$sql" | docker exec -i "$DB_CONTAINER" mariadb -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
+                | grep -v "Using a password" \
+                | sed 's/^/  [mysql] /' \
+                || true
+        else
+            printf "%b" "$sql" | docker exec -i "$DB_CONTAINER" mysql -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
+                | grep -v "Using a password" \
+                | sed 's/^/  [mysql] /' \
+                || true
+        fi
+    else
+        if [ "$DB_TYPE" = "mariadb" ]; then
+            printf "%b" "$sql" | mariadb -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
+                | grep -v "Using a password" \
+                | sed 's/^/  [mysql] /' \
+                || true
+        else
+            printf "%b" "$sql" | mysql -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
+                | grep -v "Using a password" \
+                | sed 's/^/  [mysql] /' \
+                || true
+        fi
+    fi
+
+    log_message "DROP phase complete"
+    return 0
+}
+
+# Patch DB credentials in a wp-config.php file (in place). Used after a
+# successful DB import so the restored wp-config.php connects with the
+# SAME creds that actually imported the data — otherwise WordPress can
+# 500 right after restore when the backup's creds (pointing at the old
+# stack) don't match the live container's creds.
+#
+# Args:
+#   $1 — path to wp-config.php to patch. Format:
+#          /path/on/host                 (host mode)
+#          CONTAINER:/path/in/container (container-direct mode; we
+#                                        docker cp the file out, patch, and
+#                                        cp it back)
+#   $2 — DB_NAME
+#   $3 — DB_USER
+#   $4 — DB_PASSWORD  (empty string is OK — we'll write an empty literal)
+#   $5 — DB_HOST
+patch_wp_config_db_creds() {
+    local wp_config_path="$1"
+    local new_name="$2"
+    local new_user="$3"
+    local new_pass="$4"
+    local new_host="$5"
+
+    if [ -z "$wp_config_path" ] || [ -z "$new_name" ] || [ -z "$new_user" ] || [ -z "$new_host" ]; then
+        log_message "ERROR: patch_wp_config_db_creds() needs path, name, user, host"
+        return 1
+    fi
+
+    # Skip if nothing actually changed (avoids unnecessary docker cp round-trip)
+    local actual_path="$wp_config_path"
+    local in_container=false
+    local container=""
+    local cdocroot=""
+    if [[ "$wp_config_path" == *":"* ]]; then
+        in_container=true
+        container="${wp_config_path%%:*}"
+        cdocroot="${wp_config_path#*:}"
+        actual_path="/tmp/wp_config_creds_$$.php"
+        if ! docker cp "$container:$cdocroot" "$actual_path" 2>/dev/null; then
+            log_message "ERROR: failed to docker cp $container:$cdocroot for creds patch"
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$actual_path" ]; then
+        log_message "ERROR: wp-config.php not found at $actual_path"
+        [ "$in_container" = true ] && rm -f "$actual_path"
+        return 1
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would patch DB creds in $wp_config_path (DB_HOST -> $new_host, DB_USER -> $new_user, DB_NAME -> $new_name)"
+        [ "$in_container" = true ] && rm -f "$actual_path"
+        return 0
+    fi
+
+    # Escape slashes for sed. Use ASCII Unit Separator as delimiter to avoid
+    # colliding with the slashes in the patterns themselves. Special chars to
+    # escape: the sed delimiter (\x1f), backslash, and the sed ampersand (which
+    # means "the matched text" in the replacement).
+    local sep=$'\x1f'
+    local new_name_esc new_user_esc new_pass_esc new_host_esc
+    _sed_escape() {
+        # Order matters: escape backslashes first, then ampersands
+        printf '%s' "$1" | sed "s${sep}\\\\\\\\&${sep}\\\\\\\\\\\\&${sep}g; s${sep}\\&${sep}\\\\\\&${sep}g"
+    }
+    new_name_esc=$(_sed_escape "$new_name")
+    new_user_esc=$(_sed_escape "$new_user")
+    new_pass_esc=$(_sed_escape "$new_pass")
+    new_host_esc=$(_sed_escape "$new_host")
+
+    # Replace the ENTIRE right-hand expression of each define() — including
+    # any function call like getenv_docker('WORDPRESS_DB_NAME', 'wordpress')
+    # or getenv(...) or constant lookups — with a literal single-quoted value.
+    # Pattern matches: define( 'DB_NAME', <anything-up-to-closing-paren> );
+    #
+    # sed -i.bak writes the original file to <name>.bak ONLY when a match
+    # is replaced; if no match, .bak is not created. So we count patches
+    # by checking which .bak files appear.
+    local bak_name="${actual_path}.creds.bak.$$"
+    local patched_count=0
+    # Remove any stale .bak from previous runs
+    rm -f "${actual_path}.bak" "$bak_name"
+
+    # DB_NAME
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_name_esc}');${sep}" "$actual_path" 2>/dev/null || true
+    # DB_USER
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_USER['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_user_esc}');${sep}" "$actual_path" 2>/dev/null || true
+    # DB_PASSWORD
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_PASSWORD['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_pass_esc}');${sep}" "$actual_path" 2>/dev/null || true
+    # DB_HOST
+    sed -i.bak -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_HOST['\"][[:space:]]*,[[:space:]]*).*\\)[[:space:]]*;${sep}\\1'${new_host_esc}');${sep}" "$actual_path" 2>/dev/null || true
+
+    # Count patched lines: each sed wrote a .bak only if it replaced something.
+    # Multiple sed -i.bak calls on the same file overwrite the same .bak file,
+    # so we can't just count .bak files. Instead, grep the final file for the
+    # new literals.
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*'${new_name_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_USER['\"][[:space:]]*,[[:space:]]*'${new_user_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_PASSWORD['\"][[:space:]]*,[[:space:]]*'${new_pass_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+    if grep -qE "define[[:space:]]*\\([[:space:]]*['\"]DB_HOST['\"][[:space:]]*,[[:space:]]*'${new_host_esc}'[[:space:]]*\\)" "$actual_path" 2>/dev/null; then
+        patched_count=$((patched_count + 1))
+    fi
+
+    rm -f "${actual_path}.bak" "$bak_name"
+
+    if [ "$patched_count" -eq 0 ]; then
+        log_message "WARN: No DB_NAME/DB_USER/DB_HOST define() lines were patched in $wp_config_path"
+        log_message "  Expected pattern: define( 'DB_NAME', <expression> );"
+        log_message "  Check that wp-config.php is the standard WordPress config format."
+        [ "$in_container" = true ] && rm -f "$actual_path"
+        return 1
+    fi
+
+    if [ "$in_container" = true ]; then
+        if ! docker cp "$actual_path" "$container:$cdocroot" 2>/dev/null; then
+            log_message "ERROR: failed to docker cp patched wp-config.php back to $container:$cdocroot"
+            rm -f "$actual_path"
+            return 1
+        fi
+        rm -f "$actual_path"
+        log_message "Patched DB creds in $container:$cdocroot (DB_NAME/USER/PASSWORD/HOST replaced; ${patched_count}/4 literal(s))"
+    else
+        log_message "Patched DB creds in $wp_config_path (DB_NAME/USER/PASSWORD/HOST replaced; ${patched_count}/4 literal(s))"
+    fi
+    return 0
+}
+
+# Patch $table_prefix in a wp-config.php file (in place). Used after a
+# reset-db import so the restored wp-config.php's prefix matches the
+# tables we just imported (which were dumped from the backup, with the
+# backup's prefix).
+#
+# Args:
+#   $1 — path to wp-config.php to patch (host path; for container-direct
+#        we docker cp the file out, patch, and cp it back)
+patch_wp_config_table_prefix() {
+    local wp_config_path="$1"
+    local old_prefix="$2"
+    local new_prefix="$3"
+
+    if [ -z "$old_prefix" ] || [ -z "$new_prefix" ]; then
+        log_message "ERROR: patch_wp_config_table_prefix() needs old and new prefix"
+        return 1
+    fi
+    if [ "$old_prefix" = "$new_prefix" ]; then
+        log_message "Table prefix unchanged ('$old_prefix') — skipping patch"
+        return 0
+    fi
+
+    local actual_path="$wp_config_path"
+    local in_container=false
+    local container=""
+    local cdocroot=""
+    if [[ "$wp_config_path" == *":"* ]]; then
+        # Format: <container>:<abs_path_in_container>
+        in_container=true
+        container="${wp_config_path%%:*}"
+        cdocroot="${wp_config_path#*:}"
+        actual_path="/tmp/wp_config_patch_$$.php"
+        if ! docker cp "$container:$cdocroot" "$actual_path" 2>/dev/null; then
+            log_message "ERROR: failed to docker cp $container:$cdocroot"
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$actual_path" ]; then
+        log_message "ERROR: wp-config.php not found at $actual_path"
+        return 1
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would patch \$table_prefix: '$old_prefix' -> '$new_prefix'"
+        return 0
+    fi
+
+    # Replace both $table_prefix and $wpdb->prefix (defensive).
+    # Use a delimiter unlikely to appear in PHP: ASCII Unit Separator (0x1f).
+    local sep=$'\x1f'
+    sed -i.bak -E "s${sep}(\\\$(table_prefix|wpdb->prefix)[[:space:]]*=[[:space:]]*['\"]).*${sep}\1${new_prefix}'${sep}g" "$actual_path"
+    rm -f "$actual_path.bak"
+
+    if [ "$in_container" = true ]; then
+        if ! docker cp "$actual_path" "$container:$cdocroot" 2>/dev/null; then
+            log_message "ERROR: failed to docker cp patched wp-config.php back to $container:$cdocroot"
+            rm -f "$actual_path"
+            return 1
+        fi
+        rm -f "$actual_path"
+        log_message "Patched \$table_prefix '$old_prefix' -> '$new_prefix' in $container:$cdocroot"
+    else
+        log_message "Patched \$table_prefix '$old_prefix' -> '$new_prefix' in $wp_config_path"
+    fi
+    return 0
+}
+
+# Interactive confirmation prompt. Skipped if ASSUME_YES=true. Returns 0
+# (proceed) or 1 (abort).
+confirm_destructive_action() {
+    local msg="$1"
+    if [ "$ASSUME_YES" = true ]; then
+        log_message "$msg"
+        log_message "--yes supplied — proceeding"
+        return 0
+    fi
+    log_message ""
+    log_message "==================================================================="
+    log_message "  WARNING: $msg"
+    log_message "==================================================================="
+    local reply
+    printf "Type 'yes' to proceed (anything else aborts): "
+    read -r reply
+    if [ "$reply" = "yes" ]; then
+        return 0
+    fi
+    return 1
+}
+
 # Function to restore database (Docker)
 restore_database_docker() {
     local sql_file="$1"
-    
+
     log_message "Restoring database using Docker..."
-    
-    # Check if container is running
-    if ! docker ps --format "table {{.Names}}" | grep -q "^${DB_CONTAINER}$"; then
-        log_message "ERROR: Database container '$DB_CONTAINER' is not running"
-        log_message "Please start your Docker containers first: docker-compose up -d"
-        return 1
+
+    # Check if container is running. If not, try to recover by re-resolving
+    # from the running stack (the value we have may be a stale compose
+    # service name like "db" rather than the real container name, or the
+    # container may be named under a different project).
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+        log_message "WARN: Database container '$DB_CONTAINER' is not running; trying to discover the real running container..."
+        if resolve_db_container_from_running_stack "${DB_HOST:-}"; then
+            log_message "Discovered running DB container: $DB_CONTAINER"
+        fi
+        if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+            log_message "ERROR: Could not find a running database container"
+            log_message "  Tried: '$DB_CONTAINER' (from compose / .dbinfo)"
+            log_message "  DB_HOST from wp-config.php: '${DB_HOST:-<unset>}'"
+            log_message "  Please start your Docker containers first: docker compose up -d"
+            log_message "  Or pass the WordPress container with -c to use env-var lookup."
+            return 1
+        fi
     fi
-    
+
     # Check if SQL file exists and has content
     if [ ! -s "$sql_file" ]; then
         log_message "ERROR: Database backup file is empty or does not exist"
@@ -408,13 +1272,31 @@ restore_database_docker() {
     
     docker_restore_cmd="$docker_restore_cmd $DB_NAME"
     
-    # Execute database restore
-    if eval "$docker_restore_cmd" < "$sql_file" 2>/dev/null; then
+    # Execute database restore. Capture stdout to a tmpfile so we don't
+    # leak DB content (multi-row INSERT...VALUES rows, etc.) to the user's
+    # terminal on a successful import. If the command fails, we surface
+    # the captured output alongside the error message.
+    local _restore_stdout _restore_stderr _restore_rc
+    _restore_stdout=$(mktemp)
+    _restore_stderr=$(mktemp)
+    trap "rm -f '$_restore_stdout' '$_restore_stderr'" RETURN
+    eval "$docker_restore_cmd" < "$sql_file" > "$_restore_stdout" 2> "$_restore_stderr"
+    _restore_rc=$?
+    if [ "$_restore_rc" = 0 ]; then
         log_message "Database restored successfully using Docker"
         return 0
     else
         log_message "ERROR: Failed to restore database using Docker"
         log_message "Please check database credentials and container status"
+        # Surface captured output only on failure (truncated to last 30 lines).
+        if [ -s "$_restore_stderr" ]; then
+            log_message "MySQL stderr (last 30 lines):"
+            tail -n 30 "$_restore_stderr" | sed 's/^/  [mysql] /'
+        fi
+        if [ -s "$_restore_stdout" ]; then
+            log_message "MySQL stdout (last 30 lines):"
+            tail -n 30 "$_restore_stdout" | sed 's/^/  [mysql] /'
+        fi
         return 1
     fi
 }
@@ -445,13 +1327,30 @@ restore_database_native() {
     
     restore_cmd="$restore_cmd $DB_NAME"
     
-    # Execute database restore
-    if eval "$restore_cmd" < "$sql_file" 2>/dev/null; then
+    # Execute database restore. Capture stdout to a tmpfile so we don't
+    # leak DB content (multi-row INSERT...VALUES rows, etc.) to the user's
+    # terminal on a successful import. If the command fails, we surface
+    # the captured output alongside the error message.
+    local _restore_stdout _restore_stderr _restore_rc
+    _restore_stdout=$(mktemp)
+    _restore_stderr=$(mktemp)
+    trap "rm -f '$_restore_stdout' '$_restore_stderr'" RETURN
+    eval "$restore_cmd" < "$sql_file" > "$_restore_stdout" 2> "$_restore_stderr"
+    _restore_rc=$?
+    if [ "$_restore_rc" = 0 ]; then
         log_message "Database restored successfully using native $DB_TYPE"
         return 0
     else
         log_message "ERROR: Failed to restore database using native $DB_TYPE"
         log_message "Please check database credentials and service availability"
+        if [ -s "$_restore_stderr" ]; then
+            log_message "MySQL stderr (last 30 lines):"
+            tail -n 30 "$_restore_stderr" | sed 's/^/  [mysql] /'
+        fi
+        if [ -s "$_restore_stdout" ]; then
+            log_message "MySQL stdout (last 30 lines):"
+            tail -n 30 "$_restore_stdout" | sed 's/^/  [mysql] /'
+        fi
         return 1
     fi
 }
@@ -460,10 +1359,42 @@ restore_database_native() {
 detect_old_url() {
     local wp_config_path="$1"
 
-    # Try to extract siteurl from the SQL file in the backup
+    # Try to extract siteurl from the SQL file in the backup.
+    #
+    # IMPORTANT: We must look for the 'siteurl' / 'home' options specifically,
+    # NOT just any URL. WordPress SQL dumps virtually always contain
+    # 'https://wordpress.org/' (default commenter URL, bundled widget RSS
+    # feeds, theme/plugin default strings, etc.) — and that URL appears EARLIER
+    # in the dump than the real 'siteurl' option row, so a naive "first URL"
+    # grep would return 'https://wordpress.org/' and the script would then
+    # attempt to "replace" every wordpress.org reference with the user's
+    # local URL, corrupting the database.
+    #
+    # Pattern matches a wp_options INSERT row like:
+    #   INSERT INTO `wp_options` VALUES (1,'siteurl','http://proj.local','yes'), ...
+    # We anchor on the option_name ('siteurl' or 'home') so other URLs that
+    # happen to contain those strings as substrings cannot match.
     if [ -f "$TEMP_DIR/database.sql" ]; then
         local detected_url
-        detected_url=$(grep -oE "siteurl.*'https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null | head -1 | grep -oE "https?://[^']+")
+        # Try 'siteurl' first (authoritative site URL).
+        detected_url=$(grep -oE "'siteurl','https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null \
+            | grep -m 1 -oE "https?://[^']+")
+        # Fall back to 'home' option.
+        if [ -z "$detected_url" ]; then
+            detected_url=$(grep -oE "'home','https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null \
+                | grep -m 1 -oE "https?://[^']+")
+        fi
+        if [ -n "$detected_url" ]; then
+            echo "$detected_url"
+            return 0
+        fi
+
+        # Last-resort fallback: pick the first URL anywhere in the dump.
+        # This may return a non-site URL (e.g. https://wordpress.org/ from a
+        # bundled widget) and is therefore UNRELIABLE — only used if we
+        # genuinely cannot find a siteurl/home option row.
+        log_message "WARNING: Could not locate 'siteurl'/'home' options in SQL dump; falling back to first URL found (may be incorrect)"
+        detected_url=$(grep -oE "'https?://[^']+'" "$TEMP_DIR/database.sql" 2>/dev/null | grep -m 1 -oE "https?://[^']+")
         if [ -n "$detected_url" ]; then
             echo "$detected_url"
             return 0
@@ -544,15 +1475,31 @@ run_db_query() {
     db_cmd=$(build_db_query_cmd)
     local query_file
     query_file=$(mktemp)
-    # 'trap ... RETURN' fires when this function returns, no matter how
-    # (success, error, or early-return). Guarantees the temp file is cleaned
-    # up even if a command between this point and the return fails.
-    trap "rm -f '$query_file'" RETURN
+    # Capture stdout+stderr to temp files; only surface on failure.
+    # mysql/mariadb may print table data to stdout during UPDATE statements
+    # (e.g. when re-reading triggers, or with verbose modes) - we MUST
+    # suppress stdout to avoid leaking DB content into the restore log.
+    local _qd_stdout _qd_stderr
+    _qd_stdout=$(mktemp)
+    _qd_stderr=$(mktemp)
+    trap "rm -f '$query_file' '$_qd_stdout' '$_qd_stderr'" RETURN
     # Write query to file with no shell expansion (printf preserves $ literally)
     printf '%s\n' "$query" > "$query_file"
-    # Pipe into the command; db_cmd ends with the DB name (no -e flag)
-    $db_cmd < "$query_file" 2>/dev/null
+    # Pipe into the command; redirect ALL output to temp files.
+    # db_cmd ends with the DB name (no -e flag).
+    $db_cmd < "$query_file" > "$_qd_stdout" 2> "$_qd_stderr"
     local rc=$?
+    if [ "$rc" != 0 ]; then
+        # On failure, surface captured output (truncated) for debugging
+        if [ -s "$_qd_stderr" ]; then
+            log_message "DB query stderr (last 20 lines):"
+            tail -n 20 "$_qd_stderr" | sed 's/^/  [query] /'
+        fi
+        if [ -s "$_qd_stdout" ]; then
+            log_message "DB query stdout (last 20 lines):"
+            tail -n 20 "$_qd_stdout" | sed 's/^/  [query] /'
+        fi
+    fi
     return $rc
 }
 
@@ -563,7 +1510,7 @@ run_db_query_capture() {
     db_cmd=$(build_db_query_cmd)
     local query_file
     query_file=$(mktemp)
-    # trap RETURN ensures cleanup on any exit path from this function
+    # For capture we WANT stdout (that's the SELECT result), so only redirect stderr.
     trap "rm -f '$query_file'" RETURN
     printf '%s\n' "$query" > "$query_file"
     local output
@@ -634,15 +1581,61 @@ update_database_urls() {
     log_message "URL replacement completed"
 }
 
-# Function to get WordPress table prefix from wp-config.php in restored files
+# Function to get WordPress table prefix from wp-config.php in restored files.
+# Handles three forms on the right-hand side of the assignment:
+#   1. Literal:        $table_prefix = 'wp_';
+#   2. getenv_docker:  $table_prefix = getenv_docker('WORDPRESS_TABLE_PREFIX', 'wp_');
+#                      (uses the fallback string as the prefix)
+#   3. getenv():       $table_prefix = getenv('WORDPRESS_TABLE_PREFIX') ?: 'wp_';
+#                      (no safe fallback to extract statically; we just return 'wp_')
+#
+# Prefers LIVE_DB_PREFIX when set (read from the pre-restore live config
+# via read_live_wp_config()) because the live config is what WordPress
+# actually used to connect — most reliable source.
 get_table_prefix() {
+    # Live prefix (preferred — most reliable)
+    if [ -n "${LIVE_DB_PREFIX:-}" ]; then
+        echo "$LIVE_DB_PREFIX"
+        return 0
+    fi
     local wp_config="$WORDPRESS_DIR/wp-config.php"
     if [ -f "$wp_config" ]; then
-        local prefix
-        prefix=$(grep -E "\\\$table_prefix" "$wp_config" 2>/dev/null | head -1 | sed -E "s/.*table_prefix[[:space:]]*=[[:space:]]*['\"]([^'\"]+)['\"].*/\1/")
-        if [ -n "$prefix" ]; then
-            echo "$prefix"
-            return 0
+        local line prefix
+        line=$(grep -E "^[[:space:]]*\\\$table_prefix" "$wp_config" 2>/dev/null | head -1)
+        if [ -n "$line" ]; then
+            # Form 1: literal value in quotes.
+            prefix=$(echo "$line" | sed -nE "s/.*=[[:space:]]*['\"]([^'\"]+)['\"].*/\\1/p")
+            if [ -n "$prefix" ]; then
+                # Sanity: if we accidentally captured a function call (sed
+                # fallback gave us the whole expression), try form 2/3.
+                case "$prefix" in
+                    *getenv*|*'\\$'*|*'('*)
+                        # fall through to form 2 handling below
+                        prefix=""
+                        ;;
+                    *)
+                        echo "$prefix"
+                        return 0
+                        ;;
+                esac
+            fi
+            # Form 2: getenv_docker('ENV', 'fallback') — extract the
+            # second quoted arg (the fallback).
+            prefix=$(echo "$line" | sed -nE "s/.*getenv_docker[[:space:]]*\([[:space:]]*['\"][^'\"]+['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"].*/\\1/p")
+            if [ -n "$prefix" ]; then
+                echo "$prefix"
+                return 0
+            fi
+            # Form 3: getenv('ENV') — no static fallback available.
+            if echo "$line" | grep -qE "getenv[[:space:]]*\("; then
+                # Try env var first; fall back to 'wp_'.
+                local env_val
+                env_val=$(echo "$line" | sed -nE "s/.*getenv[[:space:]]*\([[:space:]]*['\"]([^'\"]+)['\"].*/\\1/p" | head -1)
+                if [ -n "$env_val" ] && [ -n "${!env_val:-}" ]; then
+                    echo "${!env_val}"
+                    return 0
+                fi
+            fi
         fi
     fi
     # Default WordPress prefix
@@ -773,6 +1766,191 @@ update_admin_user() {
     log_message "Admin user '$ADMIN_USER' (ID=$existing_id) is configured as administrator"
 }
 
+# Function to restore WordPress files into a Docker container using 'docker cp'.
+# Used in container-direct mode (-c). The backup is restored INTO the
+# container (no host bind mount required) using the document root path
+# supplied with -d (default /var/www/html).
+restore_files_to_container() {
+    local container="$1"
+    local docroot="$2"
+    local backup_wp_dir="$3"
+
+    # Validate container is running
+    if ! docker inspect "$container" >/dev/null 2>&1; then
+        log_message "ERROR: Container '$container' does not exist"
+        return 1
+    fi
+    local state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null)
+    if [ "$state" != "true" ]; then
+        log_message "ERROR: Container '$container' is not running"
+        return 1
+    fi
+
+    if [ "$BACKUP_MODE" = "lightweight" ]; then
+        log_message "Restoring WordPress files to container '$container' (lightweight mode)..."
+
+        # For lightweight restore in container-direct mode, we can't easily
+        # check for wp-includes inside the container via a quick stat — use
+        # 'docker exec test -d' instead.
+        if ! docker exec "$container" test -d "$docroot/wp-includes" >/dev/null 2>&1; then
+            log_message "WARNING: Target container docroot does not appear to contain WordPress core (no wp-includes found)."
+            log_message "         Lightweight backup only contains wp-content + wp-config.php + .htaccess."
+            log_message "         You need to install WordPress core in the container first, then run this restore again."
+            return 1
+        fi
+
+        # Push wp-content
+        if [ -d "$backup_wp_dir/wp-content" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_message "[DRY-RUN] Would docker cp wp-content -> $container:$docroot/"
+            else
+                # Backup existing wp-content inside container by renaming it
+                local wp_content_inside_backup=""
+                if docker exec "$container" test -d "$docroot/wp-content" >/dev/null 2>&1; then
+                    local ts=$(date +%Y%m%d_%H%M%S)
+                    log_message "Backing up existing wp-content inside container to wp-content.backup.$ts"
+                    docker exec "$container" sh -c "mv '$docroot/wp-content' '$docroot/wp-content.backup.$ts'" 2>/dev/null || true
+                    wp_content_inside_backup="${docroot}/wp-content.backup.$ts"
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
+                fi
+                # docker cp expects a directory; source ends without / for directories
+                if docker cp "$backup_wp_dir/wp-content" "$container:$docroot/" 2>/dev/null; then
+                    # 'docker cp' always creates files inside the container as
+                    # root:root, regardless of who runs docker on the host.
+                    # If the web server runs as a non-root UID (nobody/www-data),
+                    # uploads/plugin updates will break. chown to the original
+                    # wp-content's owner we just moved out of the way; fall back
+                    # to the docroot owner if no prior wp-content existed.
+                    local target_owner_group=""
+                    if [ -n "$wp_content_inside_backup" ]; then
+                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$wp_content_inside_backup" 2>/dev/null || true)
+                    fi
+                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    if [ -n "$target_owner_group" ]; then
+                        docker exec "$container" chown -R "$target_owner_group" "$docroot/wp-content" 2>/dev/null \
+                            || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container"
+                    fi
+                    log_message "wp-content restored to container"
+                else
+                    log_message "ERROR: Failed to docker cp wp-content to container"
+                    return 1
+                fi
+            fi
+        fi
+
+        # Push wp-config.php
+        if [ -f "$backup_wp_dir/wp-config.php" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_message "[DRY-RUN] Would docker cp wp-config.php -> $container:$docroot/"
+            else
+                local wp_config_inside_backup=""
+                if docker exec "$container" test -f "$docroot/wp-config.php" >/dev/null 2>&1; then
+                    local ts=$(date +%Y%m%d_%H%M%S)
+                    log_message "Backing up existing wp-config.php inside container to wp-config.php.backup.$ts"
+                    docker exec "$container" sh -c "mv '$docroot/wp-config.php' '$docroot/wp-config.php.backup.$ts'" 2>/dev/null || true
+                    wp_config_inside_backup="${docroot}/wp-config.php.backup.$ts"
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_config_inside_backup}")
+                fi
+                if docker cp "$backup_wp_dir/wp-config.php" "$container:$docroot/" 2>/dev/null; then
+                    local target_owner_group=""
+                    if [ -n "$wp_config_inside_backup" ]; then
+                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$wp_config_inside_backup" 2>/dev/null || true)
+                    fi
+                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    if [ -n "$target_owner_group" ]; then
+                        docker exec "$container" chown "$target_owner_group" "$docroot/wp-config.php" 2>/dev/null \
+                            || log_message "WARNING: Could not chown wp-config.php to $target_owner_group inside container"
+                    fi
+                    log_message "wp-config.php restored to container"
+                else
+                    log_message "ERROR: Failed to docker cp wp-config.php to container"
+                    return 1
+                fi
+            fi
+        else
+            log_message "ERROR: wp-config.php not found in backup"
+            return 1
+        fi
+
+        # Push .htaccess
+        if [ -f "$backup_wp_dir/.htaccess" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_message "[DRY-RUN] Would docker cp .htaccess -> $container:$docroot/"
+            else
+                local htaccess_inside_backup=""
+                if docker exec "$container" test -f "$docroot/.htaccess" >/dev/null 2>&1; then
+                    local ts=$(date +%Y%m%d_%H%M%S)
+                    log_message "Backing up existing .htaccess inside container to .htaccess.backup.$ts"
+                    docker exec "$container" sh -c "mv '$docroot/.htaccess' '$docroot/.htaccess.backup.$ts'" 2>/dev/null || true
+                    htaccess_inside_backup="${docroot}/.htaccess.backup.$ts"
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${htaccess_inside_backup}")
+                fi
+                if docker cp "$backup_wp_dir/.htaccess" "$container:$docroot/" 2>/dev/null; then
+                    local target_owner_group=""
+                    if [ -n "$htaccess_inside_backup" ]; then
+                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$htaccess_inside_backup" 2>/dev/null || true)
+                    fi
+                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    if [ -n "$target_owner_group" ]; then
+                        docker exec "$container" chown "$target_owner_group" "$docroot/.htaccess" 2>/dev/null \
+                            || log_message "WARNING: Could not chown .htaccess to $target_owner_group inside container"
+                    fi
+                    log_message ".htaccess restored to container"
+                else
+                    log_message "WARNING: Failed to docker cp .htaccess (non-critical)"
+                fi
+            fi
+        fi
+
+        log_message "Lightweight restore to container completed"
+        return 0
+    else
+        log_message "Restoring WordPress files to container '$container' (full mode)..."
+
+        if [ "$DRY_RUN" = true ]; then
+            log_message "[DRY-RUN] Would docker cp $backup_wp_dir/. -> $container:$docroot/"
+            log_message "[DRY-RUN] (existing files would be backed up inside container first)"
+            return 0
+        fi
+
+        # Backup entire docroot inside container by renaming it
+        local docroot_inside_backup=""
+        if docker exec "$container" test -d "$docroot" >/dev/null 2>&1; then
+            local ts=$(date +%Y%m%d_%H%M%S)
+            log_message "Backing up existing docroot inside container to $docroot.backup.$ts"
+            docker exec "$container" sh -c "mv '$docroot' '$docroot.backup.$ts'" 2>/dev/null || true
+            docroot_inside_backup="${docroot}.backup.$ts"
+            RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot_inside_backup}")
+            # Recreate empty docroot
+            docker exec "$container" mkdir -p "$docroot" 2>/dev/null
+        else
+            docker exec "$container" mkdir -p "$docroot" 2>/dev/null
+        fi
+
+        # Push everything. docker cp requires src/. for directory contents.
+        if docker cp "$backup_wp_dir"/. "$container:$docroot/" 2>/dev/null; then
+            # 'docker cp' always creates files inside the container as
+            # root:root. chown the freshly-pushed tree to the original
+            # docroot owner so the web server (nobody/33/1000) can read
+            # and write it. Uses the safety backup we just moved out of
+            # the way; falls back to nothing if there was no original.
+            local target_owner_group=""
+            if [ -n "$docroot_inside_backup" ]; then
+                target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot_inside_backup" 2>/dev/null || true)
+            fi
+            if [ -n "$target_owner_group" ]; then
+                docker exec "$container" chown -R "$target_owner_group" "$docroot" 2>/dev/null \
+                    || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container"
+            fi
+            log_message "WordPress files restored to container successfully"
+            return 0
+        else
+            log_message "ERROR: Failed to docker cp WordPress files to container"
+            return 1
+        fi
+    fi
+}
+
 # Function to restore WordPress files
 restore_files() {
     local backup_wp_dir="$1"
@@ -807,8 +1985,9 @@ restore_files() {
         # Restore wp-content directory
         if [ -d "$backup_wp_dir/wp-content" ]; then
             # Backup existing wp-content if exists
+            local wp_content_backup=""
             if [ -d "$target_dir/wp-content" ]; then
-                local wp_content_backup="$target_dir/wp-content.backup.$(date +%Y%m%d_%H%M%S)"
+                wp_content_backup="$target_dir/wp-content.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing wp-content to: $wp_content_backup"
                 if mv "$target_dir/wp-content" "$wp_content_backup"; then
                     RESTORE_SAFETY_BACKUPS+=("$wp_content_backup")
@@ -819,6 +1998,15 @@ restore_files() {
             fi
 
             if cp -r "$backup_wp_dir/wp-content" "$target_dir/"; then
+                # Restore ownership/mode of the original wp-content so the
+                # web server (nobody/33/1000) can read/write uploads. Without
+                # this, uploads/plugin updates would silently fail with
+                # 'Permission denied'. Reference the safety backup we just
+                # moved out of the way (root is guaranteed by startup check).
+                if [ -n "$wp_content_backup" ] && [ -d "$wp_content_backup" ]; then
+                    chown -R --reference="$wp_content_backup" "$target_dir/wp-content" 2>/dev/null \
+                        || log_message "WARNING: Could not chown wp-content to match original owner"
+                fi
                 log_message "wp-content restored successfully"
             else
                 log_message "ERROR: Failed to restore wp-content"
@@ -831,8 +2019,9 @@ restore_files() {
         # Restore wp-config.php
         if [ -f "$backup_wp_dir/wp-config.php" ]; then
             # Backup existing wp-config.php if exists
+            local wp_config_backup=""
             if [ -f "$target_dir/wp-config.php" ]; then
-                local wp_config_backup="$target_dir/wp-config.php.backup.$(date +%Y%m%d_%H%M%S)"
+                wp_config_backup="$target_dir/wp-config.php.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing wp-config.php to: $wp_config_backup"
                 if mv "$target_dir/wp-config.php" "$wp_config_backup"; then
                     RESTORE_SAFETY_BACKUPS+=("$wp_config_backup")
@@ -843,6 +2032,12 @@ restore_files() {
             fi
 
             if cp "$backup_wp_dir/wp-config.php" "$target_dir/"; then
+                # Restore original ownership so the web server can read the
+                # file (and the patched DB creds can be loaded by PHP).
+                if [ -n "$wp_config_backup" ] && [ -f "$wp_config_backup" ]; then
+                    chown --reference="$wp_config_backup" "$target_dir/wp-config.php" 2>/dev/null \
+                        || log_message "WARNING: Could not chown wp-config.php to match original owner"
+                fi
                 log_message "wp-config.php restored successfully"
             else
                 log_message "ERROR: Failed to restore wp-config.php"
@@ -855,8 +2050,9 @@ restore_files() {
 
         # Restore .htaccess if exists in backup
         if [ -f "$backup_wp_dir/.htaccess" ]; then
+            local htaccess_backup=""
             if [ -f "$target_dir/.htaccess" ]; then
-                local htaccess_backup="$target_dir/.htaccess.backup.$(date +%Y%m%d_%H%M%S)"
+                htaccess_backup="$target_dir/.htaccess.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing .htaccess to: $htaccess_backup"
                 if mv "$target_dir/.htaccess" "$htaccess_backup"; then
                     RESTORE_SAFETY_BACKUPS+=("$htaccess_backup")
@@ -867,6 +2063,10 @@ restore_files() {
             fi
 
             if cp "$backup_wp_dir/.htaccess" "$target_dir/"; then
+                if [ -n "$htaccess_backup" ] && [ -f "$htaccess_backup" ]; then
+                    chown --reference="$htaccess_backup" "$target_dir/.htaccess" 2>/dev/null \
+                        || log_message "WARNING: Could not chown .htaccess to match original owner"
+                fi
                 log_message ".htaccess restored successfully"
             else
                 log_message "WARNING: Failed to restore .htaccess (non-critical)"
@@ -891,6 +2091,20 @@ restore_files() {
             fi
         else
             log_message "WARNING: Target directory exists. Contents will be replaced."
+            # Capture owner/group/mode of the existing target BEFORE we move it
+            # away. The WordPress container (e.g. litespeedtech/openlitespeed)
+            # runs as 'nobody:nogroup' and the bind-mounted host path must
+            # match that ownership, otherwise PHP/OLS cannot write uploads,
+            # caches, or update plugins/themes. By recording the original
+            # ownership here and reapplying it to the freshly-created target_dir
+            # and its contents below, we keep the container working after
+            # restore — and we also let cleanup_safety_backups() actually
+            # remove the renamed backup (otherwise 'rm -rf' as the restore
+            # user fails with 'Permission denied' on nobody-owned files).
+            local target_owner target_group target_mode
+            target_owner=$(stat -c '%u' "$target_dir")
+            target_group=$(stat -c '%g' "$target_dir")
+            target_mode=$(stat -c '%a' "$target_dir")
             # Backup existing directory — tracked for cleanup on success
             local backup_existing="$target_dir.backup.$(date +%Y%m%d_%H%M%S)"
             log_message "Creating backup of existing directory: $backup_existing"
@@ -899,7 +2113,19 @@ restore_files() {
                 return 1
             fi
             RESTORE_SAFETY_BACKUPS+=("$backup_existing")
+            # Recreate target_dir, then restore its original ownership/mode.
+            # The WordPress container (e.g. litespeedtech/openlitespeed) runs
+            # as 'nobody:nogroup' and the bind-mounted host path must match
+            # that ownership — otherwise PHP/OLS can't write uploads, cache,
+            # or update plugins/themes. 'mkdir' alone would create a dir
+            # owned by the restore user, so we chown/chmod it back to the
+            # original. Root is guaranteed at this point (script aborts at
+            # startup if not).
             mkdir -p "$target_dir"
+            chown --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                || chown "${target_owner}:${target_group}" "$target_dir" 2>/dev/null || true
+            chmod --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                || chmod "$target_mode" "$target_dir" 2>/dev/null || true
         fi
         
         # Copy WordPress files from backup.
@@ -911,10 +2137,22 @@ restore_files() {
         shopt -s dotglob
         if cp -r "$backup_wp_dir"/. "$target_dir"/; then
             shopt -u dotglob
-            log_message "WordPress files restored successfully"
+            # Restore the original target_dir ownership/mode onto every file
+            # we just copied. The 'cp -r' above created files owned by the
+                # restore user, which would break the WordPress container
+                # running as 'nobody' (uploads, cache writes, plugin updates
+                # all fail). Using --reference=backup_existing (which we just
+                # moved out of the way) preserves the exact uid:gid the
+                # container was using. Root is guaranteed at this point.
+                if [ -n "${target_owner:-}" ] && [ -n "${target_group:-}" ]; then
+                    chown -R --reference="$backup_existing" "$target_dir" 2>/dev/null \
+                        || chown -R "${target_owner}:${target_group}" "$target_dir" 2>/dev/null \
+                        || log_message "WARNING: Could not chown restored files to ${target_owner}:${target_group}"
+                fi
+                log_message "WordPress files restored successfully"
 
-            # Verify dotfiles (e.g. .htaccess) actually made it across — a missing
-            # .htaccess will silently break pretty-permalinks on Apache/OLS.
+                # Verify dotfiles (e.g. .htaccess) actually made it across — a missing
+                # .htaccess will silently break pretty-permalinks on Apache/OLS.
             local missing_dotfiles=()
             for df in "$backup_wp_dir"/.[!.]*; do
                 [ -e "$df" ] || continue
@@ -953,8 +2191,9 @@ restore_files() {
 }
 
 # Parse command line arguments
-# Allow long options: --skip-files, --skip-db, --dry-run, --fix-mode
-ARGS=$(getopt -o "b:w:u:U:t:A:P:E:fh" -l "skip-files,skip-db,dry-run,fix-mode" -- "$@" 2>/dev/null)
+# Allow long options: --skip-files, --skip-db, --dry-run, --fix-mode,
+# --reset-db, --yes
+ARGS=$(getopt -o "b:w:c:d:u:U:t:A:P:E:fryh" -l "skip-files,skip-db,dry-run,fix-mode,reset-db,yes" -- "$@" 2>/dev/null)
 if [ $? -ne 0 ]; then
     show_help
     exit 1
@@ -969,6 +2208,15 @@ while [ $# -gt 0 ]; do
             ;;
         -w)
             WORDPRESS_DIR="$2"
+            shift 2
+            ;;
+        -c)
+            WP_CONTAINER="$2"
+            CONTAINER_DIRECT=true
+            shift 2
+            ;;
+        -d)
+            WP_CONTAINER_DOCROOT="$2"
             shift 2
             ;;
         -u)
@@ -1019,6 +2267,14 @@ while [ $# -gt 0 ]; do
             FIX_MODE=true
             shift
             ;;
+        -r|--reset-db)
+            RESET_DB=true
+            shift
+            ;;
+        -y|--yes)
+            ASSUME_YES=true
+            shift
+            ;;
         --)
             shift
             ;;
@@ -1036,11 +2292,29 @@ if [ "$SHOW_HELP" = true ]; then
     exit 0
 fi
 
+# Require root (sudo). Restore needs to chown restored files to match the
+# web-server user (e.g. nobody:65534, www-data:33, 1000:1000 for OLS image)
+# — only root can chown to other UIDs. Fail loudly BEFORE any heavy work
+# (unzip, docker cp, DB import) starts so the user doesn't waste minutes
+# only to get a half-restored site.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: This script must be run as root (use sudo)" >&2
+    echo "       Example: sudo $0 -b BACKUP_FILE -w WORDPRESS_DIR [options]" >&2
+    echo "       Restore needs to chown restored files to match the web server user." >&2
+    exit 1
+fi
+
 # Validate required parameters based on mode
 if [ "$FIX_MODE" = true ]; then
-    # Fix mode: -w required, -b NOT required, at least one post-restore option required
-    if [ -z "$WORDPRESS_DIR" ]; then
-        echo "ERROR: Fix mode (-f) requires -w WORDPRESS_DIR"
+    # Fix mode: -w OR -c required, -b NOT required, at least one post-restore option required
+    if [ -z "$WORDPRESS_DIR" ] && [ -z "$WP_CONTAINER" ]; then
+        echo "ERROR: Fix mode (-f) requires -w WORDPRESS_DIR or -c WP_CONTAINER"
+        echo ""
+        show_help
+        exit 1
+    fi
+    if [ -n "$WORDPRESS_DIR" ] && [ -n "$WP_CONTAINER" ]; then
+        echo "ERROR: -w and -c are mutually exclusive. Use only one."
         echo ""
         show_help
         exit 1
@@ -1059,7 +2333,7 @@ if [ "$FIX_MODE" = true ]; then
         log_message "NOTE: --skip-files / --skip-db ignored in fix mode (-f)"
     fi
 else
-    # Restore mode: -b and -w both required
+    # Restore mode: -b required, AND (-w OR -c) required
     if [ -z "$BACKUP_FILE" ]; then
         echo "ERROR: Missing required parameter -b (backup file). Use -f for fix mode."
         echo ""
@@ -1067,8 +2341,15 @@ else
         exit 1
     fi
 
-    if [ -z "$WORDPRESS_DIR" ]; then
-        echo "ERROR: Missing required parameter -w (WordPress directory)"
+    if [ -z "$WORDPRESS_DIR" ] && [ -z "$WP_CONTAINER" ]; then
+        echo "ERROR: Either -w WORDPRESS_DIR or -c WP_CONTAINER is required"
+        echo ""
+        show_help
+        exit 1
+    fi
+
+    if [ -n "$WORDPRESS_DIR" ] && [ -n "$WP_CONTAINER" ]; then
+        echo "ERROR: -w and -c are mutually exclusive. Use only one."
         echo ""
         show_help
         exit 1
@@ -1099,20 +2380,75 @@ fi
 if [ -n "$BACKUP_FILE" ]; then
     BACKUP_FILE=$(realpath "$BACKUP_FILE")
 fi
-WORDPRESS_DIR=$(realpath "$WORDPRESS_DIR")
+if [ -n "$WORDPRESS_DIR" ]; then
+    WORDPRESS_DIR=$(realpath "$WORDPRESS_DIR")
+fi
 
-# Detect environment (Docker or Native)
-detect_docker_environment
-
-# Detect database configuration based on environment
-if [ "$IS_DOCKER" = true ]; then
-    if ! detect_docker_database_info; then
-        log_message "ERROR: Failed to detect Docker database configuration"
-        exit 1
+# Detect environment (Docker or Native). Skip auto-detect compose-file probing
+# in container-direct mode (-c): the user explicitly told us which container
+# to restore into, and .dbinfo sidecar carries the DB target.
+if [ "$CONTAINER_DIRECT" = true ]; then
+    log_message "Container-direct restore mode (-c): skipping compose-file auto-detection"
+    # Auto-enable reset-db flow in -c mode: it's the safest way to handle
+    # cross-stack restores (different host/container) because we read credentials
+    # from the live wp-config.php instead of relying on a stale .dbinfo sidecar.
+    # User can opt out by passing --no-reset-db if such an option is added later.
+    if [ "$RESET_DB" != true ]; then
+        RESET_DB=true
+        log_message "Auto-enabled reset-db flow for -c mode (use --no-reset-db to opt out, if implemented)"
+    fi
+    # Reuse DB info from .dbinfo sidecar if present (preferred); otherwise
+    # fall back to docker container inspection of the WP container.
+    IS_DOCKER=true
+    if [ -n "$BACKUP_DB_HOST" ] && [ -n "$BACKUP_DB_NAME" ]; then
+        DB_HOST="$BACKUP_DB_HOST"
+        DB_NAME="$BACKUP_DB_NAME"
+        DB_USER="$BACKUP_DB_USER"
+        DB_PASSWORD="$BACKUP_DB_PASSWORD"
+        DB_TYPE="${BACKUP_DB_TYPE:-mysql}"
+        DB_CONTAINER="$BACKUP_DB_CONTAINER"
+        log_message "Using DB config from .dbinfo: $DB_NAME@$DB_HOST (type=$DB_TYPE)"
+    else
+        # Fall back: inspect WP container for env vars (may not be set if backup
+        # was made before .dbinfo existed).
+        if docker inspect "$WP_CONTAINER" >/dev/null 2>&1; then
+            DB_HOST=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_HOST"' 2>/dev/null)
+            DB_NAME=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_NAME"' 2>/dev/null)
+            DB_USER=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_USER"' 2>/dev/null)
+            DB_PASSWORD=$(docker exec "$WP_CONTAINER" sh -c 'echo "$WORDPRESS_DB_PASSWORD"' 2>/dev/null)
+            if [ -n "$DB_HOST" ] && [ -n "$DB_NAME" ]; then
+                log_message "Read DB config from WP container env vars"
+                log_message "Database: $DB_NAME on $DB_HOST"
+            else
+                log_message "ERROR: Cannot determine DB config (no .dbinfo sidecar and no env vars on container)"
+                exit 1
+            fi
+        else
+            log_message "ERROR: Container '$WP_CONTAINER' does not exist"
+            exit 1
+        fi
+    fi
+    # Resolve DB_CONTAINER from DB_HOST if it's a compose service name (foo:3306)
+    if [ -z "$DB_CONTAINER" ] && [ -n "$DB_HOST" ]; then
+        svc="${DB_HOST%%:*}"
+        DB_CONTAINER="${PROJECT_NAME}-${svc}"
+        unset svc
     fi
 else
-    if ! detect_native_database_service; then
-        log_message "WARNING: Database service auto-detection may not be accurate"
+    detect_docker_environment
+
+    # Detect database configuration based on environment.
+    # In Docker mode, this is best-effort at this point: we may not yet
+    # know DB_HOST (it's only extracted from the backup later). If the
+    # compose file is missing or DB_HOST is unknown, we keep going and
+    # retry after extract_db_config() — the helper uses DB_HOST from
+    # wp-config.php / .dbinfo to discover the running container.
+    if [ "$IS_DOCKER" = true ]; then
+        detect_docker_database_info || log_message "INFO: Initial DB container detection deferred until after backup extraction"
+    else
+        if ! detect_native_database_service; then
+            log_message "WARNING: Database service auto-detection may not be accurate"
+        fi
     fi
 fi
 
@@ -1121,9 +2457,13 @@ check_dependencies
 
 log_message "Starting WordPress Restore process"
 log_message "Backup file: $BACKUP_FILE"
-log_message "WordPress directory: $WORDPRESS_DIR"
+if [ "$CONTAINER_DIRECT" = true ]; then
+    log_message "Target WP container: $WP_CONTAINER (docroot: $WP_CONTAINER_DOCROOT)"
+else
+    log_message "WordPress directory: $WORDPRESS_DIR"
+fi
 log_message "Environment: $([ "$IS_DOCKER" = true ] && echo "Docker" || echo "Native")"
-log_message "Database type: $DB_TYPE"
+log_message "Database type: ${DB_TYPE:-unknown}"
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
@@ -1148,9 +2488,33 @@ cleanup_safety_backups() {
     log_message "Removing preserved safety backups (restore completed successfully):"
     local b
     for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
-        if [ -n "$b" ] && [ -e "$b" ]; then
+        if [ -z "$b" ]; then continue; fi
+        # Container-direct safety backups are tracked with a docker:// prefix:
+        #   docker://<container>:<abs_path_in_container>
+        # Host-path backups are passed straight to rm -rf.
+        if [[ "$b" == docker://* ]]; then
+            local rest="${b#docker://}"
+            local container="${rest%%:*}"
+            local cpath="${rest#*:}"
+            if [ -n "$container" ] && [ -n "$cpath" ]; then
+                log_message "  Removing (in container $container): $cpath"
+                docker exec "$container" rm -rf "$cpath" 2>/dev/null \
+                    || log_message "  WARNING: Failed to remove $cpath in $container"
+            fi
+        elif [ -e "$b" ]; then
             log_message "  Removing: $b"
-            rm -rf "$b" 2>/dev/null || log_message "  WARNING: Failed to remove $b"
+            if ! rm -rf "$b" 2>/dev/null; then
+                # The pre-restore backup may be owned by a different user
+                # (e.g. 'nobody' from the WordPress container's bind mount),
+                # so the restore user (e.g. zongbao) can't remove it. Try
+                # chmod'ing the tree first to gain write access to directories,
+                # then retry. Best-effort: if we still can't remove it, log a
+                # warning so the user knows to clean up manually (e.g. via
+                # 'docker run --rm -v ... alpine rm -rf' or sudo).
+                chmod -R u+rwX "$b" 2>/dev/null || true
+                rm -rf "$b" 2>/dev/null \
+                    || log_message "  WARNING: Failed to remove $b (owned by a different user? try: sudo rm -rf \"$b\")"
+            fi
         fi
     done
     RESTORE_SAFETY_BACKUPS=()
@@ -1168,7 +2532,13 @@ die() {
         log_message "Pre-restore backups PRESERVED for manual rollback:"
         local b
         for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
-            if [ -n "$b" ] && [ -e "$b" ]; then
+            if [ -z "$b" ]; then continue; fi
+            if [[ "$b" == docker://* ]]; then
+                local rest="${b#docker://}"
+                local container="${rest%%:*}"
+                local cpath="${rest#*:}"
+                log_message "  - (in container $container) $cpath"
+            elif [ -e "$b" ]; then
                 log_message "  - $b"
             fi
         done
@@ -1228,12 +2598,177 @@ else
         log_message "ERROR: Failed to extract database configuration"
         exit 1
     fi
+
+    # Now that DB_HOST is known (from .dbinfo sidecar or wp-config.php),
+    # re-resolve the DB container if we previously failed or got a stale
+    # name. This is the common case when restoring a backup from one
+    # Docker stack onto a different one (e.g. szreypower-* -> wp-dev-*).
+    if [ "$IS_DOCKER" = true ] && [ "$CONTAINER_DIRECT" != true ]; then
+        if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+            log_message "Re-resolving DB container using DB_HOST='$DB_HOST'..."
+            if ! detect_docker_database_info; then
+                log_message "ERROR: Failed to detect Docker database configuration after extracting backup"
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# READ LIVE WP-CONFIG (always in restore mode, even without -r / -c)
+# Read credentials + table_prefix from the LIVE wp-config.php on the target
+# (host for -w, container for -c) BEFORE we overwrite files. These are
+# the credentials WordPress will actually need to connect after restore,
+# regardless of what the backup says. The destructive part (DROP tables)
+# only runs when RESET_DB is enabled.
+#
+# Soft-fail: if the target has no wp-config.php yet (fresh directory, no
+# pre-existing WP install), we just WARN and continue. The patch block
+# below will then fall back to the backup's .dbinfo values for creds.
+if [ "$FIX_MODE" != true ] && [ "$BACKUP_FILE" ]; then
+    log_message ""
+    log_message "========== READING LIVE WP-CONFIG =========="
+    if ! read_live_wp_config; then
+        log_message "WARN: No live wp-config.php on target — falling back to backup's .dbinfo for creds"
+        log_message "  (This is normal when restoring into a brand-new/empty target directory)"
+        # Fall back: derive LIVE_DB_* from what extract_db_config set, so
+        # the post-restore patch block still has something to work with.
+        LIVE_DB_NAME="${DB_NAME:-}"
+        LIVE_DB_USER="${DB_USER:-}"
+        LIVE_DB_PASSWORD="${DB_PASSWORD:-}"
+        LIVE_DB_HOST="${DB_HOST:-}"
+        # In Docker mode without an obvious DB_HOST, derive it from the
+        # compose service name of DB_CONTAINER (what WordPress actually
+        # uses to reach the DB inside the docker network).
+        if [ -z "$LIVE_DB_HOST" ] || [ "$LIVE_DB_HOST" = "db:3306" ]; then
+            if [ -n "${DB_CONTAINER:-}" ]; then
+                local_lhost=$(docker inspect "$DB_CONTAINER" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null)
+                if [ -z "$local_lhost" ]; then
+                    local_db_name="$DB_CONTAINER"
+                    local_db_base="${local_db_name%-[0-9]*}"
+                    if [ "$local_db_base" != "$local_db_name" ]; then
+                        local_lhost="${local_db_base##*-}"
+                    else
+                        local_lhost="${local_db_name##*-}"
+                    fi
+                fi
+                [ -n "$local_lhost" ] && LIVE_DB_HOST="$local_lhost"
+            fi
+        fi
+    fi
+    log_message "==========================================="
+    log_message ""
+fi
+
+# RESET-DB FLOW (only when explicitly enabled or auto-enabled by -c mode)
+# If RESET_DB=true, we discard all DB_* / DB_CONTAINER values from the backup
+# (which may refer to the source stack) and instead read creds from the LIVE
+# wp-config.php on the target host/container. We then DROP all tables matching
+# the live $table_prefix before importing the backup's SQL.
+# Note: read_live_wp_config() was already called above; here we just do the
+# destructive part (DROP / list / confirm) plus the table_prefix handling.
+if [ "$RESET_DB" = true ]; then
+    log_message ""
+    log_message "========== RESET-DB FLOW (DESTRUCTIVE) =========="
+
+    # 1. Read the backup's table prefix (so we can patch the live wp-config
+    #    to use it post-restore, preserving the live credentials).
+    if ! read_backup_table_prefix "$BACKUP_WP_DIR"; then
+        log_message "ERROR: Failed to read backup \$table_prefix (reset-db flow aborted)"
+        exit 1
+    fi
+
+    # 2. List tables currently using the LIVE prefix (these will be dropped).
+    #    list_tables_with_prefix echoes the count on stdout; capture it.
+    DROP_TABLE_COUNT=$(list_tables_with_prefix "$LIVE_DB_NAME" "$LIVE_DB_USER" "$LIVE_DB_PASSWORD" "$LIVE_DB_HOST" 2>/dev/null) || {
+        log_message "ERROR: Failed to enumerate live tables (reset-db flow aborted)"
+        exit 1
+    }
+    # Normalize — strip whitespace/blank lines
+    DROP_TABLE_COUNT=$(echo "$DROP_TABLE_COUNT" | grep -E '^[0-9]+$' | head -1)
+    [ -z "$DROP_TABLE_COUNT" ] && DROP_TABLE_COUNT=0
+    log_message "Live tables matching prefix '$LIVE_DB_PREFIX': $DROP_TABLE_COUNT"
+
+    # 3. Confirm destructive action unless we're in dry-run or have -y/--yes.
+    confirm_destructive_action "drop $DROP_TABLE_COUNT tables with prefix '$LIVE_DB_PREFIX' in database '$LIVE_DB_NAME' and import the backup"
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would DROP $DROP_TABLE_COUNT tables with prefix '$LIVE_DB_PREFIX'"
+        log_message "[DRY-RUN] Would import $TEMP_DIR/database.sql into $LIVE_DB_NAME @ $LIVE_DB_HOST"
+        log_message "[DRY-RUN] Would override DB_* with live credentials for restore"
+    else
+        # 4. Drop the live tables.
+        if [ "$DROP_TABLE_COUNT" -gt 0 ]; then
+            if ! drop_tables_for_prefix "$LIVE_DB_NAME" "$LIVE_DB_USER" "$LIVE_DB_PASSWORD" "$LIVE_DB_HOST" "$LIVE_DB_PREFIX"; then
+                log_message "ERROR: Failed to drop live tables (reset-db flow aborted — backup NOT yet imported)"
+                exit 1
+            fi
+        else
+            log_message "No live tables with prefix '$LIVE_DB_PREFIX' — skipping DROP step"
+        fi
+    fi
+
+    # 5. Override DB_* and re-resolve DB_CONTAINER were moved out of the
+    #    RESET_DB block: they now happen unconditionally for restore mode
+    #    (so the DB import command always uses live credentials, even when
+    #    --reset-db is not requested). See the "Override DB_* with LIVE
+    #    credentials" block earlier in the script.
+    log_message "=================================="
+    log_message ""
+fi
+
+# Override DB_* with LIVE credentials (read earlier in this run) so the
+# database import command — and any subsequent code that consults DB_* —
+# targets the live stack, NOT the stale .dbinfo values from the backup
+# (which typically point at the source stack that no longer exists).
+# Skip when LIVE_DB_* was set via the soft-fail fallback above (a flag
+# would be cleaner, but checking DB_NAME==LIVE_DB_NAME is enough — after
+# the read_live_wp_config path they always differ from the backup values
+# because LIVE comes from getenv_docker() resolution or the DB container's
+# env, which never match the backup's stale .dbinfo).
+if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ "$LIVE_DB_NAME" != "$DB_NAME" ]; then
+    DB_NAME="$LIVE_DB_NAME"
+    DB_USER="$LIVE_DB_USER"
+    DB_PASSWORD="$LIVE_DB_PASSWORD"
+    DB_HOST="$LIVE_DB_HOST"
+    log_message "DB_* overridden with LIVE credentials for import: $DB_NAME @ $DB_HOST"
+    # Re-resolve DB_CONTAINER for the live DB_HOST (backup's container
+    # name typically refers to the source stack and won't exist here).
+    if [ "$IS_DOCKER" = true ]; then
+        if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+            log_message "Re-resolving DB container for live DB_HOST='$DB_HOST'..."
+            if ! detect_docker_database_info; then
+                # Last-resort: try the running-stack heuristic, then prompt.
+                if ! resolve_db_container_from_running_stack "$DB_HOST" true; then
+                    log_message "ERROR: Could not find a running DB container that matches DB_HOST='$DB_HOST'"
+                    log_message "  (Hint: confirm the target DB container is on the same docker network)"
+                    exit 1
+                fi
+            fi
+            # Some helpers leave DB_CONTAINER blank; use the heuristic explicitly.
+            if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+                resolve_db_container_from_running_stack "$DB_HOST" true || true
+            fi
+        fi
+        log_message "Resolved DB_CONTAINER='$DB_CONTAINER' for live DB_HOST='$DB_HOST'"
+    fi
 fi
 
 # Validate conflicting flags (restore mode only — fix mode flags already warned above)
 if [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" = true ] && [ "$SKIP_DB" = true ]; then
     log_message "ERROR: --skip-files and --skip-db cannot be used together"
     exit 1
+fi
+# Reset-db is incompatible with --skip-db: we DROP live tables, then must
+# IMPORT the backup. Skipping the import leaves an empty database.
+if [ "$RESET_DB" = true ] && [ "$SKIP_DB" = true ]; then
+    log_message "ERROR: --reset-db (or -c auto-enable) cannot be combined with --skip-db"
+    log_message "  Reset-db drops live tables before importing the backup."
+    exit 1
+fi
+# In fix mode, reset-db makes no sense (we never touch the DB).
+if [ "$RESET_DB" = true ] && [ "$FIX_MODE" = true ]; then
+    log_message "INFO: --reset-db/-r is ignored in fix mode (no DB restoration occurs)"
+    RESET_DB=false
 fi
 
 # Print dry-run summary and EXIT before any modifications
@@ -1247,7 +2782,11 @@ if [ "$DRY_RUN" = true ]; then
         log_message "Restore DB:         $([ "$SKIP_DB" = true ] && echo "NO (--skip-db)" || echo "YES")"
         log_message "Restore files:      $([ "$SKIP_FILES" = true ] && echo "NO (--skip-files)" || echo "YES")"
     fi
-    log_message "Target dir:         $WORDPRESS_DIR"
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        log_message "Target container:   $WP_CONTAINER (docroot: $WP_CONTAINER_DOCROOT)"
+    else
+        log_message "Target dir:         $WORDPRESS_DIR"
+    fi
     log_message "Environment:        $([ "$IS_DOCKER" = true ] && echo "Docker ($DB_CONTAINER)" || echo "Native ($DB_TYPE)")"
     log_message "Database:           $DB_NAME @ $DB_HOST"
     [ -n "$NEW_URL" ] && log_message "URL replacement:    ${OLD_URL:-<auto-detect>} -> $NEW_URL"
@@ -1266,7 +2805,7 @@ fi
 # Print dry-run summary if enabled (already handled before this point; kept for safety)
 # Note: DRY-RUN exits early at the top of this block to avoid modifying anything.
 
-# RESTORE-ONLY: database restoration (skip in fix mode)
+# RESTORE-ONLY: database restoration (skip in fix mode / --skip-db).
 SQL_FILE="$TEMP_DIR/database.sql"
 if [ "$FIX_MODE" = true ]; then
     log_message "Skipping database restore (fix mode)"
@@ -1290,9 +2829,70 @@ if [ "$FIX_MODE" = true ]; then
 elif [ "$SKIP_FILES" = true ]; then
     log_message "Skipping file restoration (--skip-files)"
 else
-    if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
-        die "Files restoration failed"
+    # Dispatch: container-direct mode uses docker cp; otherwise restore to host
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        if ! restore_files_to_container "$WP_CONTAINER" "$WP_CONTAINER_DOCROOT" "$BACKUP_WP_DIR"; then
+            die "Files restoration to container failed"
+        fi
+    else
+        if ! restore_files "$BACKUP_WP_DIR" "$WORDPRESS_DIR"; then
+            die "Files restoration failed"
+        fi
     fi
+fi
+
+# RESET-DB POST-RESTORE: patch the live wp-config.php so $table_prefix and
+# $wpdb->prefix match the backup (since the live prefix was DROPPED above and
+# the imported SQL uses the backup's tables). We keep the live DB credentials.
+if [ "$RESET_DB" = true ] && [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" != true ]; then
+    log_message ""
+    log_message "Patching wp-config.php \$table_prefix: '$LIVE_DB_PREFIX' -> '$BACKUP_TABLE_PREFIX'"
+    # Decide target path format based on mode.
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        WP_CONFIG_TARGET="${WP_CONTAINER}:${WP_CONTAINER_DOCROOT}/wp-config.php"
+    else
+        WP_CONFIG_TARGET="${WORDPRESS_DIR%/}/wp-config.php"
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would patch $WP_CONFIG_TARGET (table_prefix '$LIVE_DB_PREFIX' -> '$BACKUP_TABLE_PREFIX')"
+    else
+        if ! patch_wp_config_table_prefix "$WP_CONFIG_TARGET" "$LIVE_DB_PREFIX" "$BACKUP_TABLE_PREFIX"; then
+            log_message "WARNING: Failed to patch \$table_prefix in wp-config.php"
+            log_message "  You may need to manually change \$table_prefix to '$BACKUP_TABLE_PREFIX' to match the imported tables."
+        else
+            log_message "Patched wp-config.php \$table_prefix -> '$BACKUP_TABLE_PREFIX'"
+        fi
+    fi
+    log_message ""
+fi
+
+# POST-RESTORE: patch DB credentials in wp-config.php to match the LIVE
+# credentials (LIVE_DB_*) that WordPress will need to actually connect.
+# The backup's wp-config.php may point at the source stack's container
+# or DB user (e.g. "db:3306", a container that no longer exists) and
+# would 500 right after restore. This runs in EVERY restore mode unless
+# we're in fix-mode (where no restore happens). It's independent of
+# --skip-files / --skip-db because either way the wp-config.php on disk
+# needs to point at the live target's DB after we're done.
+if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ -n "${LIVE_DB_USER:-}" ]; then
+    log_message ""
+    log_message "Patching wp-config.php DB credentials to match restore target ($LIVE_DB_NAME @ $LIVE_DB_HOST)..."
+    # Decide target path format based on mode (same rule as reset-db block above).
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        WP_CONFIG_TARGET_C="${WP_CONTAINER}:${WP_CONTAINER_DOCROOT}/wp-config.php"
+    else
+        WP_CONFIG_TARGET_C="${WORDPRESS_DIR%/}/wp-config.php"
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would patch DB creds in $WP_CONFIG_TARGET_C"
+    else
+        if ! patch_wp_config_db_creds "$WP_CONFIG_TARGET_C" "$LIVE_DB_NAME" "$LIVE_DB_USER" "${LIVE_DB_PASSWORD:-}" "${LIVE_DB_HOST:-localhost}"; then
+            log_message "WARNING: Failed to patch DB credentials in wp-config.php"
+            log_message "  You may need to manually edit DB_NAME/DB_USER/DB_PASSWORD/DB_HOST"
+            log_message "  to match the live database."
+        fi
+    fi
+    log_message ""
 fi
 
 # Post-restore customizations.

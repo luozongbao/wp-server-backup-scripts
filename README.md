@@ -17,9 +17,16 @@ The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, A
 
 - ✅ **Two backup modes**: Full (entire WordPress directory) or Lightweight (`wp-content` + `wp-config.php` + `.htaccess`)
 - ✅ **Auto-detection**: Docker vs native environment, MySQL vs MariaDB
+- ✅ **Smart DB container discovery**: When the container name in `.dbinfo` doesn't match a running container (e.g. restoring across Docker stacks), `wp_restore.sh` re-resolves the DB container from `wp-config.php`'s `DB_HOST` via five layered strategies — so cross-stack restores just work
+- ✅ **Live-config-aware patching (always on)**: Before restoring files, the script reads credentials from the **live** `wp-config.php` on the target (host path or container) — handles `getenv_docker('WORDPRESS_DB_*', 'literal')` by resolving against the running WP container's environment, falls back to the DB container's `MYSQL_*` / `MARIADB_*` env vars if `WORDPRESS_DB_*` is unset, and prompts only as a last resort. After restore, the new `wp-config.php` is patched so `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` reflect the credentials that actually imported the data — no manual editing required, no stale `.dbinfo` leak
+- ✅ **Reset-DB flow** (`-c` default, `-r` opt-in for `-w`): the **destructive** add-on to live-config patching — drops existing tables with the live prefix and imports the backup's SQL using the live credentials, then patches `$table_prefix` to match the backup. Solves cross-stack restores where the old DB credentials in `.dbinfo` are stale. Without `-r` (or with `-w` mode), only the safe patching happens — your live tables stay untouched
+- ✅ **Container-direct mode** (`-c`): back up and restore WordPress running in Docker **without** a host folder mapping — uses `docker cp` and a `.dbinfo` sidecar to carry the resolved DB credentials
 - ✅ **Single archive**: Files + database in one ZIP file
 - ✅ **Smart restore**: Automatically detects full vs lightweight backup; refuses to restore lightweight into an empty directory
 - ✅ **Post-restore customization**: Optional URL replacement, site title change, admin user creation — perfect for migrations to new domains
+- ✅ **Ownership restore (chown)**: Restored files are `chown`'d to match the original target's owner (host mode via `--reference=` to the moved-aside safety backup, Docker mode via `docker exec chown` against the webserver type's expected UID:GID). For `webserver_restore.sh`, ownership is mapped per type: Apache → `root:www-data`, Nginx → `root:root`, OpenLiteSpeed → `nobody:nogroup` (so the webserver can read its config after restore). Prevents "Permission denied" on uploads/plugin updates when the web server runs as a non-root UID (e.g. `nobody`, `www-data`, `33`, `1000`)
+- ✅ **Portable archives**: Backups use `zip -X` to strip the source machine's UID/GID from the archive, so backups can be restored on a fresh host with a different user without inheriting stale ownership
+- ✅ **Root required for restore**: Both `wp_restore.sh` and `webserver_restore.sh` abort with a clear "use sudo" message at startup if not run as root — only root can `chown` to other UIDs, and a non-root restore leaves files un-writable by the web server
 - ✅ **Dry-run mode**: Preview changes before applying them (`--dry-run`)
 - ✅ **Integrity verification**: Backup is verified after creation
 - ✅ **Email notifications**: Optional backup report via `msmtp` (`-e email`)
@@ -59,6 +66,92 @@ WordPress core (`wp-admin/`, `wp-includes/`) is **not** included since it can be
 > ⚠️ **IMPORTANT**: Restoring a lightweight backup requires the target directory to **already contain WordPress core files** (`wp-includes/`, `wp-admin/`) with a compatible version. If not, install WordPress first or use a full backup.
 
 The restore script **refuses to proceed** and exits with an error if the target is empty or missing core files, preventing a broken installation.
+
+## Container-Direct Mode (`-c`)
+
+> 🐳 **Use `-c` when WordPress runs in Docker without a host folder mapping** (e.g. only Docker named volumes are mounted). The script will read/write files and database **through the running container** using `docker cp` and `docker exec` — no host path required.
+
+This mode is designed for the official WordPress Docker image (`wordpress:cli`, `wordpress:apache`) and similar images that use `getenv_docker()` helpers in `wp-config.php` (so DB credentials live in container environment variables, not the file itself).
+
+### What `-c` does
+
+- **Backup (`wp_backup.sh -c`)** — pulls files out of the running WP container with `docker cp`, dumps the database via the **DB container** (auto-detected from the shared Docker network with the WP container, or by inspecting the compose project + service name), and writes a `.dbinfo` sidecar with the resolved DB credentials (so the literal `"wordpress"` placeholder from `getenv_docker()` never leaks into the archive).
+- **Restore (`wp_restore.sh -c`)** — pushes files back into the running WP container with `docker cp`, restores the database through the DB container. Reads `.dbinfo` from the backup to find the right DB container + credentials without re-parsing the (possibly env-driven) `wp-config.php`.
+
+### Quick Start
+
+```bash
+# Backup — read everything from inside the running WP container
+./wp_backup.sh -c my-project-wordpress-app -o /backups
+
+# Backup with a custom document root inside the container (default: /var/www/html)
+./wp_backup.sh -c my-project-wordpress-app -d /var/www/html -o /backups
+
+# Restore — push everything back into the running WP container
+./wp_restore.sh -b /backups/20260918_171946_my-project-wordpress-app.zip \
+  -c my-project-wordpress-app
+
+# Restore + URL replacement (e.g. swap dev domain for production)
+./wp_restore.sh -b backup.zip -c my-project-wordpress-app \
+  -u https://www.production.com \
+  -A admin -P 'N3wP@ss!' -E admin@production.com
+```
+
+### Limitations & Notes
+
+- The WP container **must be running**. `docker inspect` is used to verify state.
+- The DB container is auto-discovered at restore time using a layered fallback chain (see [Smart DB Container Discovery](#smart-db-container-discovery) below). The `DB_CONTAINER` line in `.dbinfo` is treated as a **hint** — if no container by that name is currently running, the script tries to find a matching one through other strategies before failing. This makes it safe to restore a backup created on one Docker stack into a different stack (e.g. `szreypower-website-2026-db` → `wp-dev-environment-wordpress-db`).
+- Lightweight container-direct restores still require `wp-includes/` to exist inside the container — same rule as the host-mode restore.
+- For DB dumps from **MySQL 8.0** containers, the script adds `--no-tablespaces` automatically (non-root users lack the `PROCESS` privilege).
+- Mutually exclusive with `-w` — pick either a host path or a container, not both.
+
+### `.dbinfo` sidecar format
+
+The backup ZIP contains a `.dbinfo` file at the archive root:
+
+```ini
+DB_NAME=<resolved db name>          # not the literal "wordpress" placeholder
+DB_USER=<db user>
+DB_PASSWORD=<db password>
+DB_HOST=<db host as seen by WP>     # e.g. "db:3306"
+DB_TYPE=<mysql|mariadb>
+DB_CONTAINER=<compose db service + project>   # treated as a HINT only at restore time
+BACKUP_MODE=<full|lightweight>
+SOURCE=<container-direct|native>
+WP_CONTAINER=<the container that was backed up>
+WP_CONTAINER_DOCROOT=<docroot inside the container>
+```
+
+This file is read by `wp_restore.sh` to skip `wp-config.php` parsing entirely (which would otherwise fail for env-driven configs).
+
+> ℹ️ `DB_CONTAINER` records the DB container at the moment the backup was taken. On restore, the script **always** verifies that container is still running — if it isn't, the script re-resolves the DB container via the strategies described in [Smart DB Container Discovery](#smart-db-container-discovery) below before failing. This is what enables restoring a backup from one Docker stack into a different stack.
+
+### Smart DB Container Discovery
+
+`wp_restore.sh` finds the right database container using a **5-step fallback chain**. Each step uses information that becomes progressively more general, so the script can find the DB even when the container name in `.dbinfo` is stale, the `docker-compose.yml` lives somewhere unexpected, or you're restoring into a completely different Docker stack.
+
+The chain (run in order, first match wins):
+
+| # | Strategy | Where the data comes from |
+|---|----------|---------------------------|
+| 1 | **Exact name match** | A running container literally named `DB_HOST` from `wp-config.php` / `.dbinfo` (e.g. `db`) |
+| 2-3 | **Compose v2 prefix** | Derive the compose project name from the WP container (passed via `-c` or auto-discovered), then try `<project>-<db-service>-1` and `<project>-<db-service>` |
+| 4 | **Shared Docker network** | Inspect networks of any running WordPress container; pick the first container on those networks whose image matches `*mariadb*` / `*mysql*` |
+| 5 | **Last-resort single-DB host** | Pick the first running container whose image matches `*mariadb*` / `*mysql*` (works when there's only one DB stack on the host) |
+
+When does each strategy kick in?
+
+- **Strategy 1** — `wp-config.php` has `DB_HOST` set to a real container name (rare for official WordPress images, but common for hand-written configs).
+- **Strategies 2-3** — You pass `-c my-project-wordpress-app` and `DB_HOST=db`; compose projects containers as `<project>-<service>-N` by default.
+- **Strategy 4** — The common case for `wp-dev-environment` and similar stacks: WordPress and DB live on a private compose network, but `DB_HOST` in `wp-config.php` is just the service name (`mysql`, `db`, `mariadb`).
+- **Strategy 5** — You're restoring on a host that only runs a single DB container and nothing else.
+
+The discovery runs **twice** during a normal restore:
+
+1. **Early** (before the backup is extracted) — best-effort, silent if `DB_HOST` isn't known yet.
+2. **After backup extraction** — once `.dbinfo` has populated `DB_HOST`, the script re-runs discovery and uses the result for the actual `docker exec mysql ...`.
+
+If discovery fails completely (no running containers at all, or none match), you'll get a clear error pointing at `DB_HOST` and asking you to start your containers or pass `-c`.
 
 ## Quick Start
 
@@ -126,7 +219,9 @@ The restore script **refuses to proceed** and exits with an error if the target 
 ```
 
 **Options**:
-- `-w WORDPRESS_DIR`: Path to WordPress installation (required)
+- `-w WORDPRESS_DIR`: Path to WordPress installation (required, **mutually exclusive with `-c`**)
+- `-c WP_CONTAINER`: **Container-direct mode** — read files from the running WP container instead of a host path (no folder mapping required)
+- `-d DOCROOT`: Document root **inside the container** when using `-c` (default: `/var/www/html`)
 - `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
 - `-l`: Lightweight mode (backup only `wp-content`, `wp-config.php`, `.htaccess`)
 - `-e EMAIL`: Send backup report to this email address (optional, requires `msmtp`)
@@ -134,14 +229,18 @@ The restore script **refuses to proceed** and exits with an error if the target 
 
 **Examples**:
 ```bash
-# Full backup
+# Full backup (host path)
 ./wp_backup.sh -w /var/www/html/wordpress -o /backups
 
-# Lightweight backup
+# Lightweight backup (host path)
 ./wp_backup.sh -w /var/www/html/wordpress -l -o /backups
 
 # Backup with email notification
 ./wp_backup.sh -w /var/www/html/wordpress -o /backups -e admin@example.com
+
+# Container-direct: WP runs in Docker with no host folder mapping
+./wp_backup.sh -c my-project-wordpress-app -o /backups
+./wp_backup.sh -c my-project-wordpress-app -d /var/www/html -l -o /backups
 ```
 
 ### Email Notifications
@@ -197,10 +296,14 @@ Notification is sent automatically on both success and failure — even `exit 1`
 
 | Option | Description |
 |--------|-------------|
-| `-b BACKUP_FILE` | Path to the backup ZIP file (required) |
-| `-w WORDPRESS_DIR` | Path to WordPress installation directory (required) |
+| `-b BACKUP_FILE` | Path to the backup ZIP file (required, **not needed for `-f` fix mode**) |
+| `-w WORDPRESS_DIR` | Path to WordPress installation directory (**mutually exclusive with `-c`**) |
+| `-c WP_CONTAINER` | **Container-direct mode** — push files back into the running WP container (no host folder mapping required). Reads `.dbinfo` from the backup to find the DB container + credentials. Implicitly enables reset-db flow (DROP + IMPORT) for safety on cross-stack restores. |
+| `-d DOCROOT` | Document root **inside the container** when using `-c` (default: `/var/www/html`) |
+| `-r`, `--reset-db` | **Destructive**: drop live tables with the current prefix and import the backup's SQL using live credentials. Default in `-c` mode; opt-in for `-w`. Live-config patching of `wp-config.php` happens **regardless** of this flag |
+| `-y`, `--yes` | Skip the DROP-TABLES confirmation prompt (only relevant with `-r`) |
 | `-u NEW_URL` | Replace all URLs in the database with this URL (e.g. `http://localhost:8088`) |
-| `-U OLD_URL` | Specify the URL to search for (default: auto-detect from `wp-config.php`) |
+| `-U OLD_URL` | Specify the URL to search for (default: auto-detect from `wp-config.php` or `.dbinfo`) |
 | `-t NEW_TITLE` | Set a new site title (updates `blogname` option) |
 | `-A ADMIN_USER` | Create or update an admin user (login) |
 | `-P ADMIN_PASSWORD` | Password for the admin user (requires `-A`) |
@@ -208,6 +311,7 @@ Notification is sent automatically on both success and failure — even `exit 1`
 | `--skip-files` | Skip file restoration (DB only) |
 | `--skip-db` | Skip database restoration (files only) |
 | `--dry-run` | Show what would happen, then exit without modifying anything |
+| `--fix-mode` / `-f` | Apply post-restore customizations to a live site **without** restoring from a backup |
 | `-h` | Show help message |
 
 **Examples**:
@@ -231,6 +335,15 @@ Notification is sent automatically on both success and failure — even `exit 1`
 
 # Restore files only (keep existing DB)
 ./wp_restore.sh -b files_backup.zip -w /var/www/site --skip-db
+
+# Container-direct restore (push into running WP container, no host mapping)
+./wp_restore.sh -b /backups/20260918_171946_my-project-wordpress-app.zip \
+  -c my-project-wordpress-app
+
+# Container-direct + URL replacement
+./wp_restore.sh -b backup.zip -c my-project-wordpress-app \
+  -u https://www.production.com \
+  -A admin -P 'N3wP@ss!' -E admin@production.com
 ```
 
 **Post-Restore Customizations**:
@@ -249,27 +362,124 @@ When `-u`, `-t`, or `-A` are used, additional changes are applied **after** the 
 **Auto-Detection Logic**:
 1. **Backup mode**: Reads `.backup_mode` marker inside the archive (full vs lightweight).
 2. **Environment detection**: Searches for `docker-compose.yml` near the WordPress directory or checks running containers.
-3. **Database detection**: Analyzes `docker-compose.yml` or system processes.
-4. **Lightweight safety check**: Verifies `wp-includes/` exists in the target before restoring a lightweight backup.
-5. **Table prefix**: Reads `$table_prefix` from the restored `wp-config.php`.
-6. **PHP detection** (for admin user): Auto-finds the web server container by skipping `db/database/mariadb/mysql/postgres/redis` services in `docker-compose.yml`, falling back to common names (`wordpress`, `web`, `app`, `nginx`, `apache`, `ols`, `lsws`), or uses host `php` if available.
+3. **Database detection**: Analyzes `docker-compose.yml` or system processes. If `docker-compose.yml` is missing or doesn't mention mysql/mariadb, DB type defaults to `mysql`.
+4. **DB container discovery**: Two-pass resolution. Pass 1 runs early (silent when `DB_HOST` is unknown). After the backup is extracted and `.dbinfo` populates `DB_HOST`, pass 2 re-runs the [5-step fallback chain](#smart-db-container-discovery) to find the right running container. This is what makes cross-stack restores (`szreypower-*-db` → `wp-dev-environment-wordpress-db`) work without any extra flags.
+5. **Lightweight safety check**: Verifies `wp-includes/` exists in the target before restoring a lightweight backup.
+6. **Table prefix**: Reads `$table_prefix` from the restored `wp-config.php`.
+7. **PHP detection** (for admin user): Auto-finds the web server container by skipping `db/database/mariadb/mysql/postgres/redis` services in `docker-compose.yml`, falling back to common names (`wordpress`, `web`, `app`, `nginx`, `apache`, `ols`, `lsws`), or uses host `php` if available.
+
+**Failure-recovery behaviour for the DB container**: If the resolved container is not running when it's time to actually restore (e.g. someone stopped the DB mid-run), the script re-runs the fallback chain once more before giving up. The error message names the candidate it tried, the `DB_HOST` it was looking for, and the suggested fix (`docker compose up -d` or pass `-c`).
 
 **Conflict validation**:
 - `--skip-files` + `--skip-db` together → error (would do nothing useful)
 - `-A ADMIN_USER` without both `-P` and `-E` → error
 
+## Reset-DB Flow (`-c` default, `-r`/`--reset-db` for `-w`)
+
+> **TL;DR**: `wp_restore.sh` always patches `DB_*` and `$table_prefix` in the restored `wp-config.php` to match the credentials that actually imported the data. The `-r` flag controls only the **destructive** part (DROP live tables + IMPORT backup SQL). Without `-r` your live tables stay untouched — but the wp-config.php is still patched so WordPress can connect.
+
+### Two layers, one flag
+
+`wp_restore.sh` does **two distinct things** during a restore:
+
+1. **Live-config-aware patching** — runs **always**, in every restore mode:
+   - Reads credentials from the **live** `wp-config.php` on the target (host path or container)
+   - After restore, rewrites `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` and `$table_prefix` in the new `wp-config.php` so WordPress can connect on first request, no manual editing
+
+2. **Reset-DB destructive flow** (`-r` / `--reset-db`) — runs only when requested (default in `-c`, opt-in for `-w`):
+   - Drops existing tables with the live prefix
+   - Imports the backup's `database.sql` using the live credentials
+   - Then patches `$table_prefix` (the destructive step's side effect)
+
+The `-r` flag does **not** control patching — that happens unconditionally. It controls only the DROP/IMPORT.
+
+### Why it exists
+
+When restoring a backup from one stack into another, the `.dbinfo` sidecar contains:
+- `DB_HOST=db:3306` (compose service name)
+- `DB_CONTAINER=old-stack-db` (the source project's DB container)
+
+On the target stack, the compose project name is different — so `old-stack-db` doesn't exist and the live database is in `new-stack-db`. Without `-r`, the [5-step fallback chain](#smart-db-container-discovery) usually rescues the DB host discovery, but the credentials used to import still come from `.dbinfo` and may mismatch. With `-r`, the script **always** uses the target's real DB.
+
+### How live-config reading works (the always-on layer)
+
+1. **Locate the live `wp-config.php`** — from `-w` host path, or pulled via `docker cp` from `-c` container
+2. **Parse DB credentials** — supports three forms:
+   - **Literal**: `define('DB_NAME', 'wordpress');` — read directly
+   - **`getenv_docker()`**: `define('DB_NAME', getenv_docker('WORDPRESS_DB_NAME', 'wordpress'));` — first tries `WORDPRESS_DB_*` env vars on the WP container, then falls back to the DB container's `MYSQL_*` / `MARIADB_*` env vars (since official WordPress and MariaDB images use different env var names). The literal fallback is used only as a last resort.
+   - **`$_ENV[]` / `getenv()`** — also supported
+3. **Resolve `DB_HOST`** — if the live config only carries a compose service name (e.g. `database`), the script derives the running container via the [5-step fallback chain](#smart-db-container-discovery) and patches it back into the new wp-config
+4. **Soft-fail fallback** — if the target has no live wp-config yet (fresh directory), the script falls back to `.dbinfo` creds so the restore can still proceed
+
+### What `-r` adds on top
+
+5. **List live tables** matching the **live** prefix via `information_schema.TABLES`
+6. **Confirm** the destructive action (auto-confirmed with `-y`/`--yes`, skipped in `--dry-run`)
+7. **`DROP`** the live tables (`SET FOREIGN_KEY_CHECKS=0` for clean ordering)
+8. **Import** the backup's `database.sql` using the **live** credentials
+
+### What `-r` does NOT change
+
+- The post-restore patching of `DB_*` and `$table_prefix` runs **identically** with or without `-r`
+- Without `-r`, the script still reads the live config and patches `DB_*` in the new wp-config.php — your WordPress will simply import against the existing tables using whatever prefix they happen to have (auto-detected from the live config)
+- With `-r`, the script also patches `$table_prefix` to match the backup (since the live tables were just dropped and the imported SQL uses the backup's prefix)
+
+### Mode behavior
+
+| Mode | Default | How to opt-in/out |
+|------|---------|-------------------|
+| `-c` (container-direct) | **ENABLED** (DROP + IMPORT) | No opt-out flag yet (the `-c` default is the safe choice for cross-stack restores) |
+| `-w` (host path) | Disabled (patching only, no DROP/IMPORT) | Pass `-r` or `--reset-db` to enable destructive flow |
+
+> The `-c` default reflects reality: if you're using `-c`, you're almost certainly dealing with a Docker stack where the `.dbinfo` from another stack is stale.
+
+### When NOT to use
+
+- **Same-stack restores** (`-c same-container`): reset-db is auto-enabled but harmless — both `.dbinfo` and live config point to the same DB, so `$table_prefix` is unchanged.
+- **If you specifically want to use the old `.dbinfo` DB** (e.g., restoring to an empty database that already has the old `.dbinfo` imported): don't pass `-r` AND don't use `-c`. Use `-w` with a fresh `WORDPRESS_DIR`.
+
+### Example
+
+```bash
+# Cross-stack restore (e.g. backup from 'szreypower-website-2026' → restore into 'wp-dev-environment')
+./wp_restore.sh -b ~/20260919_004657_szreypower-website-2026-wordpress.zip \
+    -c wp-dev-environment-wordpress-app
+
+# Same in dry-run mode (no actual changes):
+./wp_restore.sh -b ~/20260919_004657_szreypower-website-2026-wordpress.zip \
+    -c wp-dev-environment-wordpress-app --dry-run
+
+# Host-mode opt-in (destructive):
+./wp_restore.sh -b ~/backup.zip -w /var/www/html/wp -r -y
+
+# Host-mode safe (patching only, live tables untouched):
+./wp_restore.sh -b ~/backup.zip -w /var/www/html/wp
+```
+
+### Safety guarantees
+
+- The destructive `DROP` only happens **after** the live credentials are confirmed and **after** the user is prompted (unless `-y`/`--yes` is supplied)
+- `--dry-run` shows exactly which tables would be dropped and which DB they live in — **without** touching anything
+- The new `wp-config.php` is patched via `sed` with literal replacements; the script refuses to patch if the new prefix or any DB credential is empty
+- Without `-r`, no live tables are ever touched — only the new `wp-config.php` is rewritten to match the actual import source
+
 ## Recovery Process
 
-1. **Validation**: Verify backup file integrity and structure
-2. **Extraction**: Extract backup contents to temporary directory
-3. **Mode detection**: Auto-detect full vs lightweight via `.backup_mode` marker
-4. **Configuration**: Read database settings from the backup's `wp-config.php`
-5. **Environment detection**: Determine restoration method (Docker/Native)
-6. **Database restoration**: Restore database using the appropriate method
-7. **File restoration**: Restore based on detected mode
-   - **Full mode**: Replace the entire WordPress directory
-   - **Lightweight mode**: Restore only `wp-content/`, `wp-config.php`, `.htaccess` into the existing WordPress installation
-8. **Verification**: Confirm successful restoration
+1. **Root check** (`wp_restore.sh` only): abort with a "use sudo" hint if not running as UID 0 — only root can `chown` restored files to the web server's UID.
+2. **Validation**: Verify backup file integrity and structure
+3. **Extraction**: Extract backup contents to temporary directory
+4. **Mode detection**: Auto-detect full vs lightweight via `.backup_mode` marker
+5. **Configuration**: Read database settings from the backup's `wp-config.php` and/or `.dbinfo` sidecar
+6. **Environment detection**: Determine restoration method (Docker/Native)
+7. **DB container resolution** (Docker mode only): Two-pass — best-effort before backup extraction, then a final authoritative pass using the [5-step fallback chain](#smart-db-container-discovery) once `DB_HOST` is known
+7a. **Live-config reading + reset-db** (always runs): Reads credentials from the live `wp-config.php` on the target. If `-r` (or `-c`) is set, drops tables with the live prefix and imports the backup's SQL using live credentials. After file restore, the new `wp-config.php` is patched so its `DB_*` matches the import creds and its `$table_prefix` matches what was actually imported
+8. **Database restoration**: Restore database using the appropriate method (`docker exec mysql ...` for Docker, `mysql -h ...` for native)
+9. **File restoration**: Restore based on detected mode, then chown to match the original target's owner
+   - **Full mode**: Replace the entire WordPress directory; `chown -R --reference=<original>` (host) or `docker exec chown -R UID:GID` (Docker) so the web server can read/write
+   - **Lightweight mode**: Restore only `wp-content/`, `wp-config.php`, `.htaccess`; chown each via `--reference=<safety-backup>` (host) or `docker exec chown UID:GID` (Docker)
+10. **wp-config.php patching**: After DB import succeeds, rewrite `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST` in the restored `wp-config.php` to match the import creds (plus `$table_prefix` if reset-db was used). Lets WordPress connect on first request without manual editing.
+11. **Post-restore customizations** (optional): URL replacement, site title change, admin user create/update
+12. **Verification**: Confirm successful restoration
 
 ## Webserver Backup & Restore
 
@@ -321,6 +531,39 @@ The `webserver_backup.sh` and `webserver_restore.sh` scripts back up and restore
 4. **Native mode**: Copies the config directory (or file) directly.
 
 > ⚠️ **Tip**: When using `-f`, the script respects your path on the host. It will **not** fall back to scanning running Docker containers, even if their names look like webserver images. This prevents accidentally backing up an unrelated sidecar when you clearly want a host-side config.
+
+**Docker service resolution priority** (when auto-detecting inside `docker-compose.yml`):
+
+The script follows an **early-return chain** — the first detector that finds a service wins; lower-priority detectors are skipped. Detection runs in order **D → C → B → A** (lowest to highest priority):
+
+| # | Priority | Detector | When it picks |
+|---|----------|----------|---------------|
+| 1 | **D** (lowest) | First service whose image matches the detected webserver type | Legacy fallback — preserved for backward compatibility |
+| 2 | **C** | Image matches the webserver type **AND** the service exposes a webserver port (`80`, `443`, `8080`, `8443`) | Port specs honour `${VAR:-default}` interpolation from `$DOCKER_COMPOSE_DIR/.env` |
+| 3 | **B** | `$WEBSERVER_SERVICE` env var | Explicit override — must exist as a service in the compose file |
+| 4 | **A** (highest) | Compose label `wp-backup: webserver` (or shorthand `wp-backup=webserver`) | Explicit user intent |
+
+Use the higher-priority options when:
+
+- **`A` (label)** — you want a permanent, self-documenting marker that survives renames and survives being copied into a fresh repo:
+
+  ```yaml
+  services:
+    actual-web:
+      image: nginx:alpine
+      labels:
+        - "wp-backup=webserver"
+  ```
+
+- **`B` (`WEBSERVER_SERVICE`)** — you want a quick override without editing the compose file:
+  ```bash
+  export WEBSERVER_SERVICE=actual-web
+  ./webserver_backup.sh -o /backups
+  ```
+
+- **`C` (port heuristic)** — happens automatically; tune by exposing a webserver port (`80`/`443`/`8080`/`8443`) and using `${WEB_PORT:-...}` in your compose so the right port is matched even when the value comes from `.env`.
+
+> 💡 The port heuristic and `.env` interpolation only matter when no higher-priority detector (`A` / `B`) fires. If `wp-backup: webserver` is set, it wins unconditionally.
 
 **Output Format**:
 ```
@@ -385,7 +628,12 @@ The webserver type is embedded in the filename so multi-server backups stay iden
 
 # Hard restart after restore (default: graceful reload)
 ./webserver_restore.sh -b /backups/20250530_143022_nginx_config_backup.zip --restart
+
+# Force a specific webserver service when auto-detect picks the wrong one
+WEBSERVER_SERVICE=actual-web ./webserver_restore.sh -b /backups/..._nginx_config_backup.zip
 ```
+
+The `WEBSERVER_SERVICE` env var (also documented in [`webserver_backup.sh`](#webservver_backupsh)) lets you override which service in `docker-compose.yml` is treated as the webserver during restore. The same priority order applies (label → env var → port heuristic → first-image-match).
 
 **Auto-Detection Logic**:
 1. **Webserver type**: Reads from `.backup_info` in the archive, or infers from filenames inside (`nginx.conf`, `httpd_config.conf`, `apache2.conf`, `httpd.conf`).
@@ -443,7 +691,8 @@ YYYYMMDD_HHMMSS_foldername.zip
 │   ├── wp-content/
 │   ├── wp-config.php
 │   └── ...
-└── database.sql
+├── database.sql
+└── .dbinfo                 ← Resolved DB credentials (container-direct only)
 ```
 
 ### Lightweight Mode
@@ -453,8 +702,11 @@ YYYYMMDD_HHMMSS_foldername_lightweight.zip
 │   ├── wp-content/         ← Themes, plugins, uploads
 │   ├── wp-config.php
 │   └── .htaccess (if exists)
-└── database.sql
+├── database.sql
+└── .dbinfo                 ← Resolved DB credentials (container-direct only)
 ```
+
+> 💡 The `.dbinfo` sidecar is only written when the backup was taken in **container-direct mode** (`-c`). It contains the **resolved** DB credentials (after env / `getenv_docker()` resolution) so a future restore doesn't have to re-parse `wp-config.php` — which would otherwise return the literal placeholder `"wordpress"` instead of the real DB name.
 
 ## Output Format
 
@@ -534,8 +786,19 @@ crontab -e
 - **Lightweight safety check**: The restore script refuses to restore a lightweight WordPress backup into an empty directory to prevent a broken WordPress installation.
 - **Existing files**: On WordPress restore, existing files at the target are moved to a timestamped backup folder (not deleted) so you can recover. On webserver restore, the target config directory is renamed with a `.backup.<timestamp>` suffix before being overwritten.
 - **Webserver backup scope**: The webserver backup captures the **configuration** of Apache/OLS/Nginx only. It does not include site content (that's the WordPress backup's job) or TLS certificates, logs, or binary executables. Adjust paths accordingly if you need extras.
+- **Disambiguating the webserver service in compose**: If your `docker-compose.yml` has multiple services whose image matches the same webserver type, add the label `wp-backup: webserver` to the canonical one (or use the shorthand `wp-backup=webserver` in list form). Alternatively set `WEBSERVER_SERVICE=<service-name>` in the environment before running either backup or restore. See [Docker service resolution priority](#webservver_backupsh) for the full detection chain.
 
 ## Troubleshooting
+
+### "Database container 'X' is not running" (cross-stack restore)
+You're restoring a backup that was taken on a different Docker stack (or the original stack has been torn down). The `DB_CONTAINER` value in `.dbinfo` no longer corresponds to a running container.
+
+The script automatically tries to re-resolve the DB container via the [5-step fallback chain](#smart-db-container-discovery). If the final message says it still couldn't find one:
+
+1. Confirm at least one MySQL/MariaDB container is actually running: `docker ps --format '{{.Names}}\t{{.Image}}' | grep -iE 'mysql|mariadb'`
+2. If you have a WordPress container running on the same Docker network as the DB (the usual case), the network strategy (#4) should find it. Check that the WP container is also running.
+3. If you're restoring onto a fresh host with no WordPress stack yet, start the target stack first (`docker compose up -d` in the right directory), then re-run.
+4. As a last resort, pass the WP container explicitly with `-c` so the script can derive the compose project name.
 
 ### "Docker detected but no container running"
 The script detected a `docker-compose.yml` but the containers are stopped. Start them with `docker-compose up -d` or temporarily move the compose file away to force native mode.
@@ -570,10 +833,47 @@ GRANT ALL PRIVILEGES ON *.* TO 'brkdbuser'@'%';
 FLUSH PRIVILEGES;
 ```
 
+### "Permission denied" on uploads / plugin updates after restore
+The web server runs as a non-root UID (commonly `nobody`, `www-data`, `33`, or `1000` for OpenLiteSpeed) and cannot write files owned by `root`. `wp_restore.sh` runs `chown -R` after every file restore using the original target's UID:GID as the reference, but it requires `sudo` to do so. If you see this error, re-run the restore with `sudo ./wp_restore.sh ...`.
+
+### "wp_restore.sh: this script must be run as root (use sudo)" at startup
+`wp_restore.sh` aborts before any heavy work (extraction, `docker cp`, DB import) when the effective UID is non-zero. This is intentional — `chown` to another user's UID is only permitted for UID 0. Re-run with `sudo`:
+
+```bash
+sudo ./wp_restore.sh -b /backups/site.zip -w /var/www/html/wordpress
+```
+
 ### "Could not determine target webserver container" (webserver_restore.sh)
 The script could not auto-detect a webserver container from the recorded compose file or running containers. Solutions:
 1. Pass `-c CONTAINER` explicitly, or
 2. Pass `-f WEBSERVER_DIR` with the in-container path you want to restore to (and optionally `-c`).
+
+### "Webserver backup targeted the wrong service in docker-compose.yml"
+
+When `docker-compose.yml` has more than one service whose image matches the
+detected webserver type (e.g. a sidecar `nginx` plus the actual `nginx`/
+`openlitespeed`/`apache` service), the auto-detector can land on the first
+listed one. Fix this with the highest-priority detector — the **compose
+label** is the recommended approach:
+
+```yaml
+services:
+  actual-web:
+    image: nginx:alpine
+    labels:
+      - "wp-backup=webserver"   # <- explicit marker
+```
+
+Or, without editing the compose file, force a service via the
+`WEBSERVER_SERVICE` env var:
+
+```bash
+export WEBSERVER_SERVICE=actual-web
+./webserver_backup.sh -o /backups
+```
+
+See [Docker service resolution priority](#webservver_backupsh) for the full
+detection chain.
 
 ### Webserver restore failed but safety backups were preserved
 On failure, the script leaves the pre-existing target config in place under `<target>.backup.<timestamp>`. Inspect those directories to manually recover. They are automatically removed only on success.

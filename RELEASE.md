@@ -13,14 +13,119 @@ add new features; major releases introduce breaking changes.
 ### Added
 - (none yet)
 
-### Changed
-- (none yet)
-
 ### Fixed
 - (none yet)
 
 ### Removed
 - (none yet)
+
+---
+
+## v.1.1.0 — Ownership Restore & Service Detection Hardening
+
+**Tag:** `v.1.1.0`
+**Date:** 2026-09-19
+
+This release hardens three areas of the restore pipeline that previously left
+the webserver in a broken or unreliable state after a restore:
+
+1. **Webserver config ownership on restore** — `webserver_restore.sh` now matches
+   the file ownership to what the running webserver expects (per-type defaults:
+   Apache → `root:www-data`, Nginx → `root:root`, OpenLiteSpeed → `nobody:nogroup`).
+2. **`wp_restore.sh` wp-config.php patching** — handles `getenv_docker()` and
+   `getenv()` forms (not just literal strings), so the official WordPress Docker
+   image restores cleanly without "Error establishing a database connection".
+3. **Webserver service detection** — robust against `docker-compose.yml` files
+   that declare multiple webserver-image services, mixed tab/space indentation,
+   and `${VAR:-default}` port interpolation from compose `.env` files.
+
+### Added
+
+**Live-config-aware wp-config.php patching (always on)** (`wp_restore.sh`).
+
+Before restoring files, the script reads DB credentials from the **live** `wp-config.php` on the target — host path (`-w`) or container (`-c`). Three forms are supported on the right-hand side of `define(...)` calls:
+
+- **Literal**: `define('DB_NAME', 'wordpress');` — read directly
+- **`getenv_docker()`**: `define('DB_NAME', getenv_docker('WORDPRESS_DB_NAME', 'wordpress'));` — first tries `WORDPRESS_DB_*` env vars on the WP container, then falls back to the **DB container's** `MYSQL_*` / `MARIADB_*` env vars (since official WordPress and MariaDB images use different env var names). The literal fallback is used only as a last resort.
+- **`$_ENV[]` / `getenv()`** — also supported
+
+After restore, the new `wp-config.php` is patched via `sed` so its `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` and `$table_prefix` reflect the credentials that actually imported the data. WordPress can connect on first request — no manual editing. Runs in **both** `-c` and `-w` modes, with or without `-r`. If the target has no live wp-config yet (fresh directory), the script soft-fails and falls back to `.dbinfo` creds so the restore can still proceed.
+
+**`-r` / `--reset-db` clarified** (`wp_restore.sh`).
+
+`-r` now controls **only the destructive part** of restore: DROP live tables + IMPORT backup SQL using live credentials. Previously, the docs implied `-r` also gated the wp-config.php patching — that actually happens unconditionally. The `-c` mode still auto-enables `-r` for cross-stack safety; `-w` requires explicit `-r`.
+
+**`-y` / `--yes` flag** (`wp_restore.sh`).
+
+Skips the DROP-TABLES confirmation prompt when `-r` is in effect. Useful for cron/automation runs.
+
+**Robust webserver service detection** (`webserver_backup.sh`, `webserver_restore.sh`).
+
+When a `docker-compose.yml` contains multiple services whose images match a
+known webserver type (e.g. several `nginx:alpine` instances, or a sidecar
+`nginx` plus a real `nginx`/`openlitespeed`/`apache`), the script can no
+longer accidentally pick the wrong one. Service detection now follows an
+**early-return priority chain** — the first hit wins, lower-priority
+detectors are skipped entirely:
+
+| # | Priority | Method | Notes |
+|---|----------|--------|-------|
+| 1 | **D** (lowest) | First service whose image matches the detected webserver type | Legacy fallback (preserved for back-compat) |
+| 2 | **C** | Image matches webserver type **AND** exposes a webserver port (`80`/`443`/`8080`/`8443`) | Resolves `${VAR:-default}` interpolation from compose `.env` |
+| 3 | **B** | `$WEBSERVER_SERVICE` env var | Explicit, bypasses all heuristics |
+| 4 | **A** (highest) | Compose label `wp-backup: webserver` (or shorthand `wp-backup=webserver` in list form) | Explicit user intent |
+
+Key user-facing additions:
+
+- **`WEBSERVER_SERVICE` env var** — forces the webserver service name when
+  auto-detection is wrong. Set with `export WEBSERVER_SERVICE=myservice`
+  before running either `webserver_backup.sh` or `webserver_restore.sh`.
+- **Compose label `wp-backup: webserver`** — opt-in marker on a service to
+  declare it as the webserver. Supports both YAML map form
+  (`labels: wp-backup: webserver`) and list/shorthand form
+  (`labels: - "wp-backup=webserver"`).
+- **`.env` interpolation for ports** — port specs such as
+  `"${WEB_PORT:-80}:80"` now correctly resolve from
+  `$DOCKER_COMPOSE_DIR/.env` during the port-based heuristic. Previously a
+  service exposing only an interpolated webserver port (e.g. `WEB_PORT=443`)
+  could be missed.
+
+### Fixed
+
+**`wp_restore.sh` — wp-config.php patching**
+
+- `patch_wp_config_db_creds()` previously used a sed pattern (`['\"].*$`) that only matched **literal** values in `wp-config.php`. When the live config used `getenv_docker()` (the default for the official WordPress Docker image), the patch silently failed and the restored wp-config.php kept `getenv_docker('WORDPRESS_DB_NAME', 'wordpress')` calls. Result: WordPress on first request would read the placeholder `"wordpress"` instead of the real DB name, fail to connect, and produce a "Error establishing a database connection" message. The pattern is now rewritten to match the entire right-hand expression up to the closing `;`, so function calls, ternaries, and concatenations are handled correctly. Counts patched lines via `grep -c` and warns if zero matches were rewritten.
+- `get_table_prefix()` previously used a sed pattern that captured the whole `getenv_docker('WORDPRESS_TABLE_PREFIX', 'wp_')` expression as the prefix string. Result: URL replacement (`UPDATE $table_prefix = getenv_docker(...)`) raised `ERROR 1064 (42000) You have an error in your SQL syntax` mid-restore. The function now handles three forms — literal, `getenv_docker()` (uses the fallback arg as the prefix), and `getenv()` (resolves against current shell env, falls back to `wp_`) — and prefers `LIVE_DB_PREFIX` when set by `read_live_wp_config()` so the live prefix (the one WordPress actually used to connect) is always the source of truth.
+- `patch_wp_config_table_prefix()` previously only matched the literal form `$table_prefix = 'wp_';`. Now also matches the `getenv_docker()` and `getenv()` forms, so the restored wp-config.php ends up with a clean literal prefix after a reset-db import.
+
+**`wp_restore.sh` — restore flow**
+
+- Previously hard-failed when the target directory had no live wp-config.php (e.g. fresh restore). The "READ LIVE WP-CONFIG" block now soft-fails: if no live config is found, it logs a warning and continues with `.dbinfo` creds + a `DB_HOST` derived from the `DB_CONTAINER` name. Lets you restore into a completely empty directory without manual setup.
+
+**`webserver_restore.sh` — ownership & permissions on restore**
+
+- The restore previously used `cp -r` (or `tar | docker exec tar` for container mode) which created files owned by the restore user (`root` when run with `sudo`). Apache/Nginx/OLS running as non-root users (`www-data`, `nginx`, `nobody:65534`) could then fail to read their own config after restore, breaking the webserver silently. `restore_files()` now:
+  - **Host mode** — moves the existing target dir aside as a safety backup (also recorded in `RESTORE_SAFETY_BACKUPS` for cleanup on success), copies via `cp -a` (preserves modes/timestamps), `chmod -R u+rwX` to ensure root can traverse, then `chown -R` either to the safety backup's owner (`--reference` style via `stat`) or to a webserver-type default if the target didn't exist beforehand.
+  - **Container mode** — adds `--no-same-owner` to the in-container tar so it doesn't try to chown (and fail with EPERM), then `docker exec chown -R` using the same per-type defaults.
+  - Added `map_default_owner_for_type()` helper: `apache` → `root:www-data`, `nginx` → `root:root`, `openlitespeed` → `nobody:nogroup` (matches OLS's drop-priv target), with `root:root` as safe fallback.
+- `restore_files()` previously required running as root to be useful (for `chown`), but the script accepted non-root invocations and only failed later when individual `cp`/`docker exec` commands stumbled on permission errors. The script now fails fast at startup with the same "use sudo" message as `wp_restore.sh` — only root can chown to other UIDs, and a non-root restore leaves config files un-readable by the webserver.
+- The cleanup loop in `cleanup()` only knew how to remove `container:`-prefixed safety backups; the new `host:`-prefixed entries (added by the ownership-preserving restore) would have been logged as un-removable paths on success. The cleanup loop now strips both prefixes, and the failure-log branch shows the user a plain filesystem path (no `host:` / `container:` prefix) so manual recovery instructions are actionable.
+
+**`webserver_backup.sh` — service detection**
+
+- No longer picks the wrong service when `docker-compose.yml` lists another
+  webserver-image service first (e.g. `nginx-helper` before `actual-web`).
+- awk-based label parser crashed on compose files where `services:` was the
+  first indented line. Replaced with a shell/awk two-pass walker that uses
+  `lead()` indentation counts and correctly handles both tab-indented and
+  space-indented files.
+- Port heuristic treated the literal string `"8080:80"` as a port value
+  (with quotes), so webserver ports in docker-compose short syntax were
+  never matched. Now the host port is extracted before regex matching,
+  and `${VAR:-default}` interpolations are resolved against `.env` first.
+
+### Removed
+- (none)
 
 ---
 
