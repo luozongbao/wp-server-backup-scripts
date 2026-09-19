@@ -18,12 +18,12 @@ The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, A
 - ✅ **Two backup modes**: Full (entire WordPress directory) or Lightweight (`wp-content` + `wp-config.php` + `.htaccess`)
 - ✅ **Auto-detection**: Docker vs native environment, MySQL vs MariaDB
 - ✅ **Smart DB container discovery**: When the container name in `.dbinfo` doesn't match a running container (e.g. restoring across Docker stacks), `wp_restore.sh` re-resolves the DB container from `wp-config.php`'s `DB_HOST` via five layered strategies — so cross-stack restores just work
-- ✅ **Reset-DB flow** (`-c` default, `-r` opt-in for `-w`): reads DB credentials and `$table_prefix` from the **live** wp-config.php on the target host/container, drops existing tables with the live prefix, then imports the backup — perfect for cross-stack restores where the old DB credentials in `.dbinfo` are stale
+- ✅ **Live-config-aware patching (always on)**: Before restoring files, the script reads credentials from the **live** `wp-config.php` on the target (host path or container) — handles `getenv_docker('WORDPRESS_DB_*', 'literal')` by resolving against the running WP container's environment, falls back to the DB container's `MYSQL_*` / `MARIADB_*` env vars if `WORDPRESS_DB_*` is unset, and prompts only as a last resort. After restore, the new `wp-config.php` is patched so `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` reflect the credentials that actually imported the data — no manual editing required, no stale `.dbinfo` leak
+- ✅ **Reset-DB flow** (`-c` default, `-r` opt-in for `-w`): the **destructive** add-on to live-config patching — drops existing tables with the live prefix and imports the backup's SQL using the live credentials, then patches `$table_prefix` to match the backup. Solves cross-stack restores where the old DB credentials in `.dbinfo` are stale. Without `-r` (or with `-w` mode), only the safe patching happens — your live tables stay untouched
 - ✅ **Container-direct mode** (`-c`): back up and restore WordPress running in Docker **without** a host folder mapping — uses `docker cp` and a `.dbinfo` sidecar to carry the resolved DB credentials
 - ✅ **Single archive**: Files + database in one ZIP file
 - ✅ **Smart restore**: Automatically detects full vs lightweight backup; refuses to restore lightweight into an empty directory
 - ✅ **Post-restore customization**: Optional URL replacement, site title change, admin user creation — perfect for migrations to new domains
-- ✅ **Post-restore wp-config.php patch**: After a successful DB import, `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` and `$table_prefix` are rewritten in the restored `wp-config.php` to match the credentials that actually imported the data — so WordPress can connect without manual editing
 - ✅ **Ownership restore (chown)**: Restored files are `chown`'d to match the original target's owner (host mode via `--reference=`, Docker mode via `docker exec chown` against the UID:GID detected inside the container). Prevents "Permission denied" on uploads/plugin updates when the web server runs as a non-root UID (e.g. `nobody`, `www-data`, `33`, `1000`)
 - ✅ **Portable archives**: Backups use `zip -X` to strip the source machine's UID/GID from the archive, so backups can be restored on a fresh host with a different user without inheriting stale ownership
 - ✅ **Root required for restore**: `wp_restore.sh` aborts with a clear "use sudo" message at startup if not run as root — only root can `chown` to other UIDs, and a non-root restore leaves files un-writable by the web server
@@ -298,8 +298,10 @@ Notification is sent automatically on both success and failure — even `exit 1`
 |--------|-------------|
 | `-b BACKUP_FILE` | Path to the backup ZIP file (required, **not needed for `-f` fix mode**) |
 | `-w WORDPRESS_DIR` | Path to WordPress installation directory (**mutually exclusive with `-c`**) |
-| `-c WP_CONTAINER` | **Container-direct mode** — push files back into the running WP container (no host folder mapping required). Reads `.dbinfo` from the backup to find the DB container + credentials. |
+| `-c WP_CONTAINER` | **Container-direct mode** — push files back into the running WP container (no host folder mapping required). Reads `.dbinfo` from the backup to find the DB container + credentials. Implicitly enables reset-db flow (DROP + IMPORT) for safety on cross-stack restores. |
 | `-d DOCROOT` | Document root **inside the container** when using `-c` (default: `/var/www/html`) |
+| `-r`, `--reset-db` | **Destructive**: drop live tables with the current prefix and import the backup's SQL using live credentials. Default in `-c` mode; opt-in for `-w`. Live-config patching of `wp-config.php` happens **regardless** of this flag |
+| `-y`, `--yes` | Skip the DROP-TABLES confirmation prompt (only relevant with `-r`) |
 | `-u NEW_URL` | Replace all URLs in the database with this URL (e.g. `http://localhost:8088`) |
 | `-U OLD_URL` | Specify the URL to search for (default: auto-detect from `wp-config.php` or `.dbinfo`) |
 | `-t NEW_TITLE` | Set a new site title (updates `blogname` option) |
@@ -374,7 +376,22 @@ When `-u`, `-t`, or `-A` are used, additional changes are applied **after** the 
 
 ## Reset-DB Flow (`-c` default, `-r`/`--reset-db` for `-w`)
 
-The reset-db flow discards any DB credentials carried in the backup's `.dbinfo` sidecar (which may refer to a *different* Docker stack) and instead reads credentials directly from the **live** `wp-config.php` on the target. It is the safest way to restore across Docker stacks.
+> **TL;DR**: `wp_restore.sh` always patches `DB_*` and `$table_prefix` in the restored `wp-config.php` to match the credentials that actually imported the data. The `-r` flag controls only the **destructive** part (DROP live tables + IMPORT backup SQL). Without `-r` your live tables stay untouched — but the wp-config.php is still patched so WordPress can connect.
+
+### Two layers, one flag
+
+`wp_restore.sh` does **two distinct things** during a restore:
+
+1. **Live-config-aware patching** — runs **always**, in every restore mode:
+   - Reads credentials from the **live** `wp-config.php` on the target (host path or container)
+   - After restore, rewrites `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST` and `$table_prefix` in the new `wp-config.php` so WordPress can connect on first request, no manual editing
+
+2. **Reset-DB destructive flow** (`-r` / `--reset-db`) — runs only when requested (default in `-c`, opt-in for `-w`):
+   - Drops existing tables with the live prefix
+   - Imports the backup's `database.sql` using the live credentials
+   - Then patches `$table_prefix` (the destructive step's side effect)
+
+The `-r` flag does **not** control patching — that happens unconditionally. It controls only the DROP/IMPORT.
 
 ### Why it exists
 
@@ -382,26 +399,37 @@ When restoring a backup from one stack into another, the `.dbinfo` sidecar conta
 - `DB_HOST=db:3306` (compose service name)
 - `DB_CONTAINER=old-stack-db` (the source project's DB container)
 
-On the target stack, the compose project name is different — so `old-stack-db` doesn't exist and the live database is in `new-stack-db`. Without reset-db, the [5-step fallback chain](#smart-db-container-discovery) usually rescues you, but live credentials can still mismatch. With reset-db, the script **always** uses the target's real DB.
+On the target stack, the compose project name is different — so `old-stack-db` doesn't exist and the live database is in `new-stack-db`. Without `-r`, the [5-step fallback chain](#smart-db-container-discovery) usually rescues the DB host discovery, but the credentials used to import still come from `.dbinfo` and may mismatch. With `-r`, the script **always** uses the target's real DB.
 
-### How it works
+### How live-config reading works (the always-on layer)
 
-1. **Read live `wp-config.php`**: from `-w` host path, or pulled via `docker cp` from `-c` container. Handles `getenv_docker('WORDPRESS_DB_*', 'literal')` by resolving via the WP container's environment (Prompts only if env vars are missing on the container AND the literal defaults look placeholdery).
-2. **Read backup's `$table_prefix`**: extracted from the backup's `wp-config.php`.
-3. **List live tables** matching the **live** prefix via `information_schema.TABLES`.
-4. **Confirm** the destructive action (auto-confirmed with `-y`/`--yes`, skipped in `--dry-run`).
-5. **`DROP`** the live tables (`SET FOREIGN_KEY_CHECKS=0` for clean ordering).
-6. **Import** the backup's `database.sql` using the **live** credentials.
-7. **Patch `wp-config.php`** so the restored site can connect:
-   - **`$table_prefix`** (and `$wpdb->prefix`) → rewritten to match the backup's prefix, since the live tables were just dropped and the imported SQL uses the backup's prefix.
-   - **`DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST`** → rewritten to match the credentials that actually imported the DB. Runs in **both** reset-db and non-reset-db modes (the `DB_*` vars at this point are whatever the import actually used). Skipped automatically if the creds already match.
+1. **Locate the live `wp-config.php`** — from `-w` host path, or pulled via `docker cp` from `-c` container
+2. **Parse DB credentials** — supports three forms:
+   - **Literal**: `define('DB_NAME', 'wordpress');` — read directly
+   - **`getenv_docker()`**: `define('DB_NAME', getenv_docker('WORDPRESS_DB_NAME', 'wordpress'));` — first tries `WORDPRESS_DB_*` env vars on the WP container, then falls back to the DB container's `MYSQL_*` / `MARIADB_*` env vars (since official WordPress and MariaDB images use different env var names). The literal fallback is used only as a last resort.
+   - **`$_ENV[]` / `getenv()`** — also supported
+3. **Resolve `DB_HOST`** — if the live config only carries a compose service name (e.g. `database`), the script derives the running container via the [5-step fallback chain](#smart-db-container-discovery) and patches it back into the new wp-config
+4. **Soft-fail fallback** — if the target has no live wp-config yet (fresh directory), the script falls back to `.dbinfo` creds so the restore can still proceed
+
+### What `-r` adds on top
+
+5. **List live tables** matching the **live** prefix via `information_schema.TABLES`
+6. **Confirm** the destructive action (auto-confirmed with `-y`/`--yes`, skipped in `--dry-run`)
+7. **`DROP`** the live tables (`SET FOREIGN_KEY_CHECKS=0` for clean ordering)
+8. **Import** the backup's `database.sql` using the **live** credentials
+
+### What `-r` does NOT change
+
+- The post-restore patching of `DB_*` and `$table_prefix` runs **identically** with or without `-r`
+- Without `-r`, the script still reads the live config and patches `DB_*` in the new wp-config.php — your WordPress will simply import against the existing tables using whatever prefix they happen to have (auto-detected from the live config)
+- With `-r`, the script also patches `$table_prefix` to match the backup (since the live tables were just dropped and the imported SQL uses the backup's prefix)
 
 ### Mode behavior
 
-| Mode | Default? | How to opt-in/out |
-|------|----------|-------------------|
-| `-c` (container-direct) | **ENABLED** by default | Use opt-in/-out via future flag (not yet implemented) |
-| `-w` (host path) | Disabled | Pass `-r` or `--reset-db` |
+| Mode | Default | How to opt-in/out |
+|------|---------|-------------------|
+| `-c` (container-direct) | **ENABLED** (DROP + IMPORT) | No opt-out flag yet (the `-c` default is the safe choice for cross-stack restores) |
+| `-w` (host path) | Disabled (patching only, no DROP/IMPORT) | Pass `-r` or `--reset-db` to enable destructive flow |
 
 > The `-c` default reflects reality: if you're using `-c`, you're almost certainly dealing with a Docker stack where the `.dbinfo` from another stack is stale.
 
@@ -421,16 +449,19 @@ On the target stack, the compose project name is different — so `old-stack-db`
 ./wp_restore.sh -b ~/20260919_004657_szreypower-website-2026-wordpress.zip \
     -c wp-dev-environment-wordpress-app --dry-run
 
-# Host-mode opt-in:
+# Host-mode opt-in (destructive):
 ./wp_restore.sh -b ~/backup.zip -w /var/www/html/wp -r -y
+
+# Host-mode safe (patching only, live tables untouched):
+./wp_restore.sh -b ~/backup.zip -w /var/www/html/wp
 ```
 
 ### Safety guarantees
 
-- The destructive `DROP` only happens **after** the live credentials are confirmed and **after** the user is prompted (unless `-y`/`--yes` is supplied).
-- `--dry-run` shows exactly which tables would be dropped and which DB they live in — **without** touching anything.
-- The live `wp-config.php` is patched via `sed` with a literal prefix replacement; the script refuses to patch if the new prefix is empty.
-- Original credentials in `wp-config.php` (`DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`) are **never** overwritten — only the table prefix.
+- The destructive `DROP` only happens **after** the live credentials are confirmed and **after** the user is prompted (unless `-y`/`--yes` is supplied)
+- `--dry-run` shows exactly which tables would be dropped and which DB they live in — **without** touching anything
+- The new `wp-config.php` is patched via `sed` with literal replacements; the script refuses to patch if the new prefix or any DB credential is empty
+- Without `-r`, no live tables are ever touched — only the new `wp-config.php` is rewritten to match the actual import source
 
 ## Recovery Process
 
@@ -441,7 +472,7 @@ On the target stack, the compose project name is different — so `old-stack-db`
 5. **Configuration**: Read database settings from the backup's `wp-config.php` and/or `.dbinfo` sidecar
 6. **Environment detection**: Determine restoration method (Docker/Native)
 7. **DB container resolution** (Docker mode only): Two-pass — best-effort before backup extraction, then a final authoritative pass using the [5-step fallback chain](#smart-db-container-discovery) once `DB_HOST` is known
-7a. **Reset-DB flow** (if enabled): Read live wp-config.php → drop tables with the live prefix → use live credentials for the rest of the restore → patch live `wp-config.php`'s `$table_prefix` after file restore
+7a. **Live-config reading + reset-db** (always runs): Reads credentials from the live `wp-config.php` on the target. If `-r` (or `-c`) is set, drops tables with the live prefix and imports the backup's SQL using live credentials. After file restore, the new `wp-config.php` is patched so its `DB_*` matches the import creds and its `$table_prefix` matches what was actually imported
 8. **Database restoration**: Restore database using the appropriate method (`docker exec mysql ...` for Docker, `mysql -h ...` for native)
 9. **File restoration**: Restore based on detected mode, then chown to match the original target's owner
    - **Full mode**: Replace the entire WordPress directory; `chown -R --reference=<original>` (host) or `docker exec chown -R UID:GID` (Docker) so the web server can read/write

@@ -1552,15 +1552,61 @@ update_database_urls() {
     log_message "URL replacement completed"
 }
 
-# Function to get WordPress table prefix from wp-config.php in restored files
+# Function to get WordPress table prefix from wp-config.php in restored files.
+# Handles three forms on the right-hand side of the assignment:
+#   1. Literal:        $table_prefix = 'wp_';
+#   2. getenv_docker:  $table_prefix = getenv_docker('WORDPRESS_TABLE_PREFIX', 'wp_');
+#                      (uses the fallback string as the prefix)
+#   3. getenv():       $table_prefix = getenv('WORDPRESS_TABLE_PREFIX') ?: 'wp_';
+#                      (no safe fallback to extract statically; we just return 'wp_')
+#
+# Prefers LIVE_DB_PREFIX when set (read from the pre-restore live config
+# via read_live_wp_config()) because the live config is what WordPress
+# actually used to connect — most reliable source.
 get_table_prefix() {
+    # Live prefix (preferred — most reliable)
+    if [ -n "${LIVE_DB_PREFIX:-}" ]; then
+        echo "$LIVE_DB_PREFIX"
+        return 0
+    fi
     local wp_config="$WORDPRESS_DIR/wp-config.php"
     if [ -f "$wp_config" ]; then
-        local prefix
-        prefix=$(grep -E "\\\$table_prefix" "$wp_config" 2>/dev/null | head -1 | sed -E "s/.*table_prefix[[:space:]]*=[[:space:]]*['\"]([^'\"]+)['\"].*/\1/")
-        if [ -n "$prefix" ]; then
-            echo "$prefix"
-            return 0
+        local line prefix
+        line=$(grep -E "^[[:space:]]*\\\$table_prefix" "$wp_config" 2>/dev/null | head -1)
+        if [ -n "$line" ]; then
+            # Form 1: literal value in quotes.
+            prefix=$(echo "$line" | sed -nE "s/.*=[[:space:]]*['\"]([^'\"]+)['\"].*/\\1/p")
+            if [ -n "$prefix" ]; then
+                # Sanity: if we accidentally captured a function call (sed
+                # fallback gave us the whole expression), try form 2/3.
+                case "$prefix" in
+                    *getenv*|*'\\$'*|*'('*)
+                        # fall through to form 2 handling below
+                        prefix=""
+                        ;;
+                    *)
+                        echo "$prefix"
+                        return 0
+                        ;;
+                esac
+            fi
+            # Form 2: getenv_docker('ENV', 'fallback') — extract the
+            # second quoted arg (the fallback).
+            prefix=$(echo "$line" | sed -nE "s/.*getenv_docker[[:space:]]*\([[:space:]]*['\"][^'\"]+['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"].*/\\1/p")
+            if [ -n "$prefix" ]; then
+                echo "$prefix"
+                return 0
+            fi
+            # Form 3: getenv('ENV') — no static fallback available.
+            if echo "$line" | grep -qE "getenv[[:space:]]*\("; then
+                # Try env var first; fall back to 'wp_'.
+                local env_val
+                env_val=$(echo "$line" | sed -nE "s/.*getenv[[:space:]]*\([[:space:]]*['\"]([^'\"]+)['\"].*/\\1/p" | head -1)
+                if [ -n "$env_val" ] && [ -n "${!env_val:-}" ]; then
+                    echo "${!env_val}"
+                    return 0
+                fi
+            fi
         fi
     fi
     # Default WordPress prefix
