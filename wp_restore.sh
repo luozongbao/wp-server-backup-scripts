@@ -945,6 +945,102 @@ drop_tables_for_prefix() {
     return 0
 }
 
+# Patch DB credentials in a wp-config.php file (in place). Used after a
+# successful DB import so the restored wp-config.php connects with the
+# SAME creds that actually imported the data — otherwise WordPress can
+# 500 right after restore when the backup's creds (pointing at the old
+# stack) don't match the live container's creds.
+#
+# Args:
+#   $1 — path to wp-config.php to patch. Format:
+#          /path/on/host                 (host mode)
+#          CONTAINER:/path/in/container (container-direct mode; we
+#                                        docker cp the file out, patch, and
+#                                        cp it back)
+#   $2 — DB_NAME
+#   $3 — DB_USER
+#   $4 — DB_PASSWORD  (empty string is OK — we'll write an empty literal)
+#   $5 — DB_HOST
+patch_wp_config_db_creds() {
+    local wp_config_path="$1"
+    local new_name="$2"
+    local new_user="$3"
+    local new_pass="$4"
+    local new_host="$5"
+
+    if [ -z "$wp_config_path" ] || [ -z "$new_name" ] || [ -z "$new_user" ] || [ -z "$new_host" ]; then
+        log_message "ERROR: patch_wp_config_db_creds() needs path, name, user, host"
+        return 1
+    fi
+
+    # Skip if nothing actually changed (avoids unnecessary docker cp round-trip)
+    local actual_path="$wp_config_path"
+    local in_container=false
+    local container=""
+    local cdocroot=""
+    if [[ "$wp_config_path" == *":"* ]]; then
+        in_container=true
+        container="${wp_config_path%%:*}"
+        cdocroot="${wp_config_path#*:}"
+        actual_path="/tmp/wp_config_creds_$$.php"
+        if ! docker cp "$container:$cdocroot" "$actual_path" 2>/dev/null; then
+            log_message "ERROR: failed to docker cp $container:$cdocroot for creds patch"
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$actual_path" ]; then
+        log_message "ERROR: wp-config.php not found at $actual_path"
+        [ "$in_container" = true ] && rm -f "$actual_path"
+        return 1
+    fi
+
+    # Read current values; bail early if everything already matches.
+    local cur_name cur_user cur_host
+    cur_name=$(grep "define.*DB_NAME"     "$actual_path" | sed -n "s/.*DB_NAME.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+    cur_user=$(grep "define.*DB_USER"     "$actual_path" | sed -n "s/.*DB_USER.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+    cur_host=$(grep "define.*DB_HOST"     "$actual_path" | sed -n "s/.*DB_HOST.*['\"]\\([^'\"]*\\)['\"].*/\\1/p")
+    if [ "$cur_name" = "$new_name" ] && [ "$cur_user" = "$new_user" ] && [ "$cur_host" = "$new_host" ]; then
+        log_message "DB creds already match (name/user/host) — skipping patch"
+        [ "$in_container" = true ] && rm -f "$actual_path"
+        return 0
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would patch DB creds in $wp_config_path (DB_HOST $cur_host -> $new_host, DB_USER $cur_user -> $new_user, DB_NAME $cur_name -> $new_name)"
+        [ "$in_container" = true ] && rm -f "$actual_path"
+        return 0
+    fi
+
+    # Escape slashes for sed (only used in the host field, e.g. "db" or
+    # "127.0.0.1:3306"). Use ASCII Unit Separator as delimiter to avoid
+    # colliding with the slashes in the patterns themselves.
+    local sep=$'\x1f'
+    local new_name_esc new_user_esc new_pass_esc new_host_esc
+    new_name_esc=$(printf '%s' "$new_name" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
+    new_user_esc=$(printf '%s' "$new_user" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
+    new_pass_esc=$(printf '%s' "$new_pass" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
+    new_host_esc=$(printf '%s' "$new_host" | sed "s${sep}\\\\&${sep}\\\\\\&${sep}g")
+
+    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_NAME['\"],[[:space:]]*['\"]).*${sep}\\1${new_name_esc}'${sep}"     "$actual_path"
+    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_USER['\"],[[:space:]]*['\"]).*${sep}\\1${new_user_esc}'${sep}"     "$actual_path"
+    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_PASSWORD['\"],[[:space:]]*['\"]).*${sep}\\1${new_pass_esc}'${sep}" "$actual_path"
+    sed -i -E "s${sep}(define[[:space:]]*\\([[:space:]]*['\"]DB_HOST['\"],[[:space:]]*['\"]).*${sep}\\1${new_host_esc}'${sep}"     "$actual_path"
+
+    if [ "$in_container" = true ]; then
+        if ! docker cp "$actual_path" "$container:$cdocroot" 2>/dev/null; then
+            log_message "ERROR: failed to docker cp patched wp-config.php back to $container:$cdocroot"
+            rm -f "$actual_path"
+            return 1
+        fi
+        rm -f "$actual_path"
+        log_message "Patched DB creds in $container:$cdocroot (name/user/host)"
+    else
+        log_message "Patched DB creds in $wp_config_path (name/user/host)"
+    fi
+    return 0
+}
+
 # Patch $table_prefix in a wp-config.php file (in place). Used after a
 # reset-db import so the restored wp-config.php's prefix matches the
 # tables we just imported (which were dumped from the backup, with the
@@ -1539,14 +1635,31 @@ restore_files_to_container() {
                 log_message "[DRY-RUN] Would docker cp wp-content -> $container:$docroot/"
             else
                 # Backup existing wp-content inside container by renaming it
+                local wp_content_inside_backup=""
                 if docker exec "$container" test -d "$docroot/wp-content" >/dev/null 2>&1; then
                     local ts=$(date +%Y%m%d_%H%M%S)
                     log_message "Backing up existing wp-content inside container to wp-content.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/wp-content' '$docroot/wp-content.backup.$ts'" 2>/dev/null || true
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}/wp-content.backup.$ts")
+                    wp_content_inside_backup="${docroot}/wp-content.backup.$ts"
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
                 fi
                 # docker cp expects a directory; source ends without / for directories
                 if docker cp "$backup_wp_dir/wp-content" "$container:$docroot/" 2>/dev/null; then
+                    # 'docker cp' always creates files inside the container as
+                    # root:root, regardless of who runs docker on the host.
+                    # If the web server runs as a non-root UID (nobody/www-data),
+                    # uploads/plugin updates will break. chown to the original
+                    # wp-content's owner we just moved out of the way; fall back
+                    # to the docroot owner if no prior wp-content existed.
+                    local target_owner_group=""
+                    if [ -n "$wp_content_inside_backup" ]; then
+                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$wp_content_inside_backup" 2>/dev/null || true)
+                    fi
+                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    if [ -n "$target_owner_group" ]; then
+                        docker exec "$container" chown -R "$target_owner_group" "$docroot/wp-content" 2>/dev/null \
+                            || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container"
+                    fi
                     log_message "wp-content restored to container"
                 else
                     log_message "ERROR: Failed to docker cp wp-content to container"
@@ -1560,13 +1673,24 @@ restore_files_to_container() {
             if [ "$DRY_RUN" = true ]; then
                 log_message "[DRY-RUN] Would docker cp wp-config.php -> $container:$docroot/"
             else
+                local wp_config_inside_backup=""
                 if docker exec "$container" test -f "$docroot/wp-config.php" >/dev/null 2>&1; then
                     local ts=$(date +%Y%m%d_%H%M%S)
                     log_message "Backing up existing wp-config.php inside container to wp-config.php.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/wp-config.php' '$docroot/wp-config.php.backup.$ts'" 2>/dev/null || true
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}/wp-config.php.backup.$ts")
+                    wp_config_inside_backup="${docroot}/wp-config.php.backup.$ts"
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_config_inside_backup}")
                 fi
                 if docker cp "$backup_wp_dir/wp-config.php" "$container:$docroot/" 2>/dev/null; then
+                    local target_owner_group=""
+                    if [ -n "$wp_config_inside_backup" ]; then
+                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$wp_config_inside_backup" 2>/dev/null || true)
+                    fi
+                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    if [ -n "$target_owner_group" ]; then
+                        docker exec "$container" chown "$target_owner_group" "$docroot/wp-config.php" 2>/dev/null \
+                            || log_message "WARNING: Could not chown wp-config.php to $target_owner_group inside container"
+                    fi
                     log_message "wp-config.php restored to container"
                 else
                     log_message "ERROR: Failed to docker cp wp-config.php to container"
@@ -1583,13 +1707,24 @@ restore_files_to_container() {
             if [ "$DRY_RUN" = true ]; then
                 log_message "[DRY-RUN] Would docker cp .htaccess -> $container:$docroot/"
             else
+                local htaccess_inside_backup=""
                 if docker exec "$container" test -f "$docroot/.htaccess" >/dev/null 2>&1; then
                     local ts=$(date +%Y%m%d_%H%M%S)
                     log_message "Backing up existing .htaccess inside container to .htaccess.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/.htaccess' '$docroot/.htaccess.backup.$ts'" 2>/dev/null || true
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}/.htaccess.backup.$ts")
+                    htaccess_inside_backup="${docroot}/.htaccess.backup.$ts"
+                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${htaccess_inside_backup}")
                 fi
                 if docker cp "$backup_wp_dir/.htaccess" "$container:$docroot/" 2>/dev/null; then
+                    local target_owner_group=""
+                    if [ -n "$htaccess_inside_backup" ]; then
+                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$htaccess_inside_backup" 2>/dev/null || true)
+                    fi
+                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    if [ -n "$target_owner_group" ]; then
+                        docker exec "$container" chown "$target_owner_group" "$docroot/.htaccess" 2>/dev/null \
+                            || log_message "WARNING: Could not chown .htaccess to $target_owner_group inside container"
+                    fi
                     log_message ".htaccess restored to container"
                 else
                     log_message "WARNING: Failed to docker cp .htaccess (non-critical)"
@@ -1609,11 +1744,13 @@ restore_files_to_container() {
         fi
 
         # Backup entire docroot inside container by renaming it
+        local docroot_inside_backup=""
         if docker exec "$container" test -d "$docroot" >/dev/null 2>&1; then
             local ts=$(date +%Y%m%d_%H%M%S)
             log_message "Backing up existing docroot inside container to $docroot.backup.$ts"
             docker exec "$container" sh -c "mv '$docroot' '$docroot.backup.$ts'" 2>/dev/null || true
-            RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot}.backup.$ts")
+            docroot_inside_backup="${docroot}.backup.$ts"
+            RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot_inside_backup}")
             # Recreate empty docroot
             docker exec "$container" mkdir -p "$docroot" 2>/dev/null
         else
@@ -1622,6 +1759,19 @@ restore_files_to_container() {
 
         # Push everything. docker cp requires src/. for directory contents.
         if docker cp "$backup_wp_dir"/. "$container:$docroot/" 2>/dev/null; then
+            # 'docker cp' always creates files inside the container as
+            # root:root. chown the freshly-pushed tree to the original
+            # docroot owner so the web server (nobody/33/1000) can read
+            # and write it. Uses the safety backup we just moved out of
+            # the way; falls back to nothing if there was no original.
+            local target_owner_group=""
+            if [ -n "$docroot_inside_backup" ]; then
+                target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot_inside_backup" 2>/dev/null || true)
+            fi
+            if [ -n "$target_owner_group" ]; then
+                docker exec "$container" chown -R "$target_owner_group" "$docroot" 2>/dev/null \
+                    || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container"
+            fi
             log_message "WordPress files restored to container successfully"
             return 0
         else
@@ -1665,8 +1815,9 @@ restore_files() {
         # Restore wp-content directory
         if [ -d "$backup_wp_dir/wp-content" ]; then
             # Backup existing wp-content if exists
+            local wp_content_backup=""
             if [ -d "$target_dir/wp-content" ]; then
-                local wp_content_backup="$target_dir/wp-content.backup.$(date +%Y%m%d_%H%M%S)"
+                wp_content_backup="$target_dir/wp-content.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing wp-content to: $wp_content_backup"
                 if mv "$target_dir/wp-content" "$wp_content_backup"; then
                     RESTORE_SAFETY_BACKUPS+=("$wp_content_backup")
@@ -1677,6 +1828,15 @@ restore_files() {
             fi
 
             if cp -r "$backup_wp_dir/wp-content" "$target_dir/"; then
+                # Restore ownership/mode of the original wp-content so the
+                # web server (nobody/33/1000) can read/write uploads. Without
+                # this, uploads/plugin updates would silently fail with
+                # 'Permission denied'. Reference the safety backup we just
+                # moved out of the way (root is guaranteed by startup check).
+                if [ -n "$wp_content_backup" ] && [ -d "$wp_content_backup" ]; then
+                    chown -R --reference="$wp_content_backup" "$target_dir/wp-content" 2>/dev/null \
+                        || log_message "WARNING: Could not chown wp-content to match original owner"
+                fi
                 log_message "wp-content restored successfully"
             else
                 log_message "ERROR: Failed to restore wp-content"
@@ -1689,8 +1849,9 @@ restore_files() {
         # Restore wp-config.php
         if [ -f "$backup_wp_dir/wp-config.php" ]; then
             # Backup existing wp-config.php if exists
+            local wp_config_backup=""
             if [ -f "$target_dir/wp-config.php" ]; then
-                local wp_config_backup="$target_dir/wp-config.php.backup.$(date +%Y%m%d_%H%M%S)"
+                wp_config_backup="$target_dir/wp-config.php.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing wp-config.php to: $wp_config_backup"
                 if mv "$target_dir/wp-config.php" "$wp_config_backup"; then
                     RESTORE_SAFETY_BACKUPS+=("$wp_config_backup")
@@ -1701,6 +1862,12 @@ restore_files() {
             fi
 
             if cp "$backup_wp_dir/wp-config.php" "$target_dir/"; then
+                # Restore original ownership so the web server can read the
+                # file (and the patched DB creds can be loaded by PHP).
+                if [ -n "$wp_config_backup" ] && [ -f "$wp_config_backup" ]; then
+                    chown --reference="$wp_config_backup" "$target_dir/wp-config.php" 2>/dev/null \
+                        || log_message "WARNING: Could not chown wp-config.php to match original owner"
+                fi
                 log_message "wp-config.php restored successfully"
             else
                 log_message "ERROR: Failed to restore wp-config.php"
@@ -1713,8 +1880,9 @@ restore_files() {
 
         # Restore .htaccess if exists in backup
         if [ -f "$backup_wp_dir/.htaccess" ]; then
+            local htaccess_backup=""
             if [ -f "$target_dir/.htaccess" ]; then
-                local htaccess_backup="$target_dir/.htaccess.backup.$(date +%Y%m%d_%H%M%S)"
+                htaccess_backup="$target_dir/.htaccess.backup.$(date +%Y%m%d_%H%M%S)"
                 log_message "Backing up existing .htaccess to: $htaccess_backup"
                 if mv "$target_dir/.htaccess" "$htaccess_backup"; then
                     RESTORE_SAFETY_BACKUPS+=("$htaccess_backup")
@@ -1725,6 +1893,10 @@ restore_files() {
             fi
 
             if cp "$backup_wp_dir/.htaccess" "$target_dir/"; then
+                if [ -n "$htaccess_backup" ] && [ -f "$htaccess_backup" ]; then
+                    chown --reference="$htaccess_backup" "$target_dir/.htaccess" 2>/dev/null \
+                        || log_message "WARNING: Could not chown .htaccess to match original owner"
+                fi
                 log_message ".htaccess restored successfully"
             else
                 log_message "WARNING: Failed to restore .htaccess (non-critical)"
@@ -2463,6 +2635,33 @@ if [ "$RESET_DB" = true ] && [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" != true 
             log_message "  You may need to manually change \$table_prefix to '$BACKUP_TABLE_PREFIX' to match the imported tables."
         else
             log_message "Patched wp-config.php \$table_prefix -> '$BACKUP_TABLE_PREFIX'"
+        fi
+    fi
+    log_message ""
+fi
+
+# POST-RESTORE: patch DB credentials in wp-config.php to match the creds
+# that ACTUALLY imported the database (DB_NAME/USER/PASSWORD/HOST). The
+# backup's wp-config.php may point at the source stack's container or DB
+# user, which doesn't exist on the target. If we don't patch this, WordPress
+# will 500 right after restore. Runs in both reset-db and non-reset-db
+# modes (the DB_* vars at this point are the creds used for the import).
+if [ "$FIX_MODE" != true ] && [ "$SKIP_FILES" != true ] && [ -n "${DB_NAME:-}" ] && [ -n "${DB_USER:-}" ]; then
+    log_message ""
+    log_message "Patching wp-config.php DB credentials to match restore target ($DB_NAME @ $DB_HOST)..."
+    # Decide target path format based on mode (same rule as reset-db block above).
+    if [ "$CONTAINER_DIRECT" = true ]; then
+        WP_CONFIG_TARGET_C="${WP_CONTAINER}:${WP_CONTAINER_DOCROOT}/wp-config.php"
+    else
+        WP_CONFIG_TARGET_C="${WORDPRESS_DIR%/}/wp-config.php"
+    fi
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY-RUN] Would patch DB creds in $WP_CONFIG_TARGET_C"
+    else
+        if ! patch_wp_config_db_creds "$WP_CONFIG_TARGET_C" "$DB_NAME" "$DB_USER" "${DB_PASSWORD:-}" "${DB_HOST:-localhost}"; then
+            log_message "WARNING: Failed to patch DB credentials in wp-config.php"
+            log_message "  You may need to manually edit DB_NAME/DB_USER/DB_PASSWORD/DB_HOST"
+            log_message "  to match the live database."
         fi
     fi
     log_message ""
