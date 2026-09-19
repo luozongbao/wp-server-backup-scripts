@@ -24,9 +24,9 @@ The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, A
 - ✅ **Single archive**: Files + database in one ZIP file
 - ✅ **Smart restore**: Automatically detects full vs lightweight backup; refuses to restore lightweight into an empty directory
 - ✅ **Post-restore customization**: Optional URL replacement, site title change, admin user creation — perfect for migrations to new domains
-- ✅ **Ownership restore (chown)**: Restored files are `chown`'d to match the original target's owner (host mode via `--reference=`, Docker mode via `docker exec chown` against the UID:GID detected inside the container). Prevents "Permission denied" on uploads/plugin updates when the web server runs as a non-root UID (e.g. `nobody`, `www-data`, `33`, `1000`)
+- ✅ **Ownership restore (chown)**: Restored files are `chown`'d to match the original target's owner (host mode via `--reference=` to the moved-aside safety backup, Docker mode via `docker exec chown` against the webserver type's expected UID:GID). For `webserver_restore.sh`, ownership is mapped per type: Apache → `root:www-data`, Nginx → `root:root`, OpenLiteSpeed → `nobody:nogroup` (so the webserver can read its config after restore). Prevents "Permission denied" on uploads/plugin updates when the web server runs as a non-root UID (e.g. `nobody`, `www-data`, `33`, `1000`)
 - ✅ **Portable archives**: Backups use `zip -X` to strip the source machine's UID/GID from the archive, so backups can be restored on a fresh host with a different user without inheriting stale ownership
-- ✅ **Root required for restore**: `wp_restore.sh` aborts with a clear "use sudo" message at startup if not run as root — only root can `chown` to other UIDs, and a non-root restore leaves files un-writable by the web server
+- ✅ **Root required for restore**: Both `wp_restore.sh` and `webserver_restore.sh` abort with a clear "use sudo" message at startup if not run as root — only root can `chown` to other UIDs, and a non-root restore leaves files un-writable by the web server
 - ✅ **Dry-run mode**: Preview changes before applying them (`--dry-run`)
 - ✅ **Integrity verification**: Backup is verified after creation
 - ✅ **Email notifications**: Optional backup report via `msmtp` (`-e email`)

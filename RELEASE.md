@@ -73,6 +73,15 @@ Key user-facing additions:
 
 - Previously hard-failed when the target directory had no live wp-config.php (e.g. fresh restore). The "READ LIVE WP-CONFIG" block now soft-fails: if no live config is found, it logs a warning and continues with `.dbinfo` creds + a `DB_HOST` derived from the `DB_CONTAINER` name. Lets you restore into a completely empty directory without manual setup.
 
+**`webserver_restore.sh` — ownership & permissions on restore**
+
+- The restore previously used `cp -r` (or `tar | docker exec tar` for container mode) which created files owned by the restore user (`root` when run with `sudo`). Apache/Nginx/OLS running as non-root users (`www-data`, `nginx`, `nobody:65534`) could then fail to read their own config after restore, breaking the webserver silently. `restore_files()` now:
+  - **Host mode** — moves the existing target dir aside as a safety backup (also recorded in `RESTORE_SAFETY_BACKUPS` for cleanup on success), copies via `cp -a` (preserves modes/timestamps), `chmod -R u+rwX` to ensure root can traverse, then `chown -R` either to the safety backup's owner (`--reference` style via `stat`) or to a webserver-type default if the target didn't exist beforehand.
+  - **Container mode** — adds `--no-same-owner` to the in-container tar so it doesn't try to chown (and fail with EPERM), then `docker exec chown -R` using the same per-type defaults.
+  - Added `map_default_owner_for_type()` helper: `apache` → `root:www-data`, `nginx` → `root:root`, `openlitespeed` → `nobody:nogroup` (matches OLS's drop-priv target), with `root:root` as safe fallback.
+- `restore_files()` previously required running as root to be useful (for `chown`), but the script accepted non-root invocations and only failed later when individual `cp`/`docker exec` commands stumbled on permission errors. The script now fails fast at startup with the same "use sudo" message as `wp_restore.sh` — only root can chown to other UIDs, and a non-root restore leaves config files un-readable by the webserver.
+- The cleanup loop in `cleanup()` only knew how to remove `container:`-prefixed safety backups; the new `host:`-prefixed entries (added by the ownership-preserving restore) would have been logged as un-removable paths on success. The cleanup loop now strips both prefixes, and the failure-log branch shows the user a plain filesystem path (no `host:` / `container:` prefix) so manual recovery instructions are actionable.
+
 **`webserver_backup.sh` — service detection**
 
 - No longer picks the wrong service when `docker-compose.yml` lists another

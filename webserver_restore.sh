@@ -443,6 +443,22 @@ _docker_container_webserver_type() {
     return 0
 }
 
+# Map a webserver type to its expected default ownership on disk.
+# Used by restore_files() when there is no prior safety backup to reference
+# (i.e. fresh /etc/<webserver> directory). We pick the user/group that the
+# webserver process is known to run as, so config files are readable after
+# restore. If the host distro differs (e.g. RHEL uses apache:apache, not
+# www-data), the user can still chown manually afterwards — but the
+# defaults cover the common Debian/Ubuntu + official-Docker-image cases.
+map_default_owner_for_type() {
+    case "$1" in
+        apache)         echo "root:www-data" ;;   # Debian/Ubuntu; official httpd image runs as root, sites-enabled readable by root
+        nginx)          echo "root:root" ;;        # Official nginx image runs master as root, workers as nginx — config readable by root is fine
+        openlitespeed)  echo "nobody:nogroup" ;;  # OLS drops privileges to nobody:nogroup; config must be readable by that UID
+        *)              echo "root:root" ;;       # safe fallback
+    esac
+}
+
 # Aggregator: run all preflight checks and decide whether to proceed.
 # Returns:
 #   0   = proceed (all checks ok, or only warnings, or --force is set)
@@ -533,13 +549,70 @@ restore_files() {
     fi
 
     if [ "$kind" = "host" ]; then
-        if [ ! -d "$dest" ]; then
+        # Capture owner/group/mode of the existing target BEFORE we copy over it.
+        # The webserver (apache/nginx/OLS) may run as a non-root user (www-data,
+        # nobody, etc.) and config files must remain readable by that user. By
+        # referencing the original ownership after restore, we keep the webserver
+        # working without manual chown. If the destination doesn't exist yet (e.g.
+        # restoring onto a fresh host), we fall back to map_default_owner_for_type().
+        local target_owner_group="" safety_backup=""
+        if [ -d "$dest" ]; then
+            target_owner_group=$(stat -c '%u:%g' "$dest" 2>/dev/null || true)
+            # Safety backup of the existing config tree — only used as a chown
+            # reference, not a full rollback artifact (the webserver config is
+            # text-only and small, so a deep .backup/ tree would waste space).
+            safety_backup="$dest.backup.$(date +%Y%m%d_%H%M%S)"
+            if ! mv "$dest" "$safety_backup" 2>/dev/null; then
+                log_message "ERROR: Failed to move existing $dest out of the way"
+                return 1
+            fi
+            RESTORE_SAFETY_BACKUPS+=("host:$safety_backup")
+            mkdir -p "$dest"
+        else
             mkdir -p "$dest"
         fi
-        if cp -r "$src_dir"/. "$dest"/; then
+
+        # Use cp -a (archive mode) so file modes and timestamps from the backup
+        # are preserved. Ownership cannot be preserved from the archive because
+        # the backup was made with 'zip -X' which strips UID/GID (portable
+        # archives), so we restore ownership separately below.
+        if cp -a "$src_dir"/. "$dest"/; then
+            # Ensure root can read/write every file we just copied. Without this,
+            # chown from a foreign UID (e.g. nobody:65534) might fail because the
+            # new files were created with the caller's umask which can be 022
+            # (fine) but on some distros defaults to 077, leaving root unable to
+            # traverse into directories that were previously 750 owned by www-data.
+            chmod -R u+rwX "$dest" 2>/dev/null || true
+
+            # Decide the target owner:
+            #   1) Prefer --reference to the safety backup (preserves the exact
+            #      uid:gid the existing webserver was using)
+            #   2) Fall back to a type-aware default (apache→root:www-data,
+            #      nginx→root:root, openlitespeed→nobody:nogroup)
+            local final_owner=""
+            if [ -n "$safety_backup" ] && [ -d "$safety_backup" ]; then
+                final_owner=$(stat -c '%u:%g' "$safety_backup" 2>/dev/null || true)
+            fi
+            if [ -z "$final_owner" ]; then
+                final_owner=$(map_default_owner_for_type "$WEBSERVER_TYPE")
+                log_message "No prior config to reference; using default owner '${final_owner}' for ${WEBSERVER_TYPE}"
+            fi
+
+            if [ -n "$final_owner" ]; then
+                if chown -R "$final_owner" "$dest" 2>/dev/null; then
+                    log_message "Restored ownership to ${final_owner} on $dest"
+                else
+                    log_message "WARNING: Could not chown restored files to ${final_owner} (webserver may fail to read config until manually chown'd)"
+                fi
+            fi
             log_message "Files copied successfully to $dest"
             return 0
         else
+            # Restore the moved-out safety backup so the user doesn't lose their
+            # existing config when we abort
+            if [ -n "$safety_backup" ] && [ -d "$safety_backup" ]; then
+                mv "$safety_backup" "$dest" 2>/dev/null || true
+            fi
             log_message "ERROR: Failed to copy files to $dest"
             return 1
         fi
@@ -552,7 +625,22 @@ restore_files() {
     # Ensure parent dir exists
     docker exec "$container" mkdir -p "$(dirname "$inpath")" >/dev/null 2>&1 || true
 
-    if tar -C "$src_dir" -cf - . | docker exec -i "$container" tar -xf - -C "$inpath" 2>/dev/null; then
+    # --no-same-owner: the tar inside the container runs as root by default
+    # but may not be allowed to chown to arbitrary UIDs (capability dropped).
+    # We chown explicitly below so tar doesn't have to.
+    if tar -C "$src_dir" -cf - . | docker exec -i "$container" tar -xf - --no-same-owner -C "$inpath" 2>/dev/null; then
+        # Pick owner based on webserver type. The container's webserver process
+        # is what needs to read these files; the mapping mirrors the host-side
+        # defaults from map_default_owner_for_type(). For OLS the official image
+        # uses nobody:nogroup (65534:65534); for apache/nginx the master runs
+        # as root and the workers can read root-owned configs.
+        local final_owner=""
+        final_owner=$(map_default_owner_for_type "$WEBSERVER_TYPE")
+        if docker exec "$container" chown -R "$final_owner" "$inpath" 2>/dev/null; then
+            log_message "Restored ownership to ${final_owner} inside container $container:$inpath"
+        else
+            log_message "WARNING: Could not chown restored files to ${final_owner} inside container (webserver may fail to read config until manually chown'd)"
+        fi
         log_message "Files copied successfully into container $container:$inpath"
         return 0
     else
@@ -773,6 +861,18 @@ if [ ! -f "$BACKUP_FILE" ]; then
     exit 1
 fi
 
+# Require root (sudo). Restore needs to chown restored files to match the
+# web server user (e.g. root:www-data for Apache, nobody:nogroup for OLS,
+# nginx:nginx for Nginx) — only root can chown to other UIDs. Fail loudly
+# BEFORE any heavy work (unzip, docker cp) starts so the user doesn't
+# waste minutes only to get a half-restored webserver config.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: This script must be run as root (use sudo)" >&2
+    echo "       Example: sudo $0 -b BACKUP_FILE [options]" >&2
+    echo "       Restore needs to chown restored files to match the web server user." >&2
+    exit 1
+fi
+
 # Initialize log file for email report
 init_log_file
 log_message "Log file initialized: $LOG_FILE"
@@ -810,6 +910,9 @@ cleanup() {
                     local container="${rest%%:*}"
                     local path="${rest#*:}"
                     docker exec "$container" rm -rf "$path" >/dev/null 2>&1 || true
+                elif [[ "$p" == host:* ]]; then
+                    local path="${p#host:}"
+                    rm -rf "$path" >/dev/null 2>&1 || true
                 else
                     rm -rf "$p" >/dev/null 2>&1 || true
                 fi
@@ -819,7 +922,15 @@ cleanup() {
         if [ ${#RESTORE_SAFETY_BACKUPS[@]} -gt 0 ]; then
             log_message "Restore failed; safety backups preserved for manual recovery:"
             for p in "${RESTORE_SAFETY_BACKUPS[@]}"; do
-                log_message "  - $p"
+                # Strip the kind prefix (container: or host:) so the user
+                # sees a plain filesystem path in the recovery message.
+                local display_path="$p"
+                if [[ "$p" == container:* ]]; then
+                    display_path="${p#container:*:}"
+                elif [[ "$p" == host:* ]]; then
+                    display_path="${p#host:}"
+                fi
+                log_message "  - $display_path"
             done
         fi
     fi
