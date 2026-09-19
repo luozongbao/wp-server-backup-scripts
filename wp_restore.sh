@@ -31,14 +31,22 @@ WP_CONTAINER_DOCROOT="/var/www/html"
 # These are auto-removed on SUCCESS, but PRESERVED on ERROR so the user can
 # roll back manually if anything went wrong mid-restore.
 declare -a RESTORE_SAFETY_BACKUPS=()
-# Bind-mount destinations detected on the WP container that fall under the
-# restore docroot (e.g. /var/www/html/wp-content/themes/MyTheme when the
-# user bind-mounts ./mytheme/ into the container). Populated by
-# detect_container_bind_mounts() in -c mode. These paths are USER-MANAGED
-# on the host: the restore script must NOT recursively chown or rm -rf
-# through them, or it will silently wipe or re-own files the user owns
-# outside the container. See issue/issue1.md.
+# Bind-mount DESTINATIONS detected inside the WP container that fall under
+# the restore docroot (e.g. /var/www/html/wp-content/themes/MyTheme when
+# the user bind-mounts ./mytheme/ into the container). Populated by
+# detect_container_bind_mounts() in -c mode from /proc/self/mountinfo
+# inside the container — NOT from `docker inspect`, which returns the
+# DECLARATIVE spec and not the live kernel state. After a `mv` of the
+# parent (e.g. /var/www/html -> /var/www/html.backup.<ts>), the bind
+# mount tracks the new path automatically; `docker inspect` still shows
+# the original path, which is WRONG (see issue/issue1.md update). These
+# paths are USER-MANAGED on the host: the restore script must NOT
+# recursively chown or rm -rf through them.
 declare -a WP_CONTAINER_BIND_MOUNTS=()
+# Parallel array: SOURCE paths of each entry in WP_CONTAINER_BIND_MOUNTS
+# (e.g. /home/zongbao/projects/wp-dev-environment/mytheme). Used purely
+# for diagnostics/logging.
+declare -a WP_CONTAINER_BIND_MOUNT_SOURCES=()
 
 # Post-restore customization options
 NEW_URL=""                  # Replace site URL throughout database (e.g., http://localhost:8088)
@@ -1774,54 +1782,58 @@ update_admin_user() {
     log_message "Admin user '$ADMIN_USER' (ID=$existing_id) is configured as administrator"
 }
 
-# Inspect the WP container's mounts and populate WP_CONTAINER_BIND_MOUNTS
-# with any bind-mount (Type=bind) whose Destination starts with the given
-# docroot. Also logs a clear summary so the user can see which subpaths
-# the script will treat as user-managed. Safe to call multiple times — it
-# dedups by clearing the array first. Sets the global array; returns 0
-# on success, 1 if the container can't be inspected.
+# Inspect the WP container's live mount state and populate
+# WP_CONTAINER_BIND_MOUNTS with the ACTUAL DESTINATIONS of any bind
+# mount that fall under the given docroot. Reads /proc/self/mountinfo
+# INSIDE the container because that reflects the kernel's live view of
+# where the bind mount actually points — after a `mv` of the parent
+# directory (e.g. mv /var/www/html -> /var/www/html.backup.<ts>) the
+# bind mount tracks the new path automatically; `docker inspect` still
+# shows the original declarative path, which would be wrong.
 #
-# Why this matters: when a user bind-mounts e.g. ./mytheme/ into
-# /var/www/html/wp-content/themes/MyTheme, that directory is OWNED BY THE
-# USER on the host. The restore script's recursive 'chown -R wp-content'
-# and the cleanup 'docker exec rm -rf wp-content.backup.<ts>' both walk
-# through bind mounts and therefore operate on the host's user-owned
-# files — silently wiping them (see issue/issue1.md). By collecting the
-# bind-mount destinations here and excluding them from those operations,
-# the restore stays confined to the parts of the docroot that are truly
-# container-managed (i.e. the named volume).
+# The SOURCE path is also recorded in WP_CONTAINER_BIND_MOUNT_SOURCES so
+# we can log it for the user. Bind-mount detection: in /proc/self/mountinfo,
+# a bind mount line has the host path in field 4 (root) — for a regular
+# filesystem mount, field 4 is `/`. So we treat anything where field 4 is
+# a non-root absolute path as a bind mount.
+#
+# Safe to call multiple times — clears both arrays first. Returns 0 on
+# success, 1 if mountinfo can't be read.
 detect_container_bind_mounts() {
     local container="$1"
     local docroot="$2"
     WP_CONTAINER_BIND_MOUNTS=()
-    if ! docker inspect "$container" >/dev/null 2>&1; then
+    WP_CONTAINER_BIND_MOUNT_SOURCES=()
+
+    # /proc/self/mountinfo line format:
+    #   mount-id parent-id major:minor root mount-point options - fs-type source super-options
+    #   541 540 252:0 /home/zongbao/projects/wp-dev-environment/mytheme /var/www/html/wp-content.backup.20260919_152631/themes/MyTheme rw,relatime - ext4 /dev/mapper/ubuntu--vg-ubuntu--lv rw
+    #   $1   $2   $3       $4 (root / bind-source)              $5 (mount point)                       $6              $7  $8       $9 (block dev)
+    local raw
+    raw=$(docker exec "$container" cat /proc/self/mountinfo 2>/dev/null || true)
+    if [ -z "$raw" ]; then
         return 1
     fi
-    # docker inspect .Mounts is JSON; pull Destination + Type per mount with
-    # @json range. We rely on json parsing via shell word-splitting rather
-    # than jq so the script stays dependency-free.
-    local raw
-    raw=$(docker inspect "$container" \
-        --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Destination}}
-{{end}}{{end}}' 2>/dev/null || true)
-    if [ -z "$raw" ]; then
-        return 0
-    fi
-    local m
-    while IFS= read -r m; do
-        # Only care about bind mounts UNDER the docroot (e.g. /var/www/html/wp-content/...).
-        # The docroot itself is typically a named volume, never a bind mount in our
-        # supported compose layouts; ignore exact-match too for safety.
-        if [ -n "$m" ] && [ "$m" != "$docroot" ] \
-            && [[ "$m" == "$docroot"/* ]]; then
-            WP_CONTAINER_BIND_MOUNTS+=("$m")
-        fi
+    local line root_field mp
+    while IFS= read -r line; do
+        set -- $line
+        root_field="$4"
+        mp="$5"
+        # Bind mount: root is a non-root absolute host path
+        if [ -z "$root_field" ] || [ "$root_field" = "/" ]; then continue; fi
+        if [[ "$root_field" != /* ]]; then continue; fi
+        # Only consider bind mounts UNDER the docroot
+        if [ "$mp" = "$docroot" ] || [[ "$mp" != "$docroot"/* ]]; then continue; fi
+        WP_CONTAINER_BIND_MOUNTS+=("$mp")
+        WP_CONTAINER_BIND_MOUNT_SOURCES+=("$root_field")
     done <<< "$raw"
+
     if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
-        log_message "Detected ${#WP_CONTAINER_BIND_MOUNTS[@]} bind mount(s) under $docroot (user-managed; will be excluded from chown/cleanup):"
-        local bm
-        for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
-            log_message "  - $bm"
+        log_message "Detected ${#WP_CONTAINER_BIND_MOUNTS[@]} bind mount(s) under $docroot (live mountinfo; user-managed; will be excluded from chown/cleanup):"
+        local i
+        for i in "${!WP_CONTAINER_BIND_MOUNTS[@]}"; do
+            log_message "  - ${WP_CONTAINER_BIND_MOUNTS[$i]}"
+            log_message "      source: ${WP_CONTAINER_BIND_MOUNT_SOURCES[$i]}"
         done
     fi
     return 0
@@ -1916,9 +1928,16 @@ restore_files_to_container() {
                     log_message "Backing up existing wp-content inside container to wp-content.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/wp-content' '$docroot/wp-content.backup.$ts'" 2>/dev/null || true
                     wp_content_inside_backup="${docroot}/wp-content.backup.$ts"
-                    # Only register for auto-cleanup if it doesn't contain a
-                    # bind mount — otherwise rm -rf would walk through the
-                    # bind mount and wipe user-owned host files (issue/issue1.md).
+                    # The mv above renamed the parent dir. Linux kernel bind
+                    # mounts track the path by name, so the bind-mount
+                    # destinations under /var/www/html/wp-content/themes/MyTheme
+                    # are now at /var/www/html/wp-content.backup.<ts>/themes/MyTheme.
+                    # We MUST re-detect before checking path_is_under_bind_mount,
+                    # otherwise the stale array (with original destinations)
+                    # would tell us the safety backup is safe to rm -rf when
+                    # in fact it now sits on top of user-owned host files
+                    # (issue/issue1.md update).
+                    detect_container_bind_mounts "$container" "$docroot"
                     if ! path_is_under_bind_mount "$wp_content_inside_backup"; then
                         RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
                     else
@@ -2057,6 +2076,12 @@ restore_files_to_container() {
             log_message "Backing up existing docroot inside container to $docroot.backup.$ts"
             docker exec "$container" sh -c "mv '$docroot' '$docroot.backup.$ts'" 2>/dev/null || true
             docroot_inside_backup="${docroot}.backup.$ts"
+            # The mv above renamed the docroot. Linux kernel bind mounts
+            # track the path by name, so bind-mount destinations under
+            # /var/www/html are now at /var/www/html.backup.<ts>/...
+            # Re-detect before deciding whether to register the safety
+            # backup for cleanup (issue/issue1.md update).
+            detect_container_bind_mounts "$container" "$docroot"
             # Full-mode backup is the docroot itself, which may contain bind mounts.
             # Refuse to auto-clean it: rm -rf would walk into the bind mount and
             # wipe user-owned host files (issue/issue1.md). The user can remove it
@@ -2644,6 +2669,15 @@ cleanup_safety_backups() {
         return 0
     fi
     log_message "Removing preserved safety backups (restore completed successfully):"
+    # Re-detect bind mounts on the WP container RIGHT NOW. This is critical:
+    # earlier in the restore, the script may have `mv`-ed the docroot or
+    # wp-content to create a .backup.<ts> sibling, and the bind-mount
+    # destinations will have followed the rename (see issue/issue1.md
+    # update). Reading /proc/self/mountinfo again here means we use the
+    # CURRENT kernel truth, not the stale array from the start of the run.
+    if [ -n "$WP_CONTAINER" ] && [ -n "$WP_CONTAINER_DOCROOT" ]; then
+        detect_container_bind_mounts "$WP_CONTAINER" "$WP_CONTAINER_DOCROOT"
+    fi
     local b
     for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
         if [ -z "$b" ]; then continue; fi
@@ -2658,9 +2692,9 @@ cleanup_safety_backups() {
                 # Defense in depth: never rm -rf a safety backup that is or
                 # contains a bind-mounted subpath. rm -rf would walk into the
                 # bind mount and silently delete user-owned host files
-                # (issue/issue1.md). Normally detect_container_bind_mounts()
-                # already filtered these out at registration time, but we
-                # re-check here so any future caller can't reintroduce the bug.
+                # (issue/issue1.md). The detect_container_bind_mounts() call
+                # above has refreshed the array with the LIVE destinations,
+                # so this check uses current kernel truth.
                 if [ "$container" = "$WP_CONTAINER" ] && path_is_under_bind_mount "$cpath"; then
                     log_message "  Skipping (in container $container): $cpath"
                     log_message "    -> contains bind-mounted subpath(s); user-managed on the host. Remove manually if no longer required."
