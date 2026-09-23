@@ -31,6 +31,22 @@ WP_CONTAINER_DOCROOT="/var/www/html"
 # These are auto-removed on SUCCESS, but PRESERVED on ERROR so the user can
 # roll back manually if anything went wrong mid-restore.
 declare -a RESTORE_SAFETY_BACKUPS=()
+# Bind-mount DESTINATIONS detected inside the WP container that fall under
+# the restore docroot (e.g. /var/www/html/wp-content/themes/MyTheme when
+# the user bind-mounts ./mytheme/ into the container). Populated by
+# detect_container_bind_mounts() in -c mode from /proc/self/mountinfo
+# inside the container — NOT from `docker inspect`, which returns the
+# DECLARATIVE spec and not the live kernel state. After a `mv` of the
+# parent (e.g. /var/www/html -> /var/www/html.backup.<ts>), the bind
+# mount tracks the new path automatically; `docker inspect` still shows
+# the original path, which is WRONG (see issue/issue1.md update). These
+# paths are USER-MANAGED on the host: the restore script must NOT
+# recursively chown or rm -rf through them.
+declare -a WP_CONTAINER_BIND_MOUNTS=()
+# Parallel array: SOURCE paths of each entry in WP_CONTAINER_BIND_MOUNTS
+# (e.g. /home/zongbao/projects/wp-dev-environment/mytheme). Used purely
+# for diagnostics/logging.
+declare -a WP_CONTAINER_BIND_MOUNT_SOURCES=()
 
 # Post-restore customization options
 NEW_URL=""                  # Replace site URL throughout database (e.g., http://localhost:8088)
@@ -189,6 +205,80 @@ log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# Returns the mysql/mariadb client binary name to use based on $DB_TYPE.
+# Centralizes the mariadb-vs-mysql branching that would otherwise be
+# repeated at every call site that shells out to the DB client.
+db_client_binary() {
+    if [ "$DB_TYPE" = "mariadb" ]; then
+        echo mariadb
+    else
+        echo mysql
+    fi
+}
+
+# Builds the '-pPASSWORD' argument for mysql/mariadb, or nothing if the
+# password is empty. Intended to be used unquoted at call sites (matching
+# prior inline usage), so an empty result contributes no argument.
+db_password_arg() {
+    local pass="$1"
+    [ -n "$pass" ] && printf -- "-p%s" "$pass"
+}
+
+# Returns success if a container with the given name is currently running.
+container_is_running() {
+    local name="$1"
+    [ -n "$name" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+}
+
+# Host-mode helper: atomically replace a single file at $target_path
+# by (1) renaming any existing file out of the way into
+# "$target_path.backup.<TS>", (2) copying $src_path to $target_path,
+# (3) registering the backup for cleanup, and (4) chowning the new file
+# to match the backup's owner so the web server (nobody/www-data) can
+# read it. Used by restore_files() for wp-config.php and .htaccess.
+#
+# Args:
+#   $1 — target path being replaced (e.g. /var/www/html/wp-config.php)
+#   $2 — source path being installed (e.g. <backup>/wp-config.php)
+#   $3 — log label for messages (e.g. "wp-config.php")
+#   $4 — "true" if restore failure should only WARN, not abort (default: false)
+#
+# Returns 0 on success or non-critical warn, non-zero on hard failure.
+_host_replace_file_with_backup() {
+    local target_path="$1"
+    local src_path="$2"
+    local label="$3"
+    local non_critical="${4:-false}"
+
+    local file_backup=""
+    if [ -f "$target_path" ]; then
+        file_backup="${target_path}.backup.$(date +%Y%m%d_%H%M%S)"
+        log_message "Backing up existing $label to: $file_backup"
+        if ! mv "$target_path" "$file_backup"; then
+            log_message "ERROR: Failed to backup existing $label"
+            return 1
+        fi
+        RESTORE_SAFETY_BACKUPS+=("$file_backup")
+    fi
+
+    if cp "$src_path" "${target_path%/*}/" 2>/dev/null; then
+        if [ -n "$file_backup" ] && [ -f "$file_backup" ]; then
+            chown --reference="$file_backup" "$target_path" 2>/dev/null \
+                || log_message "WARNING: Could not chown $label to match original owner"
+        fi
+        log_message "$label restored successfully"
+        return 0
+    else
+        if [ "$non_critical" = true ]; then
+            log_message "WARNING: Failed to restore $label (non-critical)"
+            return 0
+        else
+            log_message "ERROR: Failed to restore $label"
+            return 1
+        fi
+    fi
+}
+
 # Function to check if required tools are installed
 check_dependencies() {
     local missing_tools=()
@@ -207,14 +297,10 @@ check_dependencies() {
         fi
     else
         # Check for native database restore tools
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            if ! command -v mariadb &> /dev/null; then
-                missing_tools+=("mariadb")
-            fi
-        else
-            if ! command -v mysql &> /dev/null; then
-                missing_tools+=("mysql")
-            fi
+        local db_bin
+        db_bin=$(db_client_binary)
+        if ! command -v "$db_bin" &> /dev/null; then
+            missing_tools+=("$db_bin")
         fi
     fi
     
@@ -439,7 +525,7 @@ detect_docker_database_info() {
     # $DB_HOST (set by extract_db_config from wp-config.php / .dbinfo) so we
     # can find the right container even when the compose file is absent or
     # uses compose's default naming scheme.
-    if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+    if [ -z "$DB_CONTAINER" ] || ! container_is_running "$DB_CONTAINER"; then
         if [ -z "${DB_HOST:-}" ] && [ -z "$DB_CONTAINER" ]; then
             # Very early in the run, before the backup is extracted.
             # The main flow will retry us once DB_HOST is populated from
@@ -755,7 +841,7 @@ read_live_wp_config() {
         local env_source=""
         if [ -n "$target_container" ]; then
             env_source="$target_container"
-        elif [ -n "${DB_CONTAINER:-}" ] && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+        elif [ -n "${DB_CONTAINER:-}" ] && container_is_running "$DB_CONTAINER"; then
             env_source="$DB_CONTAINER"
             log_message "  Reading env from DB container '$env_source' (WP container has no env helpers in -w mode)"
         else
@@ -920,18 +1006,12 @@ list_tables_with_prefix() {
     local query="SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='${LIVE_DB_NAME}' AND TABLE_NAME LIKE '${LIVE_DB_PREFIX}%';"
 
     local output
+    local db_bin
+    db_bin=$(db_client_binary)
     if [ "$IS_DOCKER" = true ]; then
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            output=$(docker exec "$DB_CONTAINER" mariadb -N -B -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
-        else
-            output=$(docker exec "$DB_CONTAINER" mysql -N -B -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
-        fi
+        output=$(docker exec "$DB_CONTAINER" "$db_bin" -N -B -u"$LIVE_DB_USER" $(db_password_arg "$LIVE_DB_PASSWORD") "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
     else
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            output=$(mariadb -N -B -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
-        else
-            output=$(mysql -N -B -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
-        fi
+        output=$("$db_bin" -N -B -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $(db_password_arg "$LIVE_DB_PASSWORD") "$LIVE_DB_NAME" -e "$query" 2>/dev/null)
     fi
 
     DROP_TABLES="$output"
@@ -972,30 +1052,18 @@ drop_tables_for_prefix() {
         return 0
     fi
 
+    local db_bin
+    db_bin=$(db_client_binary)
     if [ "$IS_DOCKER" = true ]; then
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            printf "%b" "$sql" | docker exec -i "$DB_CONTAINER" mariadb -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
-                | grep -v "Using a password" \
-                | sed 's/^/  [mysql] /' \
-                || true
-        else
-            printf "%b" "$sql" | docker exec -i "$DB_CONTAINER" mysql -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
-                | grep -v "Using a password" \
-                | sed 's/^/  [mysql] /' \
-                || true
-        fi
+        printf "%b" "$sql" | docker exec -i "$DB_CONTAINER" "$db_bin" -u"$LIVE_DB_USER" $(db_password_arg "$LIVE_DB_PASSWORD") "$LIVE_DB_NAME" 2>&1 \
+            | grep -v "Using a password" \
+            | sed 's/^/  [mysql] /' \
+            || true
     else
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            printf "%b" "$sql" | mariadb -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
-                | grep -v "Using a password" \
-                | sed 's/^/  [mysql] /' \
-                || true
-        else
-            printf "%b" "$sql" | mysql -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $( [ -n "$LIVE_DB_PASSWORD" ] && printf -- "-p%s" "$LIVE_DB_PASSWORD" ) "$LIVE_DB_NAME" 2>&1 \
-                | grep -v "Using a password" \
-                | sed 's/^/  [mysql] /' \
-                || true
-        fi
+        printf "%b" "$sql" | "$db_bin" -h"$LIVE_DB_HOST" -u"$LIVE_DB_USER" $(db_password_arg "$LIVE_DB_PASSWORD") "$LIVE_DB_NAME" 2>&1 \
+            | grep -v "Using a password" \
+            | sed 's/^/  [mysql] /' \
+            || true
     fi
 
     log_message "DROP phase complete"
@@ -1129,6 +1197,19 @@ patch_wp_config_db_creds() {
             return 1
         fi
         rm -f "$actual_path"
+        # docker cp creates the destination as root:root. Re-chown to the
+        # web-server UID so PHP can read the file after restart (this also
+        # preserves the chown done by restore_files_to_container — see
+        # issue/issue2.md). Skipped if the patch target is on a bind mount
+        # (the host owns it; chown would touch user-owned host files).
+        if ! path_contains_bind_mount "$cdocroot" && ! path_is_under_bind_mount "$cdocroot"; then
+            local _patch_owner
+            _patch_owner=$(resolve_restore_owner_group "$container" "${cdocroot%/wp-config.php}" "")
+            if [ -n "$_patch_owner" ] && [ "$_patch_owner" != "0:0" ]; then
+                docker exec "$container" chown "$_patch_owner" "$cdocroot" 2>/dev/null \
+                    || log_message "WARNING: Could not re-chown wp-config.php after creds patch"
+            fi
+        fi
         log_message "Patched DB creds in $container:$cdocroot (DB_NAME/USER/PASSWORD/HOST replaced; ${patched_count}/4 literal(s))"
     else
         log_message "Patched DB creds in $wp_config_path (DB_NAME/USER/PASSWORD/HOST replaced; ${patched_count}/4 literal(s))"
@@ -1197,6 +1278,18 @@ patch_wp_config_table_prefix() {
             return 1
         fi
         rm -f "$actual_path"
+        # docker cp creates the destination as root:root. Re-chown to the
+        # web-server UID so PHP can read the file after restart (see
+        # issue/issue2.md). Skipped if the patch target is on a bind mount
+        # (the host owns it).
+        if ! path_contains_bind_mount "$cdocroot" && ! path_is_under_bind_mount "$cdocroot"; then
+            local _patch_owner
+            _patch_owner=$(resolve_restore_owner_group "$container" "${cdocroot%/wp-config.php}" "")
+            if [ -n "$_patch_owner" ] && [ "$_patch_owner" != "0:0" ]; then
+                docker exec "$container" chown "$_patch_owner" "$cdocroot" 2>/dev/null \
+                    || log_message "WARNING: Could not re-chown wp-config.php after table_prefix patch"
+            fi
+        fi
         log_message "Patched \$table_prefix '$old_prefix' -> '$new_prefix' in $container:$cdocroot"
     else
         log_message "Patched \$table_prefix '$old_prefix' -> '$new_prefix' in $wp_config_path"
@@ -1236,12 +1329,12 @@ restore_database_docker() {
     # from the running stack (the value we have may be a stale compose
     # service name like "db" rather than the real container name, or the
     # container may be named under a different project).
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+    if ! container_is_running "$DB_CONTAINER"; then
         log_message "WARN: Database container '$DB_CONTAINER' is not running; trying to discover the real running container..."
         if resolve_db_container_from_running_stack "${DB_HOST:-}"; then
             log_message "Discovered running DB container: $DB_CONTAINER"
         fi
-        if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+        if ! container_is_running "$DB_CONTAINER"; then
             log_message "ERROR: Could not find a running database container"
             log_message "  Tried: '$DB_CONTAINER' (from compose / .dbinfo)"
             log_message "  DB_HOST from wp-config.php: '${DB_HOST:-<unset>}'"
@@ -1251,86 +1344,55 @@ restore_database_docker() {
         fi
     fi
 
-    # Check if SQL file exists and has content
-    if [ ! -s "$sql_file" ]; then
-        log_message "ERROR: Database backup file is empty or does not exist"
-        return 1
-    fi
-    
     # Create database restore command for Docker
-    local docker_restore_cmd=""
-    
-    if [ "$DB_TYPE" = "mariadb" ]; then
-        docker_restore_cmd="docker exec -i $DB_CONTAINER mariadb -u$DB_USER"
-    else
-        docker_restore_cmd="docker exec -i $DB_CONTAINER mysql -u$DB_USER"
-    fi
-    
+    local docker_restore_cmd="docker exec -i $DB_CONTAINER $(db_client_binary) -u$DB_USER"
     if [ -n "$DB_PASSWORD" ]; then
         docker_restore_cmd="$docker_restore_cmd -p$DB_PASSWORD"
     fi
-    
     docker_restore_cmd="$docker_restore_cmd $DB_NAME"
-    
-    # Execute database restore. Capture stdout to a tmpfile so we don't
-    # leak DB content (multi-row INSERT...VALUES rows, etc.) to the user's
-    # terminal on a successful import. If the command fails, we surface
-    # the captured output alongside the error message.
-    local _restore_stdout _restore_stderr _restore_rc
-    _restore_stdout=$(mktemp)
-    _restore_stderr=$(mktemp)
-    trap "rm -f '$_restore_stdout' '$_restore_stderr'" RETURN
-    eval "$docker_restore_cmd" < "$sql_file" > "$_restore_stdout" 2> "$_restore_stderr"
-    _restore_rc=$?
-    if [ "$_restore_rc" = 0 ]; then
-        log_message "Database restored successfully using Docker"
-        return 0
-    else
-        log_message "ERROR: Failed to restore database using Docker"
-        log_message "Please check database credentials and container status"
-        # Surface captured output only on failure (truncated to last 30 lines).
-        if [ -s "$_restore_stderr" ]; then
-            log_message "MySQL stderr (last 30 lines):"
-            tail -n 30 "$_restore_stderr" | sed 's/^/  [mysql] /'
-        fi
-        if [ -s "$_restore_stdout" ]; then
-            log_message "MySQL stdout (last 30 lines):"
-            tail -n 30 "$_restore_stdout" | sed 's/^/  [mysql] /'
-        fi
-        return 1
-    fi
+
+    _execute_db_import "$sql_file" "$docker_restore_cmd" "Docker" "database credentials and container status"
 }
 
 # Function to restore database (Native)
 restore_database_native() {
     local sql_file="$1"
-    
+
     log_message "Restoring database using native $DB_TYPE..."
-    
+
+    # Create database restore command based on service type
+    local restore_cmd="$(db_client_binary) -h$DB_HOST -u$DB_USER"
+    if [ -n "$DB_PASSWORD" ]; then
+        restore_cmd="$restore_cmd -p$DB_PASSWORD"
+    fi
+    restore_cmd="$restore_cmd $DB_NAME"
+
+    _execute_db_import "$sql_file" "$restore_cmd" "native $DB_TYPE" "database credentials and service availability"
+}
+
+# Shared implementation for restore_database_docker/restore_database_native.
+# Runs $restore_cmd with $sql_file piped in as stdin. Capture stdout to a
+# tmpfile so we don't leak DB content (multi-row INSERT...VALUES rows, etc.)
+# to the user's terminal on a successful import. If the command fails, we
+# surface the captured output alongside the error message.
+#
+# Args:
+#   $1 — path to the SQL file to import
+#   $2 — full shell command to run (as a string; evaluated)
+#   $3 — label used in log messages (e.g. "Docker", "native mysql")
+#   $4 — hint appended to the "Please check ..." error message
+_execute_db_import() {
+    local sql_file="$1"
+    local restore_cmd="$2"
+    local label="$3"
+    local check_hint="$4"
+
     # Check if SQL file exists and has content
     if [ ! -s "$sql_file" ]; then
         log_message "ERROR: Database backup file is empty or does not exist"
         return 1
     fi
-    
-    # Create database restore command based on service type
-    local restore_cmd=""
-    if [ "$DB_TYPE" = "mariadb" ]; then
-        restore_cmd="mariadb -h$DB_HOST -u$DB_USER"
-    else
-        restore_cmd="mysql -h$DB_HOST -u$DB_USER"
-    fi
-    
-    if [ -n "$DB_PASSWORD" ]; then
-        restore_cmd="$restore_cmd -p$DB_PASSWORD"
-    fi
-    
-    restore_cmd="$restore_cmd $DB_NAME"
-    
-    # Execute database restore. Capture stdout to a tmpfile so we don't
-    # leak DB content (multi-row INSERT...VALUES rows, etc.) to the user's
-    # terminal on a successful import. If the command fails, we surface
-    # the captured output alongside the error message.
+
     local _restore_stdout _restore_stderr _restore_rc
     _restore_stdout=$(mktemp)
     _restore_stderr=$(mktemp)
@@ -1338,11 +1400,12 @@ restore_database_native() {
     eval "$restore_cmd" < "$sql_file" > "$_restore_stdout" 2> "$_restore_stderr"
     _restore_rc=$?
     if [ "$_restore_rc" = 0 ]; then
-        log_message "Database restored successfully using native $DB_TYPE"
+        log_message "Database restored successfully using $label"
         return 0
     else
-        log_message "ERROR: Failed to restore database using native $DB_TYPE"
-        log_message "Please check database credentials and service availability"
+        log_message "ERROR: Failed to restore database using $label"
+        log_message "Please check $check_hint"
+        # Surface captured output only on failure (truncated to last 30 lines).
         if [ -s "$_restore_stderr" ]; then
             log_message "MySQL stderr (last 30 lines):"
             tail -n 30 "$_restore_stderr" | sed 's/^/  [mysql] /'
@@ -1439,30 +1502,16 @@ detect_old_url_from_live_db() {
 build_db_query_cmd() {
     # Outputs the prefix command to run a query against the DB.
     # Caller is responsible for appending the SQL.
+    local cmd
 
     if [ "$IS_DOCKER" = true ]; then
-        local cmd="docker exec -i $DB_CONTAINER"
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            cmd="$cmd mariadb"
-        else
-            cmd="$cmd mysql"
-        fi
-        cmd="$cmd -u$DB_USER"
-        [ -n "$DB_PASSWORD" ] && cmd="$cmd -p$DB_PASSWORD"
-        cmd="$cmd -N -B $DB_NAME"
-        echo "$cmd"
+        cmd="docker exec -i $DB_CONTAINER $(db_client_binary) -u$DB_USER"
     else
-        local cmd=""
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            cmd="mariadb"
-        else
-            cmd="mysql"
-        fi
-        cmd="$cmd -h$DB_HOST -u$DB_USER"
-        [ -n "$DB_PASSWORD" ] && cmd="$cmd -p$DB_PASSWORD"
-        cmd="$cmd -N -B $DB_NAME"
-        echo "$cmd"
+        cmd="$(db_client_binary) -h$DB_HOST -u$DB_USER"
     fi
+    [ -n "$DB_PASSWORD" ] && cmd="$cmd -p$DB_PASSWORD"
+    cmd="$cmd -N -B $DB_NAME"
+    echo "$cmd"
 }
 
 # Function to run a SQL query against the restored database
@@ -1766,6 +1815,274 @@ update_admin_user() {
     log_message "Admin user '$ADMIN_USER' (ID=$existing_id) is configured as administrator"
 }
 
+# Inspect the WP container's live mount state and populate
+# WP_CONTAINER_BIND_MOUNTS with the ACTUAL DESTINATIONS of any bind
+# mount that fall under the given docroot. Reads /proc/self/mountinfo
+# INSIDE the container because that reflects the kernel's live view of
+# where the bind mount actually points — after a `mv` of the parent
+# directory (e.g. mv /var/www/html -> /var/www/html.backup.<ts>) the
+# bind mount tracks the new path automatically; `docker inspect` still
+# shows the original declarative path, which would be wrong.
+#
+# The SOURCE path is also recorded in WP_CONTAINER_BIND_MOUNT_SOURCES so
+# we can log it for the user. Bind-mount detection: in /proc/self/mountinfo,
+# a bind mount line has the host path in field 4 (root) — for a regular
+# filesystem mount, field 4 is `/`. So we treat anything where field 4 is
+# a non-root absolute path as a bind mount.
+#
+# Safe to call multiple times — clears both arrays first. Returns 0 on
+# success, 1 if mountinfo can't be read.
+detect_container_bind_mounts() {
+    local container="$1"
+    local docroot="$2"
+    WP_CONTAINER_BIND_MOUNTS=()
+    WP_CONTAINER_BIND_MOUNT_SOURCES=()
+
+    # /proc/self/mountinfo line format:
+    #   mount-id parent-id major:minor root mount-point options - fs-type source super-options
+    #   541 540 252:0 /home/zongbao/projects/wp-dev-environment/mytheme /var/www/html/wp-content.backup.20260919_152631/themes/MyTheme rw,relatime - ext4 /dev/mapper/ubuntu--vg-ubuntu--lv rw
+    #   $1   $2   $3       $4 (root / bind-source)              $5 (mount point)                       $6              $7  $8       $9 (block dev)
+    local raw
+    raw=$(docker exec "$container" cat /proc/self/mountinfo 2>/dev/null || true)
+    if [ -z "$raw" ]; then
+        return 1
+    fi
+    local line root_field mp
+    while IFS= read -r line; do
+        set -- $line
+        root_field="$4"
+        mp="$5"
+        # Bind mount: root is a non-root absolute host path
+        if [ -z "$root_field" ] || [ "$root_field" = "/" ]; then continue; fi
+        if [[ "$root_field" != /* ]]; then continue; fi
+        # Only consider bind mounts UNDER the docroot
+        if [ "$mp" = "$docroot" ] || [[ "$mp" != "$docroot"/* ]]; then continue; fi
+        WP_CONTAINER_BIND_MOUNTS+=("$mp")
+        WP_CONTAINER_BIND_MOUNT_SOURCES+=("$root_field")
+    done <<< "$raw"
+
+    if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+        log_message "Detected ${#WP_CONTAINER_BIND_MOUNTS[@]} bind mount(s) under $docroot (live mountinfo; user-managed; will be excluded from chown/cleanup):"
+        local i
+        for i in "${!WP_CONTAINER_BIND_MOUNTS[@]}"; do
+            log_message "  - ${WP_CONTAINER_BIND_MOUNTS[$i]}"
+            log_message "      source: ${WP_CONTAINER_BIND_MOUNT_SOURCES[$i]}"
+        done
+    fi
+    return 0
+}
+
+# Return 0 (true) if $1 is equal to — or a strict child of — any path in
+# WP_CONTAINER_BIND_MOUNTS. Used to skip chown -R and rm -rf recursion
+# INTO user-owned subtrees. $1 is an absolute path inside the container.
+#
+# Examples (with bind mount /var/www/html/wp-content/themes/MyTheme):
+#   path_is_under_bind_mount /var/www/html/wp-content/themes/MyTheme       -> 0 (equal)
+#   path_is_under_bind_mount /var/www/html/wp-content/themes/MyTheme/foo   -> 0 (strict child)
+#   path_is_under_bind_mount /var/www/html/wp-content/themes               -> 1 (sibling/parent — NOT under)
+#   path_is_under_bind_mount /var/www/html/wp-content                      -> 1 (sibling/parent — NOT under)
+path_is_under_bind_mount() {
+    local p="$1"
+    [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -eq 0 ] && return 1
+    local bm
+    for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+        if [ "$p" = "$bm" ] || [[ "$p" == "$bm"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Return 0 (true) if $1 is equal to — or a strict ancestor of — any path in
+# WP_CONTAINER_BIND_MOUNTS. Used to REFUSE a destructive operation (rm -rf,
+# docker exec rm -rf, mv over, etc.) when the target dir IS or CONTAINS a
+# user-managed bind mount. Without this check, 'rm -rf safety-backup' would
+# happily walk INTO a bind-mounted subdir and silently delete the user's
+# host files underneath (the bind-mount destination itself fails to unlink
+# with 'Device or resource busy' but its contents are gone, confirmed by
+# issue/issue1.md reproduction).
+#
+# Examples (with bind mount /var/www/html/wp-content.backup.<ts>/themes/MyTheme):
+#   path_contains_bind_mount /var/www/html/wp-content.backup.<ts>/themes/MyTheme  -> 0 (equal)
+#   path_contains_bind_mount /var/www/html/wp-content.backup.<ts>/themes           -> 0 (strict ancestor)
+#   path_contains_bind_mount /var/www/html/wp-content.backup.<ts>                  -> 0 (strict ancestor)
+#   path_contains_bind_mount /var/www/html/wp-content.backup.<ts>/themes/Other    -> 1 (sibling/child of parent — NOT containing)
+path_contains_bind_mount() {
+    local p="$1"
+    [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -eq 0 ] && return 1
+    local bm
+    for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+        if [ "$p" = "$bm" ] || [[ "$bm" == "$p"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Decide which UID:GID to chown a freshly-restored file to inside the WP
+# container. Priority order, robust against the common 'safety backup is
+# itself root:root' trap (see issue/issue2.md):
+#
+#   1. The safety backup's owner — but only if it's non-root. A root-owned
+#      safety backup is meaningless: 'docker cp' creates files as
+#      root:root and a previous broken restore may have left the docroot
+#      that way. Chowning new files back to root:root leaves the web server
+#      unable to write uploads, run plugin updates, or flush object cache.
+#   2. The docroot's current owner — typically www-data:www-data (33:33).
+#      This is the web server's UID and is the right answer when there is
+#      no usable prior ownership.
+#   3. Hardcoded '33:33' (www-data) as the last-resort fallback for the
+#      official wordpress image and any Debian-based WP container.
+#
+# Usage inside restore_files_to_container:
+#   local target_owner_group
+#   target_owner_group=$(resolve_restore_owner_group "$container" "$docroot" "$safety_backup_path")
+resolve_restore_owner_group() {
+    local container="$1"
+    local docroot="$2"
+    local safety_backup="$3"
+    local og=""
+    if [ -n "$safety_backup" ]; then
+        og=$(docker exec "$container" stat -c '%u:%g' "$safety_backup" 2>/dev/null || true)
+    fi
+    # Discard root:root — it is never the right answer for a web-server container.
+    if [ -n "$og" ] && [ "$og" != "0:0" ]; then
+        printf '%s' "$og"
+        return 0
+    fi
+    # Try docroot — usually www-data:www-data.
+    og=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || true)
+    if [ -n "$og" ] && [ "$og" != "0:0" ]; then
+        printf '%s' "$og"
+        return 0
+    fi
+    # Last resort: www-data UID (official wordpress image default).
+    printf '%s' "33:33"
+}
+
+# Create a bind-mount-safe safety backup of the container's wp-content.
+# Why this exists:
+#   Plain `mv wp-content wp-content.backup.<ts>` would rename the parent
+#   directory, and the Linux kernel tracks bind mounts by path NAME — so
+#   the user's `./mytheme` and `./myplugin` would suddenly be reachable
+#   only at `/var/www/html/wp-content.backup.<ts>/themes/MyTheme`,
+#   trapping them in a stale sibling that we cannot safely `rm -rf` (see
+#   issue/issue1.md: rm -rf walks INTO bind mount destinations and wipes
+#   host files, while only failing to unlink the mount point itself).
+#
+# This function instead copies each NON-bind-mount subdir/file inside
+# wp-content to a sibling `wp-content.backup.<ts>` using hardlinks
+# (`cp -al`). The parent wp-content dir stays in place, so bind-mount
+# destinations stay at their expected paths (e.g.
+# /var/www/html/wp-content/themes/MyTheme) and the freshly-copied
+# wp-content from docker cp lands cleanly on top of them. If no bind
+# mounts are present, fall back to the fast `mv` path (no copy cost).
+#
+# Args:
+#   $1 — container name
+#   $2 — docroot in container (e.g. /var/www/html)
+# Echoes: the safety backup path (empty if backup was skipped for safety).
+# Side effects: creates the safety backup dir; logs progress.
+safety_backup_wp_content() {
+    local container="$1"
+    local docroot="$2"
+    local ts=$(date +%Y%m%d_%H%M%S)
+    local src="$docroot/wp-content"
+    local dst="$docroot/wp-content.backup.$ts"
+
+    if [ ! -d "$src" ]; then
+        return 0
+    fi
+
+    # Detect bind mounts INSIDE wp-content specifically.
+    detect_container_bind_mounts "$container" "$docroot"
+    local has_bm=false
+    if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+        has_bm=true
+    fi
+
+    if [ "$has_bm" = false ]; then
+        # Fast path: plain rename. No bind-mount interference, no copy cost.
+        if docker exec "$container" sh -c "mv '$src' '$dst'" 2>/dev/null; then
+            printf '%s' "$dst"
+            return 0
+        fi
+        log_message "WARNING: Could not mv $src to $dst in container"
+        return 1
+    fi
+
+    # Bind mounts are present. We MUST avoid renaming the parent dir, AND we
+    # MUST avoid recursing into any bind-mount destination (cp -al of a
+    # mount point would either fail or alias the destination, masking
+    # host changes from the container — either way a bug). Use find with
+    # -prune to copy only non-bind-mount paths.
+    mkdir -p "$dst" 2>/dev/null  # for IDE/host tooling, harmless if it fails
+    if ! docker exec "$container" mkdir -p "$dst" 2>/dev/null; then
+        log_message "WARNING: Could not mkdir $dst in container"
+        return 1
+    fi
+    if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -eq 0 ]; then
+        # Defensive: nothing to exclude.
+        docker exec "$container" sh -c "cp -al '$src'/. '$dst'/ 2>/dev/null" \
+            || log_message "WARNING: cp -al of $src failed"
+    else
+        local chown_exclusions
+        chown_exclusions=$(build_find_exclusions_for_bind_mounts)
+        # cp -al inside the container with the same pruned find pattern we
+        # use for chown. cp -al hardlinks every file we touch, so the
+        # safety backup shares inodes with the live tree; subsequent
+        # writes to either side will NOT affect the other, but rm on the
+        # original does unlink the inode (cp -al does NOT create a true
+        # independent copy). For our purpose (a backup you can inspect
+        # and rm -rf the wp-content.backup.<ts> later) this is fine.
+        #
+        # IMPORTANT: use cp -al on each path find returns (one -exec per
+        # file/dir), rather than `cp -al src/. dst/` which would recurse
+        # into bind mounts and alias host files.
+        docker exec "$container" sh -c "cd '$src' && find . \( $chown_exclusions \) -prune -o -exec cp -al {} '$dst'/{} + 2>/dev/null" \
+            || log_message "WARNING: bind-mount-aware cp -al of $src into $dst partially failed"
+    fi
+    printf '%s' "$dst"
+}
+
+# Build a space-separated set of `-path <glob>` exclusions suitable for
+# passing to `find ... -prune -o ...`. E.g. for bind mounts
+# /var/www/html/wp-content/themes/MyTheme and
+# /var/www/html/wp-content/plugins/MyPlugin, returns:
+#   -path /var/www/html/wp-content/themes/MyTheme -o -path /var/www/html/wp-content/themes/MyTheme/* -o -path /var/www/html/wp-content/plugins/MyPlugin -o -path /var/www/html/wp-content/plugins/MyPlugin/*
+# Caller is expected to wrap this in find's \( ... \) and append the actions, e.g.:
+#   find "$root" \( $(build_find_exclusions_for_bind_mounts) \) -prune -o -exec chown ... {} +
+#
+# IMPORTANT: do NOT emit a leading `-o`. find treats that as "binary -o with
+# no left operand" and errors out with 'invalid expression'. The first
+# token must be a `-path` test.
+build_find_exclusions_for_bind_mounts() {
+    # Builds a find(1) expression that prunes each bind-mount destination
+    # and everything underneath it. The expression is consumed INSIDE a
+    # docker exec sh -c, so the host shell MUST NOT word-split or glob
+    # these tokens — otherwise the `*` in `${bm}/*` would expand against
+    # whatever happens to be in the bind mount (which lives inside the
+    # container, and whose contents we have no control over). We escape
+    # every space AND every `*` with a backslash so the inner shell
+    # treats the whole thing as literal text and hands it to find
+    # intact.
+    local out=""
+    local bm escaped
+    for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+        # Backslash-escape any character that would be special to the
+        # inner shell: spaces and glob metacharacters (* ? [ ]).
+        escaped=$(printf '%s' "$bm" | sed -e 's/[][ *?]/\\&/g')
+        local bm_glob="${escaped}/*"
+        bm_glob=$(printf '%s' "$bm_glob" | sed -e 's/[][ *?]/\\&/g')
+        if [ -z "$out" ]; then
+            out="-path $escaped -o -path $bm_glob"
+        else
+            out="$out -o -path $escaped -o -path $bm_glob"
+        fi
+    done
+    printf '%s' "$out"
+}
+
 # Function to restore WordPress files into a Docker container using 'docker cp'.
 # Used in container-direct mode (-c). The backup is restored INTO the
 # container (no host bind mount required) using the document root path
@@ -1786,6 +2103,11 @@ restore_files_to_container() {
         return 1
     fi
 
+    # Detect user-managed bind mounts under the docroot so we don't chown
+    # or rm -rf through them (issue/issue1.md). Idempotent — safe to call
+    # on every container-direct restore.
+    detect_container_bind_mounts "$container" "$docroot"
+
     if [ "$BACKUP_MODE" = "lightweight" ]; then
         log_message "Restoring WordPress files to container '$container' (lightweight mode)..."
 
@@ -1804,31 +2126,83 @@ restore_files_to_container() {
             if [ "$DRY_RUN" = true ]; then
                 log_message "[DRY-RUN] Would docker cp wp-content -> $container:$docroot/"
             else
-                # Backup existing wp-content inside container by renaming it
+                # Use the bind-mount-aware safety_backup_wp_content helper
+                # (defined above). It:
+                #   - On a plain setup (no bind mounts), does the cheap `mv`
+                #     of the entire wp-content dir, exactly as the script
+                #     historically did.
+                #   - When bind mounts are present, hardlink-copies
+                #     non-bind-mount paths into a sibling `wp-content.backup.
+                #     <ts>` so bind-mount destinations stay at their
+                #     original paths (e.g. wp-content/themes/MyTheme). The
+                #     parent wp-content is NOT renamed, so we don't trap
+                #     bind-mount destinations inside a directory we cannot
+                #     safely `rm -rf`. See issue/issue1.md.
                 local wp_content_inside_backup=""
-                if docker exec "$container" test -d "$docroot/wp-content" >/dev/null 2>&1; then
-                    local ts=$(date +%Y%m%d_%H%M%S)
-                    log_message "Backing up existing wp-content inside container to wp-content.backup.$ts"
-                    docker exec "$container" sh -c "mv '$docroot/wp-content' '$docroot/wp-content.backup.$ts'" 2>/dev/null || true
-                    wp_content_inside_backup="${docroot}/wp-content.backup.$ts"
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
+                wp_content_inside_backup=$(safety_backup_wp_content "$container" "$docroot")
+                if [ -n "$wp_content_inside_backup" ]; then
+                    # Detach bind-mount destinations from the now-backup dir
+                    # so cleanup_safety_backups() can rm -rf the safety
+                    # backup without descending into host-mounted
+                    # subdirectories. The bind-mount destinations remain
+                    # live under wp-content/, NOT under the safety backup.
+                    # On the no-bind-mount fast path, this is a no-op.
+                    detect_container_bind_mounts "$container" "$docroot"
+                    if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -eq 0 ]; then
+                        # No bind mounts → the safety backup is exactly the
+                        # renamed wp-content. Register for cleanup.
+                        RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
+                    else
+                        # Bind mounts present → wp-content/backups/<ts> contains
+                        # only copied hardlinks (cp -al); the live wp-content
+                        # itself is unchanged in place. The safety backup dir
+                        # is safe to rm -rf because nothing in it is reachable
+                        # from the live wp-content anymore (hardlinks do not
+                        # create nested mount-point aliases). Register it for
+                        # cleanup.
+                        RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_content_inside_backup}")
+                    fi
                 fi
                 # docker cp expects a directory; source ends without / for directories
                 if docker cp "$backup_wp_dir/wp-content" "$container:$docroot/" 2>/dev/null; then
                     # 'docker cp' always creates files inside the container as
                     # root:root, regardless of who runs docker on the host.
                     # If the web server runs as a non-root UID (nobody/www-data),
-                    # uploads/plugin updates will break. chown to the original
-                    # wp-content's owner we just moved out of the way; fall back
-                    # to the docroot owner if no prior wp-content existed.
-                    local target_owner_group=""
-                    if [ -n "$wp_content_inside_backup" ]; then
-                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$wp_content_inside_backup" 2>/dev/null || true)
-                    fi
-                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    # uploads/plugin updates will break. Pick the right owner:
+                    # prefer the previous wp-content, but ignore root:root (a
+                    # previously broken restore may have left it that way — see
+                    # issue/issue2.md), then the docroot, then www-data (33:33).
+                    local target_owner_group
+                    target_owner_group=$(resolve_restore_owner_group "$container" "$docroot" "$wp_content_inside_backup")
+                    log_message "  Target owner for restored wp-content: $target_owner_group (from safety backup ${wp_content_inside_backup:-<none>})"
                     if [ -n "$target_owner_group" ]; then
-                        docker exec "$container" chown -R "$target_owner_group" "$docroot/wp-content" 2>/dev/null \
-                            || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container"
+                        # Skip bind-mounted subpaths: they belong to the user on the
+                        # host, not to the container's webserver UID. Recursively
+                        # chowning them would silently re-own files outside the
+                        # container (issue/issue1.md).
+                        if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+                            local chown_exclusions
+                            chown_exclusions=$(build_find_exclusions_for_bind_mounts)
+                            # NOTE: $chown_exclusions is intentionally UNQUOTED
+                            # inside the sh -c string. build_find_exclusions_for_bind_mounts()
+                            # already escapes every special char (spaces, *, ?, [])
+                            # with a backslash, so the inner container shell sees
+                            # the expression as literal find predicates and does
+                            # not word-split or glob-expand it. (Quoting the
+                            # variable as a single arg would collapse all
+                            # predicates into one bad arg.)
+                            docker exec "$container" sh -c "find '$docroot/wp-content' \( $chown_exclusions \) -prune -o -exec chown '$target_owner_group' {} +" 2>/dev/null \
+                                || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container (bind-mount-aware)"
+                            # Make sure each bind-mount destination itself has the
+                            # right owner too (the directory entry, not just contents).
+                            local bm
+                            for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+                                docker exec "$container" chown "$target_owner_group" "$bm" 2>/dev/null || true
+                            done
+                        else
+                            docker exec "$container" chown -R "$target_owner_group" "$docroot/wp-content" 2>/dev/null \
+                                || log_message "WARNING: Could not chown wp-content to $target_owner_group inside container"
+                        fi
                     fi
                     log_message "wp-content restored to container"
                 else
@@ -1849,14 +2223,18 @@ restore_files_to_container() {
                     log_message "Backing up existing wp-config.php inside container to wp-config.php.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/wp-config.php' '$docroot/wp-config.php.backup.$ts'" 2>/dev/null || true
                     wp_config_inside_backup="${docroot}/wp-config.php.backup.$ts"
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_config_inside_backup}")
+                    if path_is_under_bind_mount "$wp_config_inside_backup" || path_contains_bind_mount "$wp_config_inside_backup"; then
+                        log_message "  NOTE: Skipping auto-cleanup of $wp_config_inside_backup — is or contains bind-mounted subpath(s) the user manages on the host. Remove manually after verifying the restore."
+                    else
+                        RESTORE_SAFETY_BACKUPS+=("docker://${container}:${wp_config_inside_backup}")
+                    fi
                 fi
                 if docker cp "$backup_wp_dir/wp-config.php" "$container:$docroot/" 2>/dev/null; then
-                    local target_owner_group=""
-                    if [ -n "$wp_config_inside_backup" ]; then
-                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$wp_config_inside_backup" 2>/dev/null || true)
-                    fi
-                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    # Resolve to www-data (or docroot owner) when the previous
+                    # wp-config.php was root:root — see resolve_restore_owner_group().
+                    local target_owner_group
+                    target_owner_group=$(resolve_restore_owner_group "$container" "$docroot" "$wp_config_inside_backup")
+                    log_message "  Target owner for restored wp-config.php: $target_owner_group (from safety backup ${wp_config_inside_backup:-<none>})"
                     if [ -n "$target_owner_group" ]; then
                         docker exec "$container" chown "$target_owner_group" "$docroot/wp-config.php" 2>/dev/null \
                             || log_message "WARNING: Could not chown wp-config.php to $target_owner_group inside container"
@@ -1883,14 +2261,16 @@ restore_files_to_container() {
                     log_message "Backing up existing .htaccess inside container to .htaccess.backup.$ts"
                     docker exec "$container" sh -c "mv '$docroot/.htaccess' '$docroot/.htaccess.backup.$ts'" 2>/dev/null || true
                     htaccess_inside_backup="${docroot}/.htaccess.backup.$ts"
-                    RESTORE_SAFETY_BACKUPS+=("docker://${container}:${htaccess_inside_backup}")
+                    if path_is_under_bind_mount "$htaccess_inside_backup" || path_contains_bind_mount "$htaccess_inside_backup"; then
+                        log_message "  NOTE: Skipping auto-cleanup of $htaccess_inside_backup — is or contains bind-mounted subpath(s) the user manages on the host. Remove manually after verifying the restore."
+                    else
+                        RESTORE_SAFETY_BACKUPS+=("docker://${container}:${htaccess_inside_backup}")
+                    fi
                 fi
                 if docker cp "$backup_wp_dir/.htaccess" "$container:$docroot/" 2>/dev/null; then
-                    local target_owner_group=""
-                    if [ -n "$htaccess_inside_backup" ]; then
-                        target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$htaccess_inside_backup" 2>/dev/null || true)
-                    fi
-                    [ -z "$target_owner_group" ] && target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot" 2>/dev/null || echo "")
+                    local target_owner_group
+                    target_owner_group=$(resolve_restore_owner_group "$container" "$docroot" "$htaccess_inside_backup")
+                    log_message "  Target owner for restored .htaccess: $target_owner_group (from safety backup ${htaccess_inside_backup:-<none>})"
                     if [ -n "$target_owner_group" ]; then
                         docker exec "$container" chown "$target_owner_group" "$docroot/.htaccess" 2>/dev/null \
                             || log_message "WARNING: Could not chown .htaccess to $target_owner_group inside container"
@@ -1920,7 +2300,21 @@ restore_files_to_container() {
             log_message "Backing up existing docroot inside container to $docroot.backup.$ts"
             docker exec "$container" sh -c "mv '$docroot' '$docroot.backup.$ts'" 2>/dev/null || true
             docroot_inside_backup="${docroot}.backup.$ts"
-            RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot_inside_backup}")
+            # The mv above renamed the docroot. Linux kernel bind mounts
+            # track the path by name, so bind-mount destinations under
+            # /var/www/html are now at /var/www/html.backup.<ts>/...
+            # Re-detect before deciding whether to register the safety
+            # backup for cleanup (issue/issue1.md update).
+            detect_container_bind_mounts "$container" "$docroot"
+            # Full-mode backup is the docroot itself, which may contain bind mounts.
+            # Refuse to auto-clean it: rm -rf would walk into the bind mount and
+            # wipe user-owned host files (issue/issue1.md). The user can remove it
+            # manually once they've verified the restore.
+            if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+                log_message "  NOTE: Skipping auto-cleanup of $docroot_inside_backup — contains bind-mounted subpath(s) the user manages on the host. Remove manually after verifying."
+            else
+                RESTORE_SAFETY_BACKUPS+=("docker://${container}:${docroot_inside_backup}")
+            fi
             # Recreate empty docroot
             docker exec "$container" mkdir -p "$docroot" 2>/dev/null
         else
@@ -1930,17 +2324,32 @@ restore_files_to_container() {
         # Push everything. docker cp requires src/. for directory contents.
         if docker cp "$backup_wp_dir"/. "$container:$docroot/" 2>/dev/null; then
             # 'docker cp' always creates files inside the container as
-            # root:root. chown the freshly-pushed tree to the original
-            # docroot owner so the web server (nobody/33/1000) can read
-            # and write it. Uses the safety backup we just moved out of
-            # the way; falls back to nothing if there was no original.
-            local target_owner_group=""
-            if [ -n "$docroot_inside_backup" ]; then
-                target_owner_group=$(docker exec "$container" stat -c '%u:%g' "$docroot_inside_backup" 2>/dev/null || true)
-            fi
+            # root:root. chown the freshly-pushed tree so the web server
+            # can read and write it. resolve_restore_owner_group() picks a
+            # sensible target, ignoring root:root from any prior broken
+            # restore.
+            local target_owner_group
+            target_owner_group=$(resolve_restore_owner_group "$container" "$docroot" "$docroot_inside_backup")
+            log_message "  Target owner for restored docroot: $target_owner_group (from safety backup ${docroot_inside_backup:-<none>})"
             if [ -n "$target_owner_group" ]; then
-                docker exec "$container" chown -R "$target_owner_group" "$docroot" 2>/dev/null \
-                    || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container"
+                # Skip bind-mounted subpaths in the recursive chown: those
+                # paths are owned by the user on the host (issue/issue1.md).
+                if [ ${#WP_CONTAINER_BIND_MOUNTS[@]} -gt 0 ]; then
+                    local chown_exclusions
+                    chown_exclusions=$(build_find_exclusions_for_bind_mounts)
+                    # See comment in the wp-content branch above — the
+                    # exclusion expression is self-escaped so it can be
+                    # passed unquoted into the inner sh.
+                    docker exec "$container" sh -c "find '$docroot' \( $chown_exclusions \) -prune -o -exec chown '$target_owner_group' {} +" 2>/dev/null \
+                        || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container (bind-mount-aware)"
+                    local bm
+                    for bm in "${WP_CONTAINER_BIND_MOUNTS[@]}"; do
+                        docker exec "$container" chown "$target_owner_group" "$bm" 2>/dev/null || true
+                    done
+                else
+                    docker exec "$container" chown -R "$target_owner_group" "$docroot" 2>/dev/null \
+                        || log_message "WARNING: Could not chown restored docroot to $target_owner_group inside container"
+                fi
             fi
             log_message "WordPress files restored to container successfully"
             return 0
@@ -2003,7 +2412,21 @@ restore_files() {
                 # this, uploads/plugin updates would silently fail with
                 # 'Permission denied'. Reference the safety backup we just
                 # moved out of the way (root is guaranteed by startup check).
+                # If the safety backup was itself root:root (common after a
+                # broken prior restore — issue/issue2.md), fall back to the
+                # existing target_dir's owner: that's what the web server
+                # expects and won't be root in any sensible setup.
+                local host_target_owner=""
                 if [ -n "$wp_content_backup" ] && [ -d "$wp_content_backup" ]; then
+                    host_target_owner=$(stat -c '%u:%g' "$wp_content_backup" 2>/dev/null || true)
+                fi
+                if [ "$host_target_owner" = "0:0" ] || [ -z "$host_target_owner" ]; then
+                    host_target_owner=$(stat -c '%u:%g' "$target_dir" 2>/dev/null || echo "")
+                fi
+                if [ -n "$host_target_owner" ] && [ "$host_target_owner" != "0:0" ]; then
+                    chown -R "$host_target_owner" "$target_dir/wp-content" 2>/dev/null \
+                        || log_message "WARNING: Could not chown wp-content to $host_target_owner"
+                elif [ -n "$wp_content_backup" ] && [ -d "$wp_content_backup" ]; then
                     chown -R --reference="$wp_content_backup" "$target_dir/wp-content" 2>/dev/null \
                         || log_message "WARNING: Could not chown wp-content to match original owner"
                 fi
@@ -2018,29 +2441,7 @@ restore_files() {
 
         # Restore wp-config.php
         if [ -f "$backup_wp_dir/wp-config.php" ]; then
-            # Backup existing wp-config.php if exists
-            local wp_config_backup=""
-            if [ -f "$target_dir/wp-config.php" ]; then
-                wp_config_backup="$target_dir/wp-config.php.backup.$(date +%Y%m%d_%H%M%S)"
-                log_message "Backing up existing wp-config.php to: $wp_config_backup"
-                if mv "$target_dir/wp-config.php" "$wp_config_backup"; then
-                    RESTORE_SAFETY_BACKUPS+=("$wp_config_backup")
-                else
-                    log_message "ERROR: Failed to backup existing wp-config.php"
-                    return 1
-                fi
-            fi
-
-            if cp "$backup_wp_dir/wp-config.php" "$target_dir/"; then
-                # Restore original ownership so the web server can read the
-                # file (and the patched DB creds can be loaded by PHP).
-                if [ -n "$wp_config_backup" ] && [ -f "$wp_config_backup" ]; then
-                    chown --reference="$wp_config_backup" "$target_dir/wp-config.php" 2>/dev/null \
-                        || log_message "WARNING: Could not chown wp-config.php to match original owner"
-                fi
-                log_message "wp-config.php restored successfully"
-            else
-                log_message "ERROR: Failed to restore wp-config.php"
+            if ! _host_replace_file_with_backup "$target_dir/wp-config.php" "$backup_wp_dir/wp-config.php" "wp-config.php" false; then
                 return 1
             fi
         else
@@ -2050,27 +2451,7 @@ restore_files() {
 
         # Restore .htaccess if exists in backup
         if [ -f "$backup_wp_dir/.htaccess" ]; then
-            local htaccess_backup=""
-            if [ -f "$target_dir/.htaccess" ]; then
-                htaccess_backup="$target_dir/.htaccess.backup.$(date +%Y%m%d_%H%M%S)"
-                log_message "Backing up existing .htaccess to: $htaccess_backup"
-                if mv "$target_dir/.htaccess" "$htaccess_backup"; then
-                    RESTORE_SAFETY_BACKUPS+=("$htaccess_backup")
-                else
-                    log_message "ERROR: Failed to backup existing .htaccess"
-                    return 1
-                fi
-            fi
-
-            if cp "$backup_wp_dir/.htaccess" "$target_dir/"; then
-                if [ -n "$htaccess_backup" ] && [ -f "$htaccess_backup" ]; then
-                    chown --reference="$htaccess_backup" "$target_dir/.htaccess" 2>/dev/null \
-                        || log_message "WARNING: Could not chown .htaccess to match original owner"
-                fi
-                log_message ".htaccess restored successfully"
-            else
-                log_message "WARNING: Failed to restore .htaccess (non-critical)"
-            fi
+            _host_replace_file_with_backup "$target_dir/.htaccess" "$backup_wp_dir/.htaccess" ".htaccess" true || true
         fi
         
         # Calculate restored files size
@@ -2486,6 +2867,15 @@ cleanup_safety_backups() {
         return 0
     fi
     log_message "Removing preserved safety backups (restore completed successfully):"
+    # Re-detect bind mounts on the WP container RIGHT NOW. This is critical:
+    # earlier in the restore, the script may have `mv`-ed the docroot or
+    # wp-content to create a .backup.<ts> sibling, and the bind-mount
+    # destinations will have followed the rename (see issue/issue1.md
+    # update). Reading /proc/self/mountinfo again here means we use the
+    # CURRENT kernel truth, not the stale array from the start of the run.
+    if [ -n "$WP_CONTAINER" ] && [ -n "$WP_CONTAINER_DOCROOT" ]; then
+        detect_container_bind_mounts "$WP_CONTAINER" "$WP_CONTAINER_DOCROOT"
+    fi
     local b
     for b in "${RESTORE_SAFETY_BACKUPS[@]}"; do
         if [ -z "$b" ]; then continue; fi
@@ -2497,9 +2887,37 @@ cleanup_safety_backups() {
             local container="${rest%%:*}"
             local cpath="${rest#*:}"
             if [ -n "$container" ] && [ -n "$cpath" ]; then
-                log_message "  Removing (in container $container): $cpath"
-                docker exec "$container" rm -rf "$cpath" 2>/dev/null \
-                    || log_message "  WARNING: Failed to remove $cpath in $container"
+                # Defense in depth: never rm -rf a safety backup that EQUALS,
+                # SITS UNDER, OR CONTAINS a bind-mounted subpath.
+                #
+                # - path_is_under_bind_mount ($cpath is a child of a bind mount):
+                #   the entire safety backup IS inside the user-managed subtree;
+                #   rm -rf would only touch host-owned files there.
+                #
+                # - path_contains_bind_mount ($cpath is an ancestor of a bind
+                #   mount): the safety backup has a bind mount as a descendant
+                #   (this is the post-mv case — we renamed the docroot's parent
+                #   dir and the kernel rewrote the bind-mount destination path
+                #   to live inside the safety backup). rm -rf on the safety
+                #   backup recurses into the bind-mount destination and, while
+                #   it cannot unlink the mount point itself ('Device or
+                #   resource busy'), it WILL successfully unlink every file
+                #   inside the mount point — silently wiping user-owned host
+                #   files. This is the catastrophic case from issue/issue1.md.
+                #
+                # The detect_container_bind_mounts() call above has refreshed
+                # the array with the LIVE destinations, so both checks use
+                # current kernel truth, not stale data from earlier in the run.
+                if [ "$container" = "$WP_CONTAINER" ] && (
+                    path_contains_bind_mount "$cpath" || path_is_under_bind_mount "$cpath"
+                ); then
+                    log_message "  Skipping (in container $container): $cpath"
+                    log_message "    -> is or contains a bind-mounted subpath; user-managed on the host. Remove manually if no longer required."
+                else
+                    log_message "  Removing (in container $container): $cpath"
+                    docker exec "$container" rm -rf "$cpath" 2>/dev/null \
+                        || log_message "  WARNING: Failed to remove $cpath in $container"
+                fi
             fi
         elif [ -e "$b" ]; then
             log_message "  Removing: $b"
@@ -2604,7 +3022,7 @@ else
     # name. This is the common case when restoring a backup from one
     # Docker stack onto a different one (e.g. szreypower-* -> wp-dev-*).
     if [ "$IS_DOCKER" = true ] && [ "$CONTAINER_DIRECT" != true ]; then
-        if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+        if [ -z "$DB_CONTAINER" ] || ! container_is_running "$DB_CONTAINER"; then
             log_message "Re-resolving DB container using DB_HOST='$DB_HOST'..."
             if ! detect_docker_database_info; then
                 log_message "ERROR: Failed to detect Docker database configuration after extracting backup"
@@ -2734,7 +3152,7 @@ if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ "$LIVE_DB_NAME" !=
     # Re-resolve DB_CONTAINER for the live DB_HOST (backup's container
     # name typically refers to the source stack and won't exist here).
     if [ "$IS_DOCKER" = true ]; then
-        if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+        if [ -z "$DB_CONTAINER" ] || ! container_is_running "$DB_CONTAINER"; then
             log_message "Re-resolving DB container for live DB_HOST='$DB_HOST'..."
             if ! detect_docker_database_info; then
                 # Last-resort: try the running-stack heuristic, then prompt.
@@ -2745,7 +3163,7 @@ if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ "$LIVE_DB_NAME" !=
                 fi
             fi
             # Some helpers leave DB_CONTAINER blank; use the heuristic explicitly.
-            if [ -z "$DB_CONTAINER" ] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+            if [ -z "$DB_CONTAINER" ] || ! container_is_running "$DB_CONTAINER"; then
                 resolve_db_container_from_running_stack "$DB_HOST" true || true
             fi
         fi

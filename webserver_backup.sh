@@ -97,6 +97,58 @@ init_log_file() {
     export LOG_FILE
 }
 
+# ---- Shared helpers ----
+# Centralize patterns that were duplicated across backup_config_docker() /
+# backup_config_native() / detect_docker_*() so the size probe, container-
+# running probe, image-regex mapping, and compose-file type detection are
+# written once.
+
+# _dir_size: human-readable size of $1 (path or file). Used by the backup
+# functions to log "Config size:" / "Backup size:" lines.
+_dir_size() {
+    du -sh "$1" | cut -f1
+}
+
+# container_is_running: probe whether a docker container with exact name $1
+# is currently running. Returns 0 if running, 1 otherwise.
+container_is_running() {
+    docker ps --format "table {{.Names}}" 2>/dev/null | grep -qx "$1"
+}
+
+# _webservver_image_regex: case-based regex (grep -E flavour) that matches
+# the canonical image-name fragments for a given webserver type. Empty
+# string when the type is unknown.
+_webservver_image_regex() {
+    case "$1" in
+        apache)         echo "apache|httpd" ;;
+        openlitespeed)  echo "openlitespeed|ols|lsws|litespeed" ;;
+        nginx)          echo "nginx" ;;
+        *)              echo "" ;;
+    esac
+}
+
+# _detect_webservver_type_from_compose_file: scan a docker-compose.yml for
+# image references and pick the most specific webserver type using the
+# priority order openlitespeed > nginx > apache. Echoes the detected type
+# (apache | openlitespeed | nginx) or empty string when no match.
+_detect_webservver_type_from_compose_file() {
+    local compose_file="$1"
+    if grep -qiE "openlitespeed|litespeed|ols|lsws" "$compose_file"; then
+        echo "openlitespeed"
+    elif grep -qiE "nginx" "$compose_file"; then
+        echo "nginx"
+    elif grep -qiE "apache|httpd" "$compose_file"; then
+        echo "apache"
+    else
+        echo ""
+    fi
+}
+
+# Single canonical regex matching ANY webserver image we recognise. Used to
+# decide whether a compose file or running container list "looks like a
+# webserver". Centralised so compose-scan and container-scan stay in sync.
+readonly _WEBSERVER_IMAGE_REGEX='apache|httpd|nginx|openlitespeed|ols|lsws|litespeed'
+
 # Send backup report via email using msmtp
 send_email_notification() {
     local status="$1"   # SUCCESS or FAILED
@@ -351,7 +403,7 @@ detect_docker_environment() {
 
     if [ -n "$compose_file" ]; then
         log_message "Found docker-compose.yml at: $compose_file"
-        if grep -qiE "apache|httpd|nginx|openlitespeed|ols|lsws|litespeed" "$compose_file"; then
+        if grep -qiE "$_WEBSERVER_IMAGE_REGEX" "$compose_file"; then
             IS_DOCKER=true
             DOCKER_COMPOSE_DIR=$(dirname "$compose_file")
             log_message "Detected Docker webserver environment"
@@ -374,7 +426,7 @@ detect_docker_environment() {
                 if [ -f "$d/docker-compose.yml" ] || [ -f "$d/docker-compose.yaml" ]; then
                     local cf="$d/docker-compose.yml"
                     [ -f "$d/docker-compose.yaml" ] && cf="$d/docker-compose.yaml"
-                    if grep -qiE "apache|httpd|nginx|openlitespeed|ols|lsws|litespeed" "$cf"; then
+                    if grep -qiE "$_WEBSERVER_IMAGE_REGEX" "$cf"; then
                         IS_DOCKER=true
                         DOCKER_COMPOSE_DIR="$d"
                         log_message "Detected Docker webserver environment via $cf"
@@ -388,7 +440,7 @@ detect_docker_environment() {
         # Only triggers when -f was NOT supplied (handled above otherwise).
         if command -v docker &> /dev/null; then
             local web_containers=$(docker ps --format "table {{.Image}} {{.Names}}" 2>/dev/null \
-                | grep -iE "apache|httpd|nginx|openlitespeed|ols|lsws|litespeed" || true)
+                | grep -iE "$_WEBSERVER_IMAGE_REGEX" || true)
             if [ -n "$web_containers" ]; then
                 log_message "Found webserver-related Docker containers running"
                 IS_DOCKER=true
@@ -520,16 +572,13 @@ detect_docker_webservver_info() {
     log_message "Analyzing docker-compose.yml for webserver service..."
 
     # Detect image type
-    if grep -qiE "openlitespeed|litespeed|ols|lsws" "$compose_file"; then
-        WEBSERVER_TYPE="openlitespeed"
-    elif grep -qiE "nginx" "$compose_file"; then
-        WEBSERVER_TYPE="nginx"
-    elif grep -qiE "apache|httpd" "$compose_file"; then
-        WEBSERVER_TYPE="apache"
-    else
+    local detected_type
+    detected_type=$(_detect_webservver_type_from_compose_file "$compose_file")
+    if [ -z "$detected_type" ]; then
         log_message "ERROR: Could not detect webserver type in docker-compose.yml"
         return 1
     fi
+    WEBSERVER_TYPE="$detected_type"
 
     log_message "Detected webserver type: $WEBSERVER_TYPE"
 
@@ -659,12 +708,7 @@ detect_docker_webservver_info() {
             # `services:` as a service name.
             local _svc="" _img="" _in_ports=0 _cur_svc=""
             local _type_pat
-            case "$WEBSERVER_TYPE" in
-                apache)         _type_pat="apache|httpd" ;;
-                openlitespeed)  _type_pat="openlitespeed|ols|lsws|litespeed" ;;
-                nginx)          _type_pat="nginx" ;;
-                *)              _type_pat="" ;;
-            esac
+            _type_pat=$(_webservver_image_regex "$WEBSERVER_TYPE")
 
             while IFS= read -r line; do
                 # Skip blank lines and comments.
@@ -736,12 +780,7 @@ detect_docker_webservver_info() {
         #      top-level key that is NOT a reserved key (services:, version:, ...).
         #   3. First such key wins; this is the legacy "first matching service" rule.
         local type_pat
-        case "$WEBSERVER_TYPE" in
-            apache)         type_pat="apache|httpd" ;;
-            openlitespeed)  type_pat="openlitespeed|ols|lsws|litespeed" ;;
-            nginx)          type_pat="nginx" ;;
-            *)              type_pat="" ;;
-        esac
+        type_pat=$(_webservver_image_regex "$WEBSERVER_TYPE")
 
         local image_lns
         if [ -n "$type_pat" ]; then
@@ -861,7 +900,7 @@ backup_config_docker() {
 
     log_message "Creating webserver config backup from Docker container '$container'..."
 
-    if ! docker ps --format "table {{.Names}}" | grep -q "^${container}$"; then
+    if ! container_is_running "$container"; then
         log_message "ERROR: Webserver container '$container' is not running"
         log_message "Please start your Docker containers first"
         return 1
@@ -881,7 +920,7 @@ backup_config_docker() {
             if tar -xf "$temp_dir/config.tar" -C "$temp_dir/files/" 2>/dev/null; then
                 rm -f "$temp_dir/config.tar"
                 log_message "Config copied successfully from container"
-                local size=$(du -sh "$temp_dir/files" | cut -f1)
+                local size=$(_dir_size "$temp_dir/files")
                 log_message "Config size: $size"
                 return 0
             else
@@ -912,7 +951,7 @@ backup_config_native() {
 
     if copy_source_to_dest "$src_dir" "$temp_dir/files/"; then
         log_message "Config copied successfully"
-        local size=$(du -sh "$temp_dir/files" | cut -f1)
+        local size=$(_dir_size "$temp_dir/files")
         log_message "Config size: $size"
         return 0
     else

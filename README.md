@@ -25,6 +25,12 @@ The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, A
 - ✅ **Smart restore**: Automatically detects full vs lightweight backup; refuses to restore lightweight into an empty directory
 - ✅ **Post-restore customization**: Optional URL replacement, site title change, admin user creation — perfect for migrations to new domains
 - ✅ **Ownership restore (chown)**: Restored files are `chown`'d to match the original target's owner (host mode via `--reference=` to the moved-aside safety backup, Docker mode via `docker exec chown` against the webserver type's expected UID:GID). For `webserver_restore.sh`, ownership is mapped per type: Apache → `root:www-data`, Nginx → `root:root`, OpenLiteSpeed → `nobody:nogroup` (so the webserver can read its config after restore). Prevents "Permission denied" on uploads/plugin updates when the web server runs as a non-root UID (e.g. `nobody`, `www-data`, `33`, `1000`)
+- ✅ **Bind-mount safety (auto)**: When a WordPress container has bind mounts layered on the named volume (e.g. `./mytheme/` → `/var/www/html/wp-content/themes/MyTheme`), the restore detects them via `/proc/self/mountinfo` and:
+  - Refuses `rm -rf` on any safety backup that is **under** or **contains** a bind mount destination (prevents `unlinkat` walking into the host directory — see [`issue/issue1.md`](issue/issue1.md))
+  - Hardlink-copies (`cp -al`) non-bind paths into the safety backup instead of `mv`-renaming the parent (so bind mount destinations stay at their original paths)
+  - Re-chowns `wp-config.php` and `.htaccess` after the post-restore `docker cp` patches, skipping if the target is on a bind mount (see [`issue/issue2.md`](issue/issue2.md))
+  - Ignores `0:0` ownership read from a stale `root:root` safety backup and falls back to the docroot owner (`33:33` for official WordPress images)
+  - All of this is automatic and adds no new CLI flags. See [Bind-Mount Safety](#bind-mount-safety) below
 - ✅ **Portable archives**: Backups use `zip -X` to strip the source machine's UID/GID from the archive, so backups can be restored on a fresh host with a different user without inheriting stale ownership
 - ✅ **Root required for restore**: Both `wp_restore.sh` and `webserver_restore.sh` abort with a clear "use sudo" message at startup if not run as root — only root can `chown` to other UIDs, and a non-root restore leaves files un-writable by the web server
 - ✅ **Dry-run mode**: Preview changes before applying them (`--dry-run`)
@@ -152,6 +158,81 @@ The discovery runs **twice** during a normal restore:
 2. **After backup extraction** — once `.dbinfo` has populated `DB_HOST`, the script re-runs discovery and uses the result for the actual `docker exec mysql ...`.
 
 If discovery fails completely (no running containers at all, or none match), you'll get a clear error pointing at `DB_HOST` and asking you to start your containers or pass `-c`.
+
+## Bind-Mount Safety
+
+When a WordPress container's docroot is a named volume layered with one or more bind mounts (very common in dev stacks — e.g. `wordpress_files:/var/www/html` with `./mytheme/` and `./myplugin/` overlaid for live editing), a naive restore can corrupt the bind-mounted host directories. `wp_restore.sh` detects this layout and adjusts its behaviour automatically — **no new flags required**.
+
+### What the script detects
+
+On every restore, the script reads `/proc/self/mountinfo` inside the WP container and records any bind mount whose destination is inside the docroot:
+
+```
+[2026-09-19 17:24:46] Detected 2 bind mount(s) under /var/www/html (live mountinfo; user-managed; will be excluded from chown/cleanup):
+[2026-09-19 17:24:46]   - /var/www/html/wp-content/themes/MyTheme
+[2026-09-19 17:24:46]       source: /home/zongbao/projects/wp-dev-environment/mytheme
+[2026-09-19 17:24:46]   - /var/www/html/wp-content/plugins/MyPlugin
+[2026-09-19 17:24:46]       source: /home/zongbao/projects/wp-dev-environment/myplugin
+```
+
+These destinations (and their host sources) are considered **user-managed** and are excluded from all destructive operations during the restore.
+
+### What the script does differently
+
+| Step | Without bind mounts | With bind mounts |
+|------|--------------------|------------------|
+| `wp-content` safety backup | `mv wp-content wp-content.backup.<ts>` (fast, atomic) | `mkdir wp-content.backup.<ts>` + `cp -al` of every non-bind path under `wp-content` (bind mount destinations stay at their original paths; the live `wp-content/` is not renamed) |
+| Safety backup auto-cleanup after success | `rm -rf` the `.backup.<ts>` dir | Same — but only if the safety backup contains no bind mount destinations (the `cp -al` variant qualifies; a stray `.backup.<ts>` left over from a prior broken run is left in place for manual cleanup) |
+| `chown -R` after restore | Walks the whole `wp-content/` | Walks the whole `wp-content/` but `prune`s the bind mount subtrees (their host files keep the owner's UID/GID; only the mount-point inode inside the container is chown'd to `33:33`) |
+| `wp-config.php` ownership after `docker cp` post-restore patch | Chowns to `33:33` | Chowns to `33:33` — but skips the chown if `wp-config.php` itself is on a bind mount (you manage that file, the script doesn't touch it) |
+| Target UID:GID resolution | Reads from the safety backup's owner | Reads from the safety backup's owner, but **ignores `0:0`** (a stale `root:root` safety backup from a previous broken run is meaningless — falls back to the docroot owner, then `33:33`) |
+
+### Why this matters
+
+The naive behaviour — `mv wp-content wp-content.backup.<ts>` followed later by `rm -rf wp-content.backup.<ts>` — is catastrophic when bind mounts are present:
+
+- The `mv` renames the parent directory, but the Linux kernel tracks bind mounts by **path name**, not inode. After the rename, the bind mount destinations live inside the safety backup (e.g. `wp-content.backup.<ts>/themes/MyTheme`).
+- The eventual `rm -rf` walks **into** the bind mount destinations and unlinks files in the host directory — even though the mount point itself fails with `Device or resource busy`. Host files disappear silently.
+
+The script's bind-mount-aware behaviour keeps `mv`/`rm -rf` strictly outside the user-managed subtrees, so host files are never touched during a restore. This was the root cause documented in [`issue/issue1.md`](issue/issue1.md). The `wp-config.php` ownership after `docker cp` is documented in [`issue/issue2.md`](issue/issue2.md).
+
+### Verification after a restore
+
+You can confirm the bind-mount safety contract held:
+
+```bash
+# Container side — bind mounts at expected paths, ownership correct
+docker exec <wp_container> bash -c '
+  stat -c "%n %U:%G" /var/www/html/wp-config.php \
+    /var/www/html/wp-content/themes/MyTheme \
+    /var/www/html/wp-content/plugins/MyPlugin
+  grep -E "MyTheme|MyPlugin" /proc/self/mountinfo
+  ls -la /var/www/html/ | grep backup || echo "(no orphans)"
+'
+
+# Host side — files preserved
+ls -la /home/zongbao/projects/wp-dev-environment/{mytheme,myplugin}/
+```
+
+Expected:
+
+- `wp-config.php` → `www-data:www-data 33:33`
+- bind mount destinations → still at `wp-content/themes/MyTheme` (not at `.backup.<ts>/themes/MyTheme`), owned by the container's web UID
+- no `.backup.<ts>` orphans left in the docroot
+- host `mytheme/` and `myplugin/` mtimes unchanged from before the restore
+
+### Orphan cleanup if a previous broken run left a `.backup.<ts>` behind
+
+If a previous (pre-fix) restore left `wp-content.backup.<ts>` inside the container with bind mount destinations trapped inside it, the new script will **refuse to remove it** (because doing so would walk into your bind mounts). Clean it up manually:
+
+```bash
+docker compose stop wordpress
+docker run --rm -v <project>_wordpress_files:/mnt nginx:alpine \
+    sh -c 'rm -rf /mnt/wp-content.backup.<ts>'
+docker compose start wordpress
+```
+
+The auxiliary container `nginx:alpine` mounts the same named volume but has no bind mounts of its own, so its `rm -rf` operates on the volume layer only — safely removing the orphan without touching your host directories.
 
 ## Quick Start
 
@@ -785,6 +866,7 @@ crontab -e
 - **Docker backups**: Database dumps and webserver configs are streamed via `docker exec`, so the Docker daemon must be running.
 - **Lightweight safety check**: The restore script refuses to restore a lightweight WordPress backup into an empty directory to prevent a broken WordPress installation.
 - **Existing files**: On WordPress restore, existing files at the target are moved to a timestamped backup folder (not deleted) so you can recover. On webserver restore, the target config directory is renamed with a `.backup.<timestamp>` suffix before being overwritten.
+- **Bind-mounted subtrees under the docroot**: If your WordPress container has bind mounts layered on the named volume (e.g. `./mytheme/` → `/var/www/html/wp-content/themes/MyTheme`), the restore detects them automatically and skips them during `mv` / `rm -rf` / `chown -R` to avoid wiping or chowning your host files. See [Bind-Mount Safety](#bind-mount-safety).
 - **Webserver backup scope**: The webserver backup captures the **configuration** of Apache/OLS/Nginx only. It does not include site content (that's the WordPress backup's job) or TLS certificates, logs, or binary executables. Adjust paths accordingly if you need extras.
 - **Disambiguating the webserver service in compose**: If your `docker-compose.yml` has multiple services whose image matches the same webserver type, add the label `wp-backup: webserver` to the canonical one (or use the shorthand `wp-backup=webserver` in list form). Alternatively set `WEBSERVER_SERVICE=<service-name>` in the environment before running either backup or restore. See [Docker service resolution priority](#webservver_backupsh) for the full detection chain.
 
@@ -835,6 +917,12 @@ FLUSH PRIVILEGES;
 
 ### "Permission denied" on uploads / plugin updates after restore
 The web server runs as a non-root UID (commonly `nobody`, `www-data`, `33`, or `1000` for OpenLiteSpeed) and cannot write files owned by `root`. `wp_restore.sh` runs `chown -R` after every file restore using the original target's UID:GID as the reference, but it requires `sudo` to do so. If you see this error, re-run the restore with `sudo ./wp_restore.sh ...`.
+
+### Host files vanished after restore (or restore refuses to remove `.backup.<ts>`)
+If your WordPress container has bind mounts layered on the docroot (e.g. `./mytheme/` → `/var/www/html/wp-content/themes/MyTheme`) and a restore either wiped your host files or left a `.backup.<ts>` directory in the container that the script refuses to delete, see [Bind-Mount Safety](#bind-mount-safety). Modern versions of `wp_restore.sh` detect bind mounts via `/proc/self/mountinfo` and skip all `rm -rf` / `mv` operations on paths that contain or live under bind mount destinations. For manual cleanup of an orphan left behind by a previous broken run, see [Orphan cleanup if a previous broken run left a `.backup.<ts>` behind](#orphan-cleanup-if-a-previous-broken-run-left-a-backupts-behind).
+
+### `wp-config.php` ends up owned by `root:root` after a restore
+The post-restore `docker cp` of `wp-config.php` always creates files as `root:root` inside the container, which can race against the script's own `chown 33:33` if a bind mount sits on `wp-config.php` (or, in older script versions, simply wasn't chown'd again after the patcher re-`docker cp`'d it). The current `wp_restore.sh` re-chowns `wp-config.php` after the DB-creds patch and the `$table_prefix` patch, and skips the chown when the file lives on a bind mount (you manage that file; the script doesn't touch it). See [Bind-Mount Safety](#bind-mount-safety) and [`issue/issue2.md`](issue/issue2.md) for context.
 
 ### "wp_restore.sh: this script must be run as root (use sudo)" at startup
 `wp_restore.sh` aborts before any heavy work (extraction, `docker cp`, DB import) when the effective UID is non-zero. This is intentional — `chown` to another user's UID is only permitted for UID 0. Re-run with `sudo`:
