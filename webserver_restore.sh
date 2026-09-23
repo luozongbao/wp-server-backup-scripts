@@ -105,6 +105,41 @@ init_log_file() {
     export LOG_FILE
 }
 
+# ---- Shared helpers ----
+# Centralize patterns that were duplicated across restore_files(),
+# verify_post_restore(), detect_webserver_container(), and the
+# container-running probe so each is written once.
+
+# container_is_running: probe whether a docker container with exact name $1
+# is currently running. Returns 0 if running, 1 otherwise. Mirrors the
+# same helper in webserver_backup.sh.
+container_is_running() {
+    docker ps --format "table {{.Names}}" 2>/dev/null | grep -qx "$1"
+}
+
+# split_container_path: split a "container:path" target into its two
+# halves. Sets the variables whose names are passed as $2 (container)
+# and $3 (path) in the caller's scope via printf -v, so callers can
+# declare `local container path` and read them directly.
+# Returns 0 on success, 1 when $1 does not contain a ":".
+split_container_path() {
+    local target="$1"
+    if [[ "$target" != *:* ]]; then
+        return 1
+    fi
+    local _container="${target%%:*}"
+    local _inpath="${target#*:}"
+    printf -v "$2" '%s' "$_container"
+    printf -v "$3" '%s' "$_inpath"
+    return 0
+}
+
+# Single canonical regex matching ANY webserver image we recognise. Used
+# by detect_webserver_container() to decide whether a compose file or
+# running container list "looks like a webserver". Centralised so the
+# compose-scan and container-scan stay in sync with webserver_backup.sh.
+readonly _WEBSERVER_IMAGE_REGEX='apache|httpd|nginx|openlitespeed|ols|lsws|litespeed'
+
 # (Email notification removed in this version: restore is an interactive operation.
 #  Logs stream to the terminal; the user is expected to be present.
 #  Use webserver_backup.sh -e EMAIL if you need emailed backup reports.)
@@ -201,7 +236,7 @@ detect_webserver_container() {
         if command -v docker &> /dev/null; then
             local c
             c=$(docker ps --format "{{.Names}} {{.Image}}" 2>/dev/null \
-                | grep -iE "apache|httpd|nginx|openlitespeed|ols|lsws|litespeed" \
+                | grep -iE "$_WEBSERVER_IMAGE_REGEX" \
                 | head -1 | awk '{print $1}')
             echo "$c"
             return 0
@@ -245,7 +280,7 @@ detect_webserver_container() {
         ' "$compose_file" 2>/dev/null)
 
         if [ -z "$service_name" ]; then
-            service_name=$(grep -B1 -iE "image:.*(apache|httpd|nginx|openlitespeed|ols|lsws|litespeed)" "$compose_file" \
+            service_name=$(grep -B1 -iE "image:.*(${_WEBSERVER_IMAGE_REGEX})" "$compose_file" \
                 | grep -oE "^  [A-Za-z0-9_.-]+:" | head -1 | sed 's/^  //; s/:$//')
         fi
         [ -n "$service_name" ] && pick_reason="image-name fallback"
@@ -335,7 +370,7 @@ _webservver_process_names() {
 }
 
 # Map a webserver type to image substrings used to detect docker container image
-_webservver_image_patterns() {
+_webservver_image_regex() {
     case "$1" in
         apache) echo "apache|httpd" ;;
         openlitespeed) echo "openlitespeed|ols|lsws|litespeed" ;;
@@ -433,7 +468,7 @@ _docker_container_webserver_type() {
 
     local t pat
     for t in apache nginx openlitespeed; do
-        pat=$(_webservver_image_patterns "$t")
+        pat=$(_webservver_image_regex "$t")
         if echo "$image" | grep -qiE "$pat"; then
             echo "$t"
             return 0
@@ -541,8 +576,11 @@ restore_files() {
         if [ "$kind" = "host" ]; then
             log_message "[DRY-RUN] Would copy contents of $src_dir -> $dest"
         else
-            local container="${dest%%:*}"
-            local inpath="${dest#*:}"
+            local container inpath
+            if ! split_container_path "$dest" container inpath; then
+                log_message "ERROR: Invalid target '$dest' (expected 'container:/in/container/path')"
+                return 1
+            fi
             log_message "[DRY-RUN] Would copy contents of $src_dir -> container $container:$inpath"
         fi
         return 0
@@ -619,8 +657,11 @@ restore_files() {
     fi
 
     # Container restore: tar | docker exec tar
-    local container="${dest%%:*}"
-    local inpath="${dest#*:}"
+    local container inpath
+    if ! split_container_path "$dest" container inpath; then
+        log_message "ERROR: Invalid target '$dest' (expected 'container:/in/container/path')"
+        return 1
+    fi
 
     # Ensure parent dir exists
     docker exec "$container" mkdir -p "$(dirname "$inpath")" >/dev/null 2>&1 || true
@@ -665,8 +706,11 @@ verify_post_restore() {
     if [ "$kind" = "host" ]; then
         check_path="$target"
     else
-        local container="${target%%:*}"
-        local inpath="${target#*:}"
+        local container inpath
+        if ! split_container_path "$target" container inpath; then
+            log_message "WARNING: Invalid target '$target' (expected 'container:/in/container/path')"
+            return 1
+        fi
         if ! check_path=$(docker exec "$container" sh -c "test -d '$inpath' && echo '$inpath' || true"); then
             check_path=""
         fi
@@ -1038,7 +1082,7 @@ if [ "$IS_DOCKER" = true ]; then
     fi
 
     # Verify container is running
-    if ! docker ps --format "table {{.Names}}" | grep -q "^${WEBSERVER_CONTAINER}$"; then
+    if ! container_is_running "$WEBSERVER_CONTAINER"; then
         log_message "ERROR: Webserver container '$WEBSERVER_CONTAINER' is not running"
         exit 1
     fi
