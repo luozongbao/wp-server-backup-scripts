@@ -86,6 +86,78 @@ init_log_file() {
     export LOG_FILE
 }
 
+# ---- Shared helpers ----
+# Most of these exist to centralize patterns that were duplicated across
+# backup_database_docker() / backup_database_native() / check_dependencies() /
+# backup_files*() so the dump path, password handling, and a docker
+# container-running probe are written once.
+
+# db_dump_client_binary: return "mariadb-dump" or "mysqldump" based on $DB_TYPE.
+# Default to mysqldump when DB_TYPE is empty/unset (matches detect_native_database_service fallback).
+db_dump_client_binary() {
+    if [ "${DB_TYPE:-}" = "mariadb" ]; then
+        echo "mariadb-dump"
+    else
+        echo "mysqldump"
+    fi
+}
+
+# db_password_arg: return "-p<password>" for mysqldump/mariadb-dump, or empty when
+# no password is set. Empty-password semantics match the original inline code
+# (which guarded the -p<pass> concat on -n "$DB_PASSWORD").
+db_password_arg() {
+    local pass="$1"
+    if [ -n "$pass" ]; then
+        echo "-p${pass}"
+    fi
+}
+
+# container_is_running: returns 0 if a Docker container with the given name is
+# currently running (matches running=True in docker inspect). Returns non-zero
+# on missing/stopped container. Wraps the inline `docker ps --format ... |
+# grep -qx "$name"` checks scattered across the script.
+container_is_running() {
+    local name="$1"
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+}
+
+# _execute_db_dump: run a database dump command (already shaped for docker-exec
+# or native), capture its stdout to $output_file, and validate the result the
+# same way the original backup_database_docker/native did:
+#   - On dump success: log size + return 0
+#   - On dump failure: log ERROR + return 1
+#   - On empty output:  log "ERROR: Database backup file is empty" + return 1
+# Mirrors the structure of wp_restore.sh's _execute_db_import.
+_execute_db_dump() {
+    local dump_cmd="$1"
+    local output_file="$2"
+    local label="$3"      # "Docker" or "native mysql"/"native mariadb"
+    local fail_hint="$4"  # second-line hint on failure (matches originals' second-line logs)
+
+    if eval "$dump_cmd" > "$output_file" 2>/dev/null; then
+        log_message "Database backup created successfully: $output_file"
+        if [ -s "$output_file" ]; then
+            local backup_size
+            backup_size=$(du -h "$output_file" | cut -f1)
+            log_message "Database backup size: $backup_size"
+            return 0
+        else
+            log_message "ERROR: Database backup file is empty"
+            return 1
+        fi
+    else
+        log_message "ERROR: Failed to create database backup using $label"
+        log_message "$fail_hint"
+        return 1
+    fi
+}
+
+# _dir_size: a tiny wrapper around `du -sh <path> | cut -f1`. Returns the
+# human-readable size of <path> on stdout, or "0" if du is unavailable.
+_dir_size() {
+    du -sh "$1" 2>/dev/null | cut -f1
+}
+
 # Send backup report via email using msmtp
 send_email_notification() {
     local status="$1"   # SUCCESS or FAILED
@@ -171,14 +243,10 @@ check_dependencies() {
         fi
     else
         # Check for native database dump tools
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            if ! command -v mariadb-dump &> /dev/null; then
-                missing_tools+=("mariadb-dump")
-            fi
-        else
-            if ! command -v mysqldump &> /dev/null; then
-                missing_tools+=("mysqldump")
-            fi
+        local dump_bin
+        dump_bin=$(db_dump_client_binary)
+        if ! command -v "$dump_bin" &> /dev/null; then
+            missing_tools+=("$dump_bin")
         fi
     fi
     
@@ -428,17 +496,6 @@ extract_db_config_from_container() {
     return 0
 }
 
-# Function to read a file from inside a running container (used in container-direct mode)
-read_file_from_container() {
-    local container="$1"
-    local path="$2"
-
-    if ! docker exec "$container" test -f "$path" 2>/dev/null; then
-        return 1
-    fi
-    docker exec "$container" cat "$path" 2>/dev/null
-}
-
 # Function to validate that the WP container exists and is running, and copy
 # wp-config.php to a temp path so the rest of the script can extract DB info
 # uniformly from a file.
@@ -612,7 +669,8 @@ backup_files_from_container() {
 
         # Marker file so restore script knows this is lightweight
         echo "lightweight" > "$temp_dir/files/.backup_mode"
-        local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+        local files_size
+        files_size=$(_dir_size "$temp_dir/files")
         log_message "Lightweight backup size: $files_size"
         return 0
     else
@@ -629,7 +687,8 @@ backup_files_from_container() {
                 log_message "WARNING: Failed to refresh wp-config.php from container"
             fi
             log_message "WordPress files pulled from container successfully"
-            local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+            local files_size
+            files_size=$(_dir_size "$temp_dir/files")
             log_message "WordPress files size: $files_size"
             return 0
         else
@@ -642,91 +701,32 @@ backup_files_from_container() {
 # Function to create database backup (Docker)
 backup_database_docker() {
     local output_file="$1"
-    
+
     log_message "Creating database backup using Docker..."
-    
+
     # Check if container is running
-    if ! docker ps --format "table {{.Names}}" | grep -q "^${DB_CONTAINER}$"; then
+    if ! container_is_running "$DB_CONTAINER"; then
         log_message "ERROR: Database container '$DB_CONTAINER' is not running"
         log_message "Please start your Docker containers first"
         return 1
     fi
-    
-    # Create database dump command for Docker
-    local docker_dump_cmd=""
-
-    if [ "$DB_TYPE" = "mariadb" ]; then
-        docker_dump_cmd="docker exec $DB_CONTAINER mariadb-dump -u$DB_USER"
-    else
-        docker_dump_cmd="docker exec $DB_CONTAINER mysqldump -u$DB_USER"
-    fi
-
-    if [ -n "$DB_PASSWORD" ]; then
-        docker_dump_cmd="$docker_dump_cmd -p$DB_PASSWORD"
-    fi
 
     # MySQL 8 needs --no-tablespaces for non-root users (PROCESS privilege).
     # Safe for MariaDB as well — ignored if the server doesn't recognize it.
-    docker_dump_cmd="$docker_dump_cmd --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
-    
-    # Execute database dump
-    if eval "$docker_dump_cmd" > "$output_file" 2>/dev/null; then
-        log_message "Database backup created successfully: $output_file"
-        
-        # Check if backup file has content
-        if [ -s "$output_file" ]; then
-            local backup_size=$(du -h "$output_file" | cut -f1)
-            log_message "Database backup size: $backup_size"
-            return 0
-        else
-            log_message "ERROR: Database backup file is empty"
-            return 1
-        fi
-    else
-        log_message "ERROR: Failed to create database backup using Docker"
-        log_message "Please check database credentials and container status"
-        return 1
-    fi
+    local docker_dump_cmd="docker exec $DB_CONTAINER $(db_dump_client_binary) -u$DB_USER $(db_password_arg "$DB_PASSWORD") --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
+
+    _execute_db_dump "$docker_dump_cmd" "$output_file" "Docker" "Please check database credentials and container status"
 }
 
 # Function to create database backup (Native)
 backup_database_native() {
     local output_file="$1"
-    
-    log_message "Creating database backup using native $DB_TYPE..."
-    
-    # Create database dump command based on service type
-    local dump_cmd=""
-    if [ "$DB_TYPE" = "mariadb" ]; then
-        dump_cmd="mariadb-dump -h$DB_HOST -u$DB_USER"
-    else
-        dump_cmd="mysqldump -h$DB_HOST -u$DB_USER"
-    fi
-    
-    if [ -n "$DB_PASSWORD" ]; then
-        dump_cmd="$dump_cmd -p$DB_PASSWORD"
-    fi
 
-    dump_cmd="$dump_cmd --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
-    
-    # Execute database dump
-    if eval "$dump_cmd" > "$output_file" 2>/dev/null; then
-        log_message "Database backup created successfully: $output_file"
-        
-        # Check if backup file has content
-        if [ -s "$output_file" ]; then
-            local backup_size=$(du -h "$output_file" | cut -f1)
-            log_message "Database backup size: $backup_size"
-            return 0
-        else
-            log_message "ERROR: Database backup file is empty"
-            return 1
-        fi
-    else
-        log_message "ERROR: Failed to create database backup using native $DB_TYPE"
-        log_message "Please check database credentials and service availability"
-        return 1
-    fi
+    log_message "Creating database backup using native $DB_TYPE..."
+
+    local dump_cmd="$(db_dump_client_binary) -h$DB_HOST -u$DB_USER $(db_password_arg "$DB_PASSWORD") --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
+
+    _execute_db_dump "$dump_cmd" "$output_file" "native $DB_TYPE" "Please check database credentials and service availability"
 }
 
 # Function to create files backup
@@ -773,20 +773,22 @@ backup_files() {
         
         # Create a marker file so restore script knows this is lightweight
         echo "lightweight" > "$temp_dir/files/.backup_mode"
-        
+
         # Calculate files backup size
-        local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+        local files_size
+        files_size=$(_dir_size "$temp_dir/files")
         log_message "Lightweight backup size: $files_size"
         return 0
     else
         log_message "Creating full files backup..."
-        
+
         # Copy entire WordPress directory
         if cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null; then
             log_message "WordPress files copied successfully"
-            
+
             # Calculate files backup size
-            local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+            local files_size
+            files_size=$(_dir_size "$temp_dir/files")
             log_message "WordPress files size: $files_size"
             return 0
         else
