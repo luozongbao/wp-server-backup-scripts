@@ -920,7 +920,7 @@ if [ -z "$EMAIL_FROM" ]; then
             # Grep for an exact EMAIL_FROM= line; ignore comments and blanks.
             _env_value=$(grep -E '^[[:space:]]*EMAIL_FROM[[:space:]]*=' "$_env_path" \
                 | tail -n 1 \
-                | sed -E 's/^[[:space:]]*EMAIL_FROM[[:space:]]*=[[:space:]]*//' \
+                | sed -E 's/^[[:space:]]*EMAIL_FROM[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//' \
                 | sed -E 's/^["'\''](.*)["'\'']$/\1/')
             if [ -n "$_env_value" ]; then
                 EMAIL_FROM="$_env_value"
