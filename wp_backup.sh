@@ -15,7 +15,8 @@ DB_DUMP_CMD=""
 IS_DOCKER=false
 LIGHTWEIGHT=false
 EMAIL_TO=""
-EMAIL_FROM="admin@companydomain.com"
+EMAIL_FROM=""
+ENV_FILE=""
 # Container-direct mode: backup from a running WordPress Docker container
 # without requiring a host bind mount. Use when WordPress files live only
 # inside a Docker container (named volume) and no folder is mapped to host.
@@ -28,8 +29,8 @@ show_help() {
     echo "================================"
     echo ""
     echo "Usage:"
-    echo "  Host path:   $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-h]"
-    echo "  Container:   $0 -c WP_CONTAINER   [-o OUTPUT_DIR] [-l] [-e EMAIL] [-d DOCROOT] [-h]"
+    echo "  Host path:   $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-f FROM] [-v ENV_FILE] [-h]"
+    echo "  Container:   $0 -c WP_CONTAINER   [-o OUTPUT_DIR] [-l] [-e EMAIL] [-f FROM] [-d DOCROOT] [-v ENV_FILE] [-h]"
     echo ""
     echo "Options:"
     echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory on the host"
@@ -44,6 +45,11 @@ show_help() {
     echo "  -l                   Lightweight mode: backup only wp-content, wp-config.php,"
     echo "                       and .htaccess (optional, default: full backup)"
     echo "  -e EMAIL             Send backup report to this email address (optional)"
+    echo "  -f FROM              Sender email address used in the From: header (optional)."
+    echo "                       Highest priority; falls back to EMAIL_FROM in the .env file."
+    echo "  -v ENV_FILE          Path to a .env file to load EMAIL_FROM from when -f"
+    echo "                       is not provided (optional, default: ./<scriptname>.env,"
+    echo "                       then /etc/wp-server-backup-script.env)"
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
@@ -172,6 +178,14 @@ send_email_notification() {
     if ! command -v msmtp &> /dev/null; then
         log_message "WARNING: msmtp not installed, skipping email notification"
         return 1
+    fi
+
+    if [ -z "$EMAIL_FROM" ]; then
+        # No explicit From: configured. msmtp's 'default' account may still
+        # supply one (via its 'from' line); we fall back to the placeholder
+        # so the message body parses, but warn the operator clearly.
+        log_message "WARNING: EMAIL_FROM is not set (-f, --from, or .env). Using placeholder; configure it to match the msmtp 'from' line."
+        EMAIL_FROM="noreply@localhost"
     fi
 
     local subject_prefix="[WordPress Backup]"
@@ -799,7 +813,49 @@ backup_files() {
 }
 
 # Parse command line arguments
-while getopts "w:c:d:o:le:h" opt; do
+# Supports short options (getopts) and a small set of GNU-style long options
+# for the flags that benefit from them (--from, --variable).
+#
+# bash's built-in getopts does not handle long options reliably, so we
+# pre-normalize the supported long forms into short ones before getopts runs.
+_NEW_ARGS=()
+_end_options=false
+for _arg in "$@"; do
+    if [ "$_end_options" = true ] || [ "$_arg" = "--" ]; then
+        _NEW_ARGS+=("$_arg")
+        _end_options=true
+        continue
+    fi
+    case "$_arg" in
+        --from=*)
+            _NEW_ARGS+=("-f" "${_arg#--from=}")
+            ;;
+        --from)
+            _NEW_ARGS+=("-f")
+            ;;
+        --variable=*)
+            _NEW_ARGS+=("-v" "${_arg#--variable=}")
+            ;;
+        --variable)
+            _NEW_ARGS+=("-v")
+            ;;
+        --help)
+            _NEW_ARGS+=("-h")
+            ;;
+        --*)
+            echo "Invalid long option: $_arg" >&2
+            show_help
+            exit 1
+            ;;
+        *)
+            _NEW_ARGS+=("$_arg")
+            ;;
+    esac
+done
+# Reset OPTIND so getopts reprocesses from the beginning with the rewritten args.
+OPTIND=1
+set -- "${_NEW_ARGS[@]}"
+while getopts "w:c:d:o:le:f:v:h" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
@@ -819,6 +875,12 @@ while getopts "w:c:d:o:le:h" opt; do
         e)
             EMAIL_TO="$OPTARG"
             ;;
+        f)
+            EMAIL_FROM="$OPTARG"
+            ;;
+        v)
+            ENV_FILE="$OPTARG"
+            ;;
         h)
             SHOW_HELP=true
             ;;
@@ -834,6 +896,41 @@ while getopts "w:c:d:o:le:h" opt; do
             ;;
     esac
 done
+unset _NEW_ARGS _arg
+
+# Resolve EMAIL_FROM with the following priority:
+#   1. -f / --from on the command line (highest priority, already set above)
+#   2. .env file, in this order:
+#        a. the path given by -v / --variable (if any)
+#        b. ./wp_backup.env (script-named file in current directory)
+#        c. /etc/wp-server-backup-script.env (system-wide fallback)
+#   If none of these provide a value, EMAIL_FROM stays empty and the
+#   send_email_notification() function will skip notification (or fall back
+#   to the From: address configured in the msmtp 'default' account).
+if [ -z "$EMAIL_FROM" ]; then
+    _env_candidates=()
+    if [ -n "$ENV_FILE" ]; then
+        _env_candidates+=("$ENV_FILE")
+    fi
+    _env_candidates+=("./wp_backup.env")
+    _env_candidates+=("/etc/wp-server-backup-script.env")
+
+    for _env_path in "${_env_candidates[@]}"; do
+        if [ -f "$_env_path" ] && [ -r "$_env_path" ]; then
+            # Grep for an exact EMAIL_FROM= line; ignore comments and blanks.
+            _env_value=$(grep -E '^[[:space:]]*EMAIL_FROM[[:space:]]*=' "$_env_path" \
+                | tail -n 1 \
+                | sed -E 's/^[[:space:]]*EMAIL_FROM[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//' \
+                | sed -E 's/^["'\''](.*)["'\'']$/\1/')
+            if [ -n "$_env_value" ]; then
+                EMAIL_FROM="$_env_value"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Loaded EMAIL_FROM from: $_env_path"
+                break
+            fi
+        fi
+    done
+    unset _env_candidates _env_path _env_value
+fi
 
 # Show help if requested
 if [ "$SHOW_HELP" = true ]; then
