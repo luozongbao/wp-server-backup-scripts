@@ -35,7 +35,7 @@ The `wp_*` scripts work on **any web server** that serves WordPress — Nginx, A
 - ✅ **Root required for restore**: Both `wp_restore.sh` and `webserver_restore.sh` abort with a clear "use sudo" message at startup if not run as root — only root can `chown` to other UIDs, and a non-root restore leaves files un-writable by the web server
 - ✅ **Dry-run mode**: Preview changes before applying them (`--dry-run`)
 - ✅ **Integrity verification**: Backup is verified after creation
-- ✅ **Email notifications**: Optional backup report via `msmtp` (`-e email`)
+- ✅ **Email notifications**: Optional backup report via `msmtp` (`-e email`, configurable `-f`/`--from` sender)
 - ✅ **Timestamped output**: `YYYYMMDD_HHMMSS_foldername[_lightweight].zip`
 - ✅ **Safe recovery**: Existing target files are backed up before overwrite
 - ✅ **Webserver config backup**: Companion scripts back up Apache, OpenLiteSpeed, or Nginx configuration (host or Docker container)
@@ -306,6 +306,8 @@ The auxiliary container `nginx:alpine` mounts the same named volume but has no b
 - `-o OUTPUT_DIR`: Backup output directory (optional, default: current directory)
 - `-l`: Lightweight mode (backup only `wp-content`, `wp-config.php`, `.htaccess`)
 - `-e EMAIL`: Send backup report to this email address (optional, requires `msmtp`)
+- `-f FROM` / `--from=FROM`: Sender email address for the `From:` header (optional; highest priority — overrides the `.env` file)
+- `-v ENV_FILE` / `--variable=ENV_FILE`: Path to a `.env` file to read `EMAIL_FROM` from (default: `./wp_backup.env`, then `/etc/wp-server-backup-script.env`)
 - `-h`: Show help message
 
 **Examples**:
@@ -316,8 +318,16 @@ The auxiliary container `nginx:alpine` mounts the same named volume but has no b
 # Lightweight backup (host path)
 ./wp_backup.sh -w /var/www/html/wordpress -l -o /backups
 
-# Backup with email notification
+# Backup with email notification (sender comes from ./wp_backup.env)
 ./wp_backup.sh -w /var/www/html/wordpress -o /backups -e admin@example.com
+
+# Backup with explicit From: address (overrides .env)
+./wp_backup.sh -w /var/www/html/wordpress -o /backups \
+    -e admin@example.com -f backup-server@example.com
+
+# Use a custom .env file path
+./wp_backup.sh -w /var/www/html/wordpress -o /backups \
+    -e admin@example.com -v /etc/my-backup.env
 
 # Container-direct: WP runs in Docker with no host folder mapping
 ./wp_backup.sh -c my-project-wordpress-app -o /backups
@@ -327,6 +337,27 @@ The auxiliary container `nginx:alpine` mounts the same named volume but has no b
 ### Email Notifications
 
 Use `-e EMAIL` to receive a backup report after the run. The script uses `msmtp` (with the `default` account) to send mail.
+
+#### Sender address (`EMAIL_FROM`) — priority order
+
+The `From:` header is resolved in this order (first match wins):
+
+1. **`-f FROM` / `--from=FROM` on the command line** — highest priority. Useful for one-off runs and overrides.
+2. **`EMAIL_FROM=` in a `.env` file**, searched in:
+   1. The path passed to `-v ENV_FILE` / `--variable=ENV_FILE` (if any)
+   2. `./wp_backup.env` (script-named file in the current directory)
+   3. `/etc/wp-server-backup-script.env` (system-wide fallback for shared hosts)
+3. **The `from` line in the `default` account of `~/.msmtprc` / `/etc/msmtprc`** — only if neither of the above is set. The script logs a `WARNING` in this case so the value mismatch (which often fails SPF/DKIM) is visible.
+
+The `.env` file is parsed line-by-line; comments (`#`) and blank lines are ignored, surrounding whitespace and either single or double quotes around the value are stripped. Example:
+
+```ini
+# ./wp_backup.env
+EMAIL_FROM="backup-server@example.com"
+# EMAIL_FROM=other@example.com   ← commented, ignored
+```
+
+If neither the flag nor the `.env` chain provides a value, the script sends the email anyway (msmtp will fill in `from` from its config) but logs `WARNING: EMAIL_FROM is not set`.
 
 **Install msmtp** (Debian/Ubuntu):
 ```bash
@@ -348,6 +379,8 @@ from           server@example.com
 user           server@example.com
 password       your-app-password
 ```
+
+> 💡 The `from` line in your msmtp `default` account **must match** the address you pass via `-f` / `--from` / `.env`. Otherwise the receiving SMTP server will reject the mail (SPF/DKIM failure) or mark it as spam.
 
 The email contains:
 - Status indicator (✅ SUCCESS or ❌ FAILED) and exit code
