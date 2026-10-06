@@ -819,7 +819,13 @@ backup_files() {
 # bash's built-in getopts does not handle long options reliably, so we
 # pre-normalize the supported long forms into short ones before getopts runs.
 _NEW_ARGS=()
+_end_options=false
 for _arg in "$@"; do
+    if [ "$_end_options" = true ] || [ "$_arg" = "--" ]; then
+        _NEW_ARGS+=("$_arg")
+        _end_options=true
+        continue
+    fi
     case "$_arg" in
         --from=*)
             _NEW_ARGS+=("-f" "${_arg#--from=}")
