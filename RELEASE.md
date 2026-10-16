@@ -21,6 +21,100 @@ add new features; major releases introduce breaking changes.
 
 ---
 
+## v.1.1.1 — Backup DB Container & Docroot Resolution Hardening
+
+**Tag:** `v.1.1.1`
+**Date:** 2026-10-17
+
+This patch release fixes two long-standing breakages in `wp_backup.sh` that
+surfaced on the litespeedtech/openlitespeed reference stack but apply to **any**
+Docker Compose project that parameterises `container_name:` or runs WordPress
+under a non-`/var/www/html` docroot. Root cause and reproduction are documented
+in [`docs/issues/issue003.md`](docs/issues/issue003.md).
+
+1. **`wp_backup.sh` `-w` mode** — `detect_docker_database_info()` no longer
+   stores the literal `${COMPOSE_PROJECT_NAME:-wp_ols}_db` placeholder as
+   `DB_CONTAINER`. It now applies the same **5-step fallback chain** that
+   `wp_restore.sh` already uses (`resolve_db_container_from_running_stack()`):
+   exact match → compose project prefix (`<project>-<svc>-1` and
+   `<project>-<svc>`) → shared Docker network with the WP container → last-resort
+   mariadb/mysql image match. The resolver logic is hoisted into a shared
+   helper so the two scripts can no longer drift apart.
+2. **`wp_backup.sh` `-c` mode** — `prepare_container_direct_mode()` no longer
+   hard-fails when the default docroot `/var/www/html` is empty. It now probes
+   the container's `WP_PATH` env var (set by `litespeedtech/openlitespeed` and
+   similar images) and a small list of common alternative paths
+   (`/var/www/vhosts/localhost/html`, `/var/www/vhosts/${HOSTNAME}/html`)
+   before giving up. The error message lists every path that was tried so the
+   user can pass `-d <path>` with confidence.
+
+### Added
+
+**Shared `resolve_db_container()` helper** (`wp_backup.sh`, `wp_restore.sh`).
+
+The 5-step DB container discovery logic that already lived in
+`wp_restore.sh::resolve_db_container_from_running_stack()` is hoisted into a
+shared helper and reused by `wp_backup.sh`. Both scripts now use **exactly the
+same algorithm** to translate `DB_HOST=database` (a compose service name) into
+the real running container (e.g. `ols_db`). Removing the duplication also
+guarantees that cross-stack backup/restore pairs will agree on which container
+to talk to.
+
+**Auto docroot discovery in `-c` mode** (`wp_backup.sh`).
+
+`prepare_container_direct_mode()` now reads the container's `WP_PATH` env var
+(probe order: `WP_PATH` → `/var/www/html` → `/var/www/vhosts/localhost/html`
+→ `/var/www/vhosts/${HOSTNAME}/html`) before aborting. If a `wp-config.php` is
+found at one of these paths, `WP_CONTAINER_DOCROOT` is updated to match and
+the chosen path is logged. The fallback list covers every common WP-in-container
+image in active use today; the error message lists every path that was tried
+when the probe fails, so the user always knows what to pass via `-d`.
+
+**`docs/issues/issue003.md`** — new issue file documenting both bugs and the
+fix rationale. Existing pointer links from the README to `issue/issue1.md` and
+`issue/issue2.md` are updated to the new canonical location `docs/issues/`.
+
+### Fixed
+
+**`wp_backup.sh` — `DB_CONTAINER` stored as a literal `${VAR:-default}_db` placeholder** (Failure A in [`docs/issues/issue003.md`](docs/issues/issue003.md))
+
+Previously `detect_docker_database_info()` parsed `docker-compose.yml` as text
+and stored the literal line `${COMPOSE_PROJECT_NAME:-wp_ols}_db` into
+`DB_CONTAINER`. Because the shell executing the backup script does not have
+`COMPOSE_PROJECT_NAME` exported (only the shell that ran `docker compose up`
+does), `docker exec $DB_CONTAINER …` reported *"No such container"* and the
+backup died before the database was dumped — even though `DB_HOST=database`
+had been correctly extracted from `wp-config.php` and the DB was reachable on
+the in-network service alias.
+
+The fix replaces the text parser with the 5-step `resolve_db_container()`
+chain (see Added above). For the reference stack
+(`COMPOSE_PROJECT_NAME=ols`, `DB_HOST=database`), the resolver returns
+`ols_db` on the first compose-prefix probe. Verified working against
+`~/projects/docker-wordpress-openlitespeed/` — the backup now completes
+without any environment preconditions.
+
+**`wp_backup.sh` — `-c` mode hard-fails on default `/var/www/html` docroot** (Failure B in [`docs/issues/issue003.md`](docs/issues/issue003.md))
+
+Previously `WP_CONTAINER_DOCROOT` defaulted to `/var/www/html` (the official
+WordPress image's path). On `litespeedtech/openlitespeed`, WordPress lives at
+`/var/www/vhosts/localhost/html` (configurable via the `WP_PATH` env var),
+so `docker exec test -f /var/www/html/wp-config.php` returned non-zero and
+`prepare_container_direct_mode()` aborted with the misleading message
+`ERROR: wp-config.php not found at /var/www/html/wp-config.php inside
+container 'ols_app'`.
+
+The fix adds the `WP_PATH` + common-path probe (see Added above) and improves
+the error message when none of the probes succeed so the user knows what to
+pass via `-d`. Verified working — `./wp_backup.sh -c ols_app -o ~/backups/`
+now completes without `-d` on the OLS image; `-d` remains available for
+custom docroot layouts.
+
+### Removed
+- (none)
+
+---
+
 ## v.1.1.0 — Ownership Restore & Service Detection Hardening
 
 **Tag:** `v.1.1.0`
