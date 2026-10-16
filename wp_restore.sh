@@ -5,6 +5,13 @@
 # Auto-detects Docker or native database services
 # Usage: ./wp_restore.sh -b /path/to/backup.zip -w /path/to/wordpress
 
+# Source shared Docker container-resolution helpers (DB container discovery
+# chain + auto docroot detection for -c mode). See
+# lib/container_resolution.sh for the contract. Imported here so wp_backup.sh
+# and wp_restore.sh share the same helpers — see issue003.md.
+# shellcheck source=lib/container_resolution.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/container_resolution.sh"
+
 # Default values
 BACKUP_FILE=""
 WORDPRESS_DIR=""
@@ -355,119 +362,6 @@ detect_docker_environment() {
     
     log_message "No Docker environment detected, using native database services"
     IS_DOCKER=false
-    return 1
-}
-
-# Function to find a running DB container by reading wp-config.php's DB_HOST.
-# WordPress Docker stacks normally set DB_HOST to the compose service name
-# (e.g. "db"), and docker-compose prefixes container names with the project
-# name (e.g. "<project>-db-1" or "<project>-db"). We try several strategies
-# so we can connect to whatever DB is actually running for this stack,
-# even if the compose file lives outside WORDPRESS_DIR.
-#
-# Strategy order:
-#   1. Exact match: a running container literally named "$DB_HOST"
-#   2. Compose v2: "<project>-<service>-1" (suffix "-1")
-#   3. Compose v2: "<project>-<service>" (no suffix)
-#   4. DB container reachable from a known WP container via shared network
-#   5. Any running container whose image is mariadb/mysql
-#
-# Sets DB_CONTAINER on success, leaves it untouched on failure.
-resolve_db_container_from_running_stack() {
-    local db_host="${1:-}"
-    [ -z "$db_host" ] && return 1
-    # Strip optional port (e.g. "db:3306" -> "db")
-    local svc="${db_host%%:*}"
-    [ -z "$svc" ] && return 1
-
-    # Skip obvious non-container hosts
-    case "$svc" in
-        localhost|127.0.0.1|0.0.0.0|::1) return 1 ;;
-    esac
-
-    if ! command -v docker &>/dev/null; then
-        return 1
-    fi
-
-    local running
-    running=$(docker ps --format '{{.Names}}' 2>/dev/null) || return 1
-    [ -z "$running" ] && return 1
-
-    # 1. Exact match
-    if echo "$running" | grep -qx "$svc"; then
-        DB_CONTAINER="$svc"
-        log_message "Resolved DB container (exact name): $DB_CONTAINER"
-        return 0
-    fi
-
-    # 2/3. Compose project prefixes — derive project name from any running
-    # WordPress container on the host so we don't guess wrong.
-    local project=""
-    if [ -n "$WP_CONTAINER" ]; then
-        # WP container was supplied via -c: "<project>-<service>-N" or
-        # "<project>-<service>". Strip trailing "-<digits>" then the service.
-        local base="${WP_CONTAINER%-[0-9]*}"
-        if [ "$base" != "$WP_CONTAINER" ]; then
-            project="${base%-*}"
-        else
-            project="${WP_CONTAINER%-*}"
-        fi
-    fi
-    if [ -z "$project" ]; then
-        # Try a WordPress container discovered from the running list
-        local wp_candidate
-        wp_candidate=$(echo "$running" | grep -E "(wordpress|wp)$|-wordpress-[0-9]+$|-wp-[0-9]+$" | head -1)
-        if [ -n "$wp_candidate" ]; then
-            local base="${wp_candidate%-[0-9]*}"
-            project="${base%-*}"
-        fi
-    fi
-    if [ -n "$project" ]; then
-        for cand in "${project}-${svc}-1" "${project}-${svc}"; do
-            if echo "$running" | grep -qx "$cand"; then
-                DB_CONTAINER="$cand"
-                log_message "Resolved DB container (compose project '$project'): $DB_CONTAINER"
-                return 0
-            fi
-        done
-    fi
-
-    # 4. Network-based: any mariadb/mysql container that shares a network
-    # with a running WordPress container.
-    local wp_for_net=""
-    if [ -n "$WP_CONTAINER" ] && echo "$running" | grep -qx "$WP_CONTAINER"; then
-        wp_for_net="$WP_CONTAINER"
-    else
-        wp_for_net=$(echo "$running" | grep -E "(wordpress|wp)$|-wordpress-[0-9]+$|-wp-[0-9]+$" | head -1)
-    fi
-    if [ -n "$wp_for_net" ]; then
-        local wp_netids
-        wp_netids=$(docker inspect "$wp_for_net" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
-        for net in $wp_netids; do
-            local candidates
-            candidates=$(docker network inspect "$net" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null) || continue
-            for cand in $candidates; do
-                if [ "$cand" = "$wp_for_net" ]; then continue; fi
-                local img
-                img=$(docker inspect "$cand" --format '{{.Config.Image}}' 2>/dev/null)
-                case "$img" in
-                    *mariadb*|*mysql*) DB_CONTAINER="$cand"; log_message "Resolved DB container (shared network with WP): $DB_CONTAINER (image=$img)"; return 0 ;;
-                esac
-            done
-        done
-    fi
-
-    # 5. Last resort: any running mariadb/mysql container. Useful when the
-    # host only runs a single DB stack and we just don't know its name.
-    local any
-    any=$(docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
-        | awk 'tolower($2) ~ /mariadb|mysql/ && $2 !~ /^(wordpress|wp):/ {print $1; exit}')
-    if [ -n "$any" ]; then
-        DB_CONTAINER="$any"
-        log_message "Resolved DB container (fallback: any running mariadb/mysql): $DB_CONTAINER"
-        return 0
-    fi
-
     return 1
 }
 
@@ -3156,7 +3050,8 @@ if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ "$LIVE_DB_NAME" !=
             log_message "Re-resolving DB container for live DB_HOST='$DB_HOST'..."
             if ! detect_docker_database_info; then
                 # Last-resort: try the running-stack heuristic, then prompt.
-                if ! resolve_db_container_from_running_stack "$DB_HOST" true; then
+                # The helper writes to DB_CONTAINER (default output var).
+                if ! resolve_db_container_from_running_stack "$DB_HOST" "${WP_CONTAINER:-}" DB_CONTAINER; then
                     log_message "ERROR: Could not find a running DB container that matches DB_HOST='$DB_HOST'"
                     log_message "  (Hint: confirm the target DB container is on the same docker network)"
                     exit 1
@@ -3164,7 +3059,7 @@ if [ "$FIX_MODE" != true ] && [ -n "${LIVE_DB_NAME:-}" ] && [ "$LIVE_DB_NAME" !=
             fi
             # Some helpers leave DB_CONTAINER blank; use the heuristic explicitly.
             if [ -z "$DB_CONTAINER" ] || ! container_is_running "$DB_CONTAINER"; then
-                resolve_db_container_from_running_stack "$DB_HOST" true || true
+                resolve_db_container_from_running_stack "$DB_HOST" "${WP_CONTAINER:-}" DB_CONTAINER || true
             fi
         fi
         log_message "Resolved DB_CONTAINER='$DB_CONTAINER' for live DB_HOST='$DB_HOST'"
