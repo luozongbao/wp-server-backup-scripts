@@ -15,7 +15,8 @@ DB_DUMP_CMD=""
 IS_DOCKER=false
 LIGHTWEIGHT=false
 EMAIL_TO=""
-EMAIL_FROM="admin@companydomain.com"
+EMAIL_FROM=""
+ENV_FILE=""
 # Container-direct mode: backup from a running WordPress Docker container
 # without requiring a host bind mount. Use when WordPress files live only
 # inside a Docker container (named volume) and no folder is mapped to host.
@@ -28,8 +29,8 @@ show_help() {
     echo "================================"
     echo ""
     echo "Usage:"
-    echo "  Host path:   $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-h]"
-    echo "  Container:   $0 -c WP_CONTAINER   [-o OUTPUT_DIR] [-l] [-e EMAIL] [-d DOCROOT] [-h]"
+    echo "  Host path:   $0 -w WORDPRESS_DIR [-o OUTPUT_DIR] [-l] [-e EMAIL] [-f FROM] [-v ENV_FILE] [-h]"
+    echo "  Container:   $0 -c WP_CONTAINER   [-o OUTPUT_DIR] [-l] [-e EMAIL] [-f FROM] [-d DOCROOT] [-v ENV_FILE] [-h]"
     echo ""
     echo "Options:"
     echo "  -w WORDPRESS_DIR     Path to the WordPress installation directory on the host"
@@ -44,6 +45,11 @@ show_help() {
     echo "  -l                   Lightweight mode: backup only wp-content, wp-config.php,"
     echo "                       and .htaccess (optional, default: full backup)"
     echo "  -e EMAIL             Send backup report to this email address (optional)"
+    echo "  -f FROM              Sender email address used in the From: header (optional)."
+    echo "                       Highest priority; falls back to EMAIL_FROM in the .env file."
+    echo "  -v ENV_FILE          Path to a .env file to load EMAIL_FROM from when -f"
+    echo "                       is not provided (optional, default: ./<scriptname>.env,"
+    echo "                       then /etc/wp-server-backup-script.env)"
     echo "  -h                   Show this help message"
     echo ""
     echo "Examples:"
@@ -55,6 +61,9 @@ show_help() {
     echo "  # Container-direct (WordPress lives only inside Docker)"
     echo "  $0 -c my_project-wordpress-app -o /backups"
     echo "  $0 -c my_project-wordpress-app -l -d /var/www/html -e admin@example.com"
+    echo "  # OLS image: docroot is /var/www/vhosts/localhost/html (auto-detected"
+    echo "  # from \$WP_PATH env var; -d shown for explicit override)"
+    echo "  $0 -c ols_app -d /var/www/vhosts/localhost/html -o /backups"
     echo ""
     echo "Output format: [timestamp]_[wordpress-folder-name].zip"
     echo "Example: 20250530_143022_wordpress.zip"
@@ -86,6 +95,78 @@ init_log_file() {
     export LOG_FILE
 }
 
+# ---- Shared helpers ----
+# Source shared Docker container-resolution helpers (DB container discovery
+# chain + auto docroot detection for the -c path). See
+# lib/container_resolution.sh for the contract.
+# shellcheck source=lib/container_resolution.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/container_resolution.sh"
+
+# Default to mysqldump when DB_TYPE is empty/unset (matches detect_native_database_service fallback).
+db_dump_client_binary() {
+    if [ "${DB_TYPE:-}" = "mariadb" ]; then
+        echo "mariadb-dump"
+    else
+        echo "mysqldump"
+    fi
+}
+
+# db_password_arg: return "-p<password>" for mysqldump/mariadb-dump, or empty when
+# no password is set. Empty-password semantics match the original inline code
+# (which guarded the -p<pass> concat on -n "$DB_PASSWORD").
+db_password_arg() {
+    local pass="$1"
+    if [ -n "$pass" ]; then
+        echo "-p${pass}"
+    fi
+}
+
+# container_is_running: returns 0 if a Docker container with the given name is
+# currently running (matches running=True in docker inspect). Returns non-zero
+# on missing/stopped container. Wraps the inline `docker ps --format ... |
+# grep -qx "$name"` checks scattered across the script.
+container_is_running() {
+    local name="$1"
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$name"
+}
+
+# _execute_db_dump: run a database dump command (already shaped for docker-exec
+# or native), capture its stdout to $output_file, and validate the result the
+# same way the original backup_database_docker/native did:
+#   - On dump success: log size + return 0
+#   - On dump failure: log ERROR + return 1
+#   - On empty output:  log "ERROR: Database backup file is empty" + return 1
+# Mirrors the structure of wp_restore.sh's _execute_db_import.
+_execute_db_dump() {
+    local dump_cmd="$1"
+    local output_file="$2"
+    local label="$3"      # "Docker" or "native mysql"/"native mariadb"
+    local fail_hint="$4"  # second-line hint on failure (matches originals' second-line logs)
+
+    if eval "$dump_cmd" > "$output_file" 2>/dev/null; then
+        log_message "Database backup created successfully: $output_file"
+        if [ -s "$output_file" ]; then
+            local backup_size
+            backup_size=$(du -h "$output_file" | cut -f1)
+            log_message "Database backup size: $backup_size"
+            return 0
+        else
+            log_message "ERROR: Database backup file is empty"
+            return 1
+        fi
+    else
+        log_message "ERROR: Failed to create database backup using $label"
+        log_message "$fail_hint"
+        return 1
+    fi
+}
+
+# _dir_size: a tiny wrapper around `du -sh <path> | cut -f1`. Returns the
+# human-readable size of <path> on stdout, or "0" if du is unavailable.
+_dir_size() {
+    du -sh "$1" 2>/dev/null | cut -f1
+}
+
 # Send backup report via email using msmtp
 send_email_notification() {
     local status="$1"   # SUCCESS or FAILED
@@ -100,6 +181,14 @@ send_email_notification() {
     if ! command -v msmtp &> /dev/null; then
         log_message "WARNING: msmtp not installed, skipping email notification"
         return 1
+    fi
+
+    if [ -z "$EMAIL_FROM" ]; then
+        # No explicit From: configured. msmtp's 'default' account may still
+        # supply one (via its 'from' line); we fall back to the placeholder
+        # so the message body parses, but warn the operator clearly.
+        log_message "WARNING: EMAIL_FROM is not set (-f, --from, or .env). Using placeholder; configure it to match the msmtp 'from' line."
+        EMAIL_FROM="noreply@localhost"
     fi
 
     local subject_prefix="[WordPress Backup]"
@@ -171,14 +260,10 @@ check_dependencies() {
         fi
     else
         # Check for native database dump tools
-        if [ "$DB_TYPE" = "mariadb" ]; then
-            if ! command -v mariadb-dump &> /dev/null; then
-                missing_tools+=("mariadb-dump")
-            fi
-        else
-            if ! command -v mysqldump &> /dev/null; then
-                missing_tools+=("mysqldump")
-            fi
+        local dump_bin
+        dump_bin=$(db_dump_client_binary)
+        if ! command -v "$dump_bin" &> /dev/null; then
+            missing_tools+=("$dump_bin")
         fi
     fi
     
@@ -239,14 +324,14 @@ detect_docker_environment() {
 # Function to detect database type and container (for Docker)
 detect_docker_database_info() {
     local compose_file="$DOCKER_COMPOSE_DIR/docker-compose.yml"
-    
+
     if [ ! -f "$compose_file" ]; then
         log_message "ERROR: docker-compose.yml not found in $DOCKER_COMPOSE_DIR"
         return 1
     fi
-    
+
     log_message "Analyzing docker-compose.yml for database configuration..."
-    
+
     # Detect database type
     if grep -qi "mariadb" "$compose_file"; then
         DB_TYPE="mariadb"
@@ -258,23 +343,70 @@ detect_docker_database_info() {
         log_message "ERROR: Could not detect database type (MariaDB/MySQL) in docker-compose.yml"
         return 1
     fi
-    
-    # Find database container name
+
+    # Capture the literal string from `container_name:` as a HINT only.
+    # The capture is unreliable for two reasons:
+    #   1. Many compose files use `${COMPOSE_PROJECT_NAME:-...}_db`-style
+    #      interpolation, which Docker resolves at `docker compose up`
+    #      time but the literal string is stored here. example stack:
+    #      container_name: ${COMPOSE_PROJECT_NAME:-wp_ols}_db
+    #      -> literal captured value is "${COMPOSE_PROJECT_NAME:-wp_ols}_db"
+    #      -> `docker exec ${COMPOSE_PROJECT_NAME:-wp_ols}_db ...` fails.
+    #   2. The naive grep window sometimes catches the `networks:` key
+    #      of a sibling service rather than the database service name.
+    # We therefore treat the captured literal as a HINT and verify it
+    # is actually a running container. If it isn't, we fall back to the
+    # 5-step DB container resolution chain (see lib/container_resolution.sh
+    # and issue003.md). The chain needs DB_HOST from wp-config.php; if
+    # we don't have it yet (rare in -w mode), the call is deferred.
     local container_line=$(grep -A 10 -B 5 "$DB_TYPE" "$compose_file" | grep -E "container_name:" | head -1)
+    local hinted_container=""
     if [ -n "$container_line" ]; then
-        DB_CONTAINER=$(echo "$container_line" | sed 's/.*container_name:\s*//' | tr -d '"' | tr -d "'" | xargs)
-    else
+        hinted_container=$(echo "$container_line" | sed 's/.*container_name:\s*//' | tr -d '"' | tr -d "'" | xargs)
+    fi
+    if [ -z "$hinted_container" ]; then
         # Try to find service name if container_name is not specified
-        DB_CONTAINER=$(grep -B 5 -A 10 "$DB_TYPE" "$compose_file" | grep -E "^\s*[a-zA-Z0-9_-]+:" | head -1 | sed 's/:\s*$//' | sed 's/^\s*//')
+        hinted_container=$(grep -B 5 -A 10 "$DB_TYPE" "$compose_file" | grep -E "^\s*[a-zA-Z0-9_-]+:" | head -1 | sed 's/:\s*$//' | sed 's/^\s*//')
     fi
-    
-    if [ -z "$DB_CONTAINER" ]; then
-        log_message "ERROR: Could not determine database container name"
-        return 1
+
+    # Verify the hint is actually a running container. Placeholders like
+    # "${COMPOSE_PROJECT_NAME:-wp_ols}_db" will obviously not be running,
+    # so we fall through to the resolver chain.
+    if [ -n "$hinted_container" ] && container_is_running "$hinted_container"; then
+        DB_CONTAINER="$hinted_container"
+        log_message "Database container (from compose hint): $DB_CONTAINER"
+        return 0
     fi
-    
-    log_message "Database container: $DB_CONTAINER"
-    return 0
+
+    if [ -n "$hinted_container" ]; then
+        log_message "Compose-hinted DB container '$hinted_container' is not running (likely \${VAR:-default} interpolation); falling back to resolver chain"
+    fi
+
+    # Fallback: use the shared 5-step resolver chain. This needs DB_HOST
+    # (extracted from wp-config.php); if we don't have it yet, the chain
+    # returns non-zero and we report a clear error below.
+    if [ -n "${DB_HOST:-}" ]; then
+        if resolve_db_container_from_running_stack "${DB_HOST}" "${WP_CONTAINER:-}" DB_CONTAINER; then
+            log_message "Database container (resolved via running-stack chain): $DB_CONTAINER"
+            return 0
+        fi
+    fi
+
+    # We have NO way to find the DB container. Two reasons this can happen:
+    #   - DB_HOST hasn't been extracted yet (wp-config.php parse failed
+    #     or wasn't run) and the literal hint is a placeholder.
+    #   - DB_HOST is a real value but no running container matches.
+    # Defer the "fatal" decision until extract_db_config() has run — the
+    # caller will set DB_HOST and retry. If we got here with an empty
+    # DB_HOST, just return 1 with a message that points at the missing data.
+    if [ -z "${DB_HOST:-}" ]; then
+        log_message "ERROR: Could not determine database container (compose hint was a placeholder and DB_HOST is not yet known)"
+        log_message "Hint: re-run after WordPress wp-config.php is readable (extract_db_config must run first)"
+    else
+        log_message "ERROR: Could not resolve database container (DB_HOST='$DB_HOST'); no running container matches and the compose hint was not usable"
+        log_message "Hint: start the DB container ('docker compose up -d'), or pass DB_HOST explicitly"
+    fi
+    return 1
 }
 
 # Function to detect native database service type
@@ -428,20 +560,16 @@ extract_db_config_from_container() {
     return 0
 }
 
-# Function to read a file from inside a running container (used in container-direct mode)
-read_file_from_container() {
-    local container="$1"
-    local path="$2"
-
-    if ! docker exec "$container" test -f "$path" 2>/dev/null; then
-        return 1
-    fi
-    docker exec "$container" cat "$path" 2>/dev/null
-}
-
 # Function to validate that the WP container exists and is running, and copy
 # wp-config.php to a temp path so the rest of the script can extract DB info
 # uniformly from a file.
+#
+# Auto-discovers the document root when the user did not pass -d:
+#   - The default /var/www/html works for the official WordPress image
+#     but is wrong for litespeedtech/openlitespeed
+#     (/var/www/vhosts/localhost/html) and several other images. We probe
+#     $WP_PATH / $WORDPRESS_PATH / $DOCROOT inside the container first,
+#     then a small list of common fallback paths. See issue003.md.
 prepare_container_direct_mode() {
     local container="$1"
     local docroot="$2"
@@ -463,10 +591,28 @@ prepare_container_direct_mode() {
         return 1
     fi
 
-    # Verify docroot contains wp-config.php
+    # Verify docroot contains wp-config.php. If the user-supplied (or
+    # default) docroot is wrong, run the shared docroot probe to look
+    # at common locations before failing (see issue003.md Failure B).
     if ! docker exec "$container" test -f "$docroot/wp-config.php" 2>/dev/null; then
-        log_message "ERROR: wp-config.php not found at $docroot/wp-config.php inside container '$container'"
-        return 1
+        log_message "wp-config.php not at $docroot; probing common locations..."
+        if detect_container_docroot "$container" "$docroot" WP_CONTAINER_DOCROOT; then
+            docroot="$WP_CONTAINER_DOCROOT"
+            log_message "Document root inside container (probed): $docroot"
+        else
+            # Build a friendly error that lists what we tried so the user
+            # can pass -d confidently on retry.
+            log_message "ERROR: wp-config.php not found in container '$container'."
+            log_message "Tried the supplied/default docroot and these common locations:"
+            log_message "  - $docroot"
+            log_message "  - /var/www/html"
+            log_message "  - /var/www/vhosts/localhost/html"
+            log_message "  - /opt/bitnami/wordpress"
+            log_message "  - /usr/src/wordpress"
+            log_message "  - \$WP_PATH / \$WORDPRESS_PATH / \$DOCROOT env vars (unset or did not contain wp-config.php)"
+            log_message "Re-run with -d <path> to specify the document root explicitly (e.g. -d /var/www/vhosts/localhost/html for the litespeedtech/openlitespeed image)."
+            return 1
+        fi
     fi
 
     # Pull wp-config.php out so we can reuse extract_db_config() unchanged
@@ -482,97 +628,12 @@ prepare_container_direct_mode() {
 # Function to find the database container that pairs with the WordPress
 # container. Strategy:
 #   1) Look for docker-compose.yml near the WP container and match service
-#      names referenced by DB_HOST (e.g. "db") to a running container with
-#      a mysql/mariadb image.
-#   2) If DB_HOST is a DNS service name, look up docker network aliases.
-#   3) Fallback: scan all running mysql/mariadb containers and pick the one
-#      sharing at least one docker network with the WP container.
-#
-# IMPORTANT: This function is called via $(...) so its stdout is captured
-# as the container name. Therefore ALL log output must go to stderr (>&2).
-find_db_container_for_wp() {
-    local wp_container="$1"
-    local db_host="$2"
-
-    log_message "Resolving database container for '$wp_container' (DB_HOST='$db_host')..." >&2
-
-    # Normalize "host:port" or "host"
-    local db_service="${db_host%%:*}"
-
-    # Try to find docker-compose.yml near the WP container by inspecting its
-    # labels (compose sets label com.docker.compose.project.config_files).
-    local compose_file=""
-    local config_files=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$wp_container" 2>/dev/null || true)
-    if [ -n "$config_files" ] && [ "$config_files" != "<no value>" ]; then
-        # Take the first path in the (possibly comma-separated) list
-        compose_file="${config_files%%,*}"
-        if [ -f "$compose_file" ]; then
-            log_message "Found compose file via container labels: $compose_file" >&2
-        else
-            compose_file=""
-        fi
-    fi
-
-    # Strategy 1: match by service name in compose file
-    if [ -n "$compose_file" ]; then
-        # Find a service block whose name matches db_service OR whose
-        # container_name is set to db_service
-        local matched_container=""
-        local current_service=""
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_-]+):[[:space:]]*$ ]]; then
-                current_service="${BASH_REMATCH[1]}"
-            fi
-            if [[ "$line" =~ container_name:[[:space:]]*([^[:space:]]+) ]]; then
-                local cn="${BASH_REMATCH[1]}"
-                if [ "$cn" = "$db_service" ] || [ "$cn" = "${PROJECT_NAME:-}_${db_service}" ] || [ "$cn" = "${PROJECT_NAME:-}-${db_service}" ]; then
-                    matched_container="$cn"
-                fi
-            fi
-            if [ "$current_service" = "$db_service" ] && [ -z "$matched_container" ]; then
-                # Try to find a running container whose name starts with
-                # the project prefix + service name
-                local project=$(basename "$(dirname "$compose_file")")
-                local candidate="${project}-${db_service}"
-                if docker inspect "$candidate" >/dev/null 2>&1; then
-                    matched_container="$candidate"
-                fi
-            fi
-        done < "$compose_file"
-
-        if [ -n "$matched_container" ] && docker ps --format '{{.Names}}' | grep -qx "$matched_container"; then
-            echo "$matched_container"
-            return 0
-        fi
-    fi
-
-    # Strategy 2: a container literally named db_service (DB_HOST value)
-    if docker ps --format '{{.Names}}' | grep -qx "$db_service"; then
-        local candidate_state=$(docker inspect -f '{{.State.Running}}' "$db_service" 2>/dev/null)
-        if [ "$candidate_state" = "true" ]; then
-            echo "$db_service"
-            return 0
-        fi
-    fi
-
-    # Strategy 3: scan all running mysql/mariadb containers and pick the one
-    # sharing a network with the WP container
-    local wp_networks=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$wp_container" 2>/dev/null)
-    local candidates=$(docker ps --format '{{.Names}}\t{{.Image}}' | awk '$2 ~ /mysql|mariadb/ {print $1}')
-
-    for cand in $candidates; do
-        local cand_networks=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cand" 2>/dev/null)
-        for net in $wp_networks; do
-            if [[ " $cand_networks " == *" $net "* ]]; then
-                log_message "Picked DB container '$cand' via shared network '$net'" >&2
-                echo "$cand"
-                return 0
-            fi
-        done
-    done
-
-    return 1
-}
+# DB container resolution lives in lib/container_resolution.sh — sourced
+# at the top of this script. The function it provides
+# (resolve_db_container_from_running_stack) supersedes the old
+# find_db_container_for_wp() defined here previously. See issue003.md
+# for the rationale (handles ${VAR:-default} interpolation in
+# container_name: directives and cross-stack restores).
 
 # Pull WordPress files out of the container into a temp directory using
 # 'docker cp'. Used in container-direct mode.
@@ -612,7 +673,8 @@ backup_files_from_container() {
 
         # Marker file so restore script knows this is lightweight
         echo "lightweight" > "$temp_dir/files/.backup_mode"
-        local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+        local files_size
+        files_size=$(_dir_size "$temp_dir/files")
         log_message "Lightweight backup size: $files_size"
         return 0
     else
@@ -629,7 +691,8 @@ backup_files_from_container() {
                 log_message "WARNING: Failed to refresh wp-config.php from container"
             fi
             log_message "WordPress files pulled from container successfully"
-            local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+            local files_size
+            files_size=$(_dir_size "$temp_dir/files")
             log_message "WordPress files size: $files_size"
             return 0
         else
@@ -642,91 +705,32 @@ backup_files_from_container() {
 # Function to create database backup (Docker)
 backup_database_docker() {
     local output_file="$1"
-    
+
     log_message "Creating database backup using Docker..."
-    
+
     # Check if container is running
-    if ! docker ps --format "table {{.Names}}" | grep -q "^${DB_CONTAINER}$"; then
+    if ! container_is_running "$DB_CONTAINER"; then
         log_message "ERROR: Database container '$DB_CONTAINER' is not running"
         log_message "Please start your Docker containers first"
         return 1
     fi
-    
-    # Create database dump command for Docker
-    local docker_dump_cmd=""
-
-    if [ "$DB_TYPE" = "mariadb" ]; then
-        docker_dump_cmd="docker exec $DB_CONTAINER mariadb-dump -u$DB_USER"
-    else
-        docker_dump_cmd="docker exec $DB_CONTAINER mysqldump -u$DB_USER"
-    fi
-
-    if [ -n "$DB_PASSWORD" ]; then
-        docker_dump_cmd="$docker_dump_cmd -p$DB_PASSWORD"
-    fi
 
     # MySQL 8 needs --no-tablespaces for non-root users (PROCESS privilege).
     # Safe for MariaDB as well — ignored if the server doesn't recognize it.
-    docker_dump_cmd="$docker_dump_cmd --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
-    
-    # Execute database dump
-    if eval "$docker_dump_cmd" > "$output_file" 2>/dev/null; then
-        log_message "Database backup created successfully: $output_file"
-        
-        # Check if backup file has content
-        if [ -s "$output_file" ]; then
-            local backup_size=$(du -h "$output_file" | cut -f1)
-            log_message "Database backup size: $backup_size"
-            return 0
-        else
-            log_message "ERROR: Database backup file is empty"
-            return 1
-        fi
-    else
-        log_message "ERROR: Failed to create database backup using Docker"
-        log_message "Please check database credentials and container status"
-        return 1
-    fi
+    local docker_dump_cmd="docker exec $DB_CONTAINER $(db_dump_client_binary) -u$DB_USER $(db_password_arg "$DB_PASSWORD") --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
+
+    _execute_db_dump "$docker_dump_cmd" "$output_file" "Docker" "Please check database credentials and container status"
 }
 
 # Function to create database backup (Native)
 backup_database_native() {
     local output_file="$1"
-    
-    log_message "Creating database backup using native $DB_TYPE..."
-    
-    # Create database dump command based on service type
-    local dump_cmd=""
-    if [ "$DB_TYPE" = "mariadb" ]; then
-        dump_cmd="mariadb-dump -h$DB_HOST -u$DB_USER"
-    else
-        dump_cmd="mysqldump -h$DB_HOST -u$DB_USER"
-    fi
-    
-    if [ -n "$DB_PASSWORD" ]; then
-        dump_cmd="$dump_cmd -p$DB_PASSWORD"
-    fi
 
-    dump_cmd="$dump_cmd --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
-    
-    # Execute database dump
-    if eval "$dump_cmd" > "$output_file" 2>/dev/null; then
-        log_message "Database backup created successfully: $output_file"
-        
-        # Check if backup file has content
-        if [ -s "$output_file" ]; then
-            local backup_size=$(du -h "$output_file" | cut -f1)
-            log_message "Database backup size: $backup_size"
-            return 0
-        else
-            log_message "ERROR: Database backup file is empty"
-            return 1
-        fi
-    else
-        log_message "ERROR: Failed to create database backup using native $DB_TYPE"
-        log_message "Please check database credentials and service availability"
-        return 1
-    fi
+    log_message "Creating database backup using native $DB_TYPE..."
+
+    local dump_cmd="$(db_dump_client_binary) -h$DB_HOST -u$DB_USER $(db_password_arg "$DB_PASSWORD") --single-transaction --routines --triggers --no-tablespaces $DB_NAME"
+
+    _execute_db_dump "$dump_cmd" "$output_file" "native $DB_TYPE" "Please check database credentials and service availability"
 }
 
 # Function to create files backup
@@ -773,20 +777,22 @@ backup_files() {
         
         # Create a marker file so restore script knows this is lightweight
         echo "lightweight" > "$temp_dir/files/.backup_mode"
-        
+
         # Calculate files backup size
-        local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+        local files_size
+        files_size=$(_dir_size "$temp_dir/files")
         log_message "Lightweight backup size: $files_size"
         return 0
     else
         log_message "Creating full files backup..."
-        
+
         # Copy entire WordPress directory
         if cp -r "$wordpress_dir" "$temp_dir/files/" 2>/dev/null; then
             log_message "WordPress files copied successfully"
-            
+
             # Calculate files backup size
-            local files_size=$(du -sh "$temp_dir/files" | cut -f1)
+            local files_size
+            files_size=$(_dir_size "$temp_dir/files")
             log_message "WordPress files size: $files_size"
             return 0
         else
@@ -797,7 +803,49 @@ backup_files() {
 }
 
 # Parse command line arguments
-while getopts "w:c:d:o:le:h" opt; do
+# Supports short options (getopts) and a small set of GNU-style long options
+# for the flags that benefit from them (--from, --variable).
+#
+# bash's built-in getopts does not handle long options reliably, so we
+# pre-normalize the supported long forms into short ones before getopts runs.
+_NEW_ARGS=()
+_end_options=false
+for _arg in "$@"; do
+    if [ "$_end_options" = true ] || [ "$_arg" = "--" ]; then
+        _NEW_ARGS+=("$_arg")
+        _end_options=true
+        continue
+    fi
+    case "$_arg" in
+        --from=*)
+            _NEW_ARGS+=("-f" "${_arg#--from=}")
+            ;;
+        --from)
+            _NEW_ARGS+=("-f")
+            ;;
+        --variable=*)
+            _NEW_ARGS+=("-v" "${_arg#--variable=}")
+            ;;
+        --variable)
+            _NEW_ARGS+=("-v")
+            ;;
+        --help)
+            _NEW_ARGS+=("-h")
+            ;;
+        --*)
+            echo "Invalid long option: $_arg" >&2
+            show_help
+            exit 1
+            ;;
+        *)
+            _NEW_ARGS+=("$_arg")
+            ;;
+    esac
+done
+# Reset OPTIND so getopts reprocesses from the beginning with the rewritten args.
+OPTIND=1
+set -- "${_NEW_ARGS[@]}"
+while getopts "w:c:d:o:le:f:v:h" opt; do
     case $opt in
         w)
             WORDPRESS_DIR="$OPTARG"
@@ -817,6 +865,12 @@ while getopts "w:c:d:o:le:h" opt; do
         e)
             EMAIL_TO="$OPTARG"
             ;;
+        f)
+            EMAIL_FROM="$OPTARG"
+            ;;
+        v)
+            ENV_FILE="$OPTARG"
+            ;;
         h)
             SHOW_HELP=true
             ;;
@@ -832,6 +886,41 @@ while getopts "w:c:d:o:le:h" opt; do
             ;;
     esac
 done
+unset _NEW_ARGS _arg
+
+# Resolve EMAIL_FROM with the following priority:
+#   1. -f / --from on the command line (highest priority, already set above)
+#   2. .env file, in this order:
+#        a. the path given by -v / --variable (if any)
+#        b. ./wp_backup.env (script-named file in current directory)
+#        c. /etc/wp-server-backup-script.env (system-wide fallback)
+#   If none of these provide a value, EMAIL_FROM stays empty and the
+#   send_email_notification() function will skip notification (or fall back
+#   to the From: address configured in the msmtp 'default' account).
+if [ -z "$EMAIL_FROM" ]; then
+    _env_candidates=()
+    if [ -n "$ENV_FILE" ]; then
+        _env_candidates+=("$ENV_FILE")
+    fi
+    _env_candidates+=("./wp_backup.env")
+    _env_candidates+=("/etc/wp-server-backup-script.env")
+
+    for _env_path in "${_env_candidates[@]}"; do
+        if [ -f "$_env_path" ] && [ -r "$_env_path" ]; then
+            # Grep for an exact EMAIL_FROM= line; ignore comments and blanks.
+            _env_value=$(grep -E '^[[:space:]]*EMAIL_FROM[[:space:]]*=' "$_env_path" \
+                | tail -n 1 \
+                | sed -E 's/^[[:space:]]*EMAIL_FROM[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//' \
+                | sed -E 's/^["'\''](.*)["'\'']$/\1/')
+            if [ -n "$_env_value" ]; then
+                EMAIL_FROM="$_env_value"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Loaded EMAIL_FROM from: $_env_path"
+                break
+            fi
+        fi
+    done
+    unset _env_candidates _env_path _env_value
+fi
 
 # Show help if requested
 if [ "$SHOW_HELP" = true ]; then
@@ -927,10 +1016,14 @@ if [ "$IS_DOCKER" = true ]; then
             exit 1
         fi
 
-        # Now resolve the DB container from DB_HOST (e.g. "db:3306" -> "db")
+        # Now resolve the DB container using the shared 5-step chain. The
+        # old find_db_container_for_wp() helper is replaced by
+        # resolve_db_container_from_running_stack() in
+        # lib/container_resolution.sh, which handles ${VAR:-default}
+        # interpolation in compose container_name: directives and
+        # cross-stack restores via shared-network detection.
         DB_TYPE="mysql"
-        DB_CONTAINER=$(find_db_container_for_wp "$WP_CONTAINER" "$DB_HOST")
-        if [ -z "$DB_CONTAINER" ]; then
+        if ! resolve_db_container_from_running_stack "${DB_HOST}" "${WP_CONTAINER}" DB_CONTAINER; then
             log_message "ERROR: Could not resolve database container for '$WP_CONTAINER' (DB_HOST='$DB_HOST')"
             log_message "Hint: ensure the DB container is running and shares a docker network with the WordPress container"
             rm -rf "$TEMP_DIR"
@@ -945,6 +1038,16 @@ if [ "$IS_DOCKER" = true ]; then
         esac
         log_message "Database container: $DB_CONTAINER (image=$local_db_image, type=$DB_TYPE)"
     else
+        # Host-path (-w) Docker mode: the resolver chain needs DB_HOST to
+        # bridge the literal-placeholder gap (see detect_docker_database_info
+        # comment, issue003.md Failure A). Extract it from wp-config.php
+        # first so the chain has something to work with; if extraction
+        # fails, detect_docker_database_info surfaces that clearly.
+        if ! extract_db_config "$WORDPRESS_DIR"; then
+            log_message "ERROR: Failed to extract database configuration"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
         if ! detect_docker_database_info; then
             log_message "ERROR: Failed to detect Docker database configuration"
             rm -rf "$TEMP_DIR"
@@ -1020,7 +1123,10 @@ trap cleanup EXIT
 
 # Extract database configuration. In container-direct mode, the DB config
 # was already extracted via extract_db_config_from_container() earlier.
-if [ "$CONTAINER_DIRECT" = false ]; then
+# In host-path Docker mode, the DB config was already extracted just
+# before detect_docker_database_info() so the resolver chain has DB_HOST.
+# Only native mode still needs to extract here.
+if [ "$IS_DOCKER" = false ]; then
     if ! extract_db_config "$WORDPRESS_DIR"; then
         log_message "ERROR: Failed to extract database configuration"
         exit 1
