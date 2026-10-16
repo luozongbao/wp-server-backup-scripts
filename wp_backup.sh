@@ -61,6 +61,9 @@ show_help() {
     echo "  # Container-direct (WordPress lives only inside Docker)"
     echo "  $0 -c my_project-wordpress-app -o /backups"
     echo "  $0 -c my_project-wordpress-app -l -d /var/www/html -e admin@example.com"
+    echo "  # OLS image: docroot is /var/www/vhosts/localhost/html (auto-detected"
+    echo "  # from \$WP_PATH env var; -d shown for explicit override)"
+    echo "  $0 -c ols_app -d /var/www/vhosts/localhost/html -o /backups"
     echo ""
     echo "Output format: [timestamp]_[wordpress-folder-name].zip"
     echo "Example: 20250530_143022_wordpress.zip"
@@ -93,12 +96,12 @@ init_log_file() {
 }
 
 # ---- Shared helpers ----
-# Most of these exist to centralize patterns that were duplicated across
-# backup_database_docker() / backup_database_native() / check_dependencies() /
-# backup_files*() so the dump path, password handling, and a docker
-# container-running probe are written once.
+# Source shared Docker container-resolution helpers (DB container discovery
+# chain + auto docroot detection for the -c path). See
+# lib/container_resolution.sh for the contract.
+# shellcheck source=lib/container_resolution.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/container_resolution.sh"
 
-# db_dump_client_binary: return "mariadb-dump" or "mysqldump" based on $DB_TYPE.
 # Default to mysqldump when DB_TYPE is empty/unset (matches detect_native_database_service fallback).
 db_dump_client_binary() {
     if [ "${DB_TYPE:-}" = "mariadb" ]; then
@@ -321,14 +324,14 @@ detect_docker_environment() {
 # Function to detect database type and container (for Docker)
 detect_docker_database_info() {
     local compose_file="$DOCKER_COMPOSE_DIR/docker-compose.yml"
-    
+
     if [ ! -f "$compose_file" ]; then
         log_message "ERROR: docker-compose.yml not found in $DOCKER_COMPOSE_DIR"
         return 1
     fi
-    
+
     log_message "Analyzing docker-compose.yml for database configuration..."
-    
+
     # Detect database type
     if grep -qi "mariadb" "$compose_file"; then
         DB_TYPE="mariadb"
@@ -340,23 +343,70 @@ detect_docker_database_info() {
         log_message "ERROR: Could not detect database type (MariaDB/MySQL) in docker-compose.yml"
         return 1
     fi
-    
-    # Find database container name
+
+    # Capture the literal string from `container_name:` as a HINT only.
+    # The capture is unreliable for two reasons:
+    #   1. Many compose files use `${COMPOSE_PROJECT_NAME:-...}_db`-style
+    #      interpolation, which Docker resolves at `docker compose up`
+    #      time but the literal string is stored here. example stack:
+    #      container_name: ${COMPOSE_PROJECT_NAME:-wp_ols}_db
+    #      -> literal captured value is "${COMPOSE_PROJECT_NAME:-wp_ols}_db"
+    #      -> `docker exec ${COMPOSE_PROJECT_NAME:-wp_ols}_db ...` fails.
+    #   2. The naive grep window sometimes catches the `networks:` key
+    #      of a sibling service rather than the database service name.
+    # We therefore treat the captured literal as a HINT and verify it
+    # is actually a running container. If it isn't, we fall back to the
+    # 5-step DB container resolution chain (see lib/container_resolution.sh
+    # and issue003.md). The chain needs DB_HOST from wp-config.php; if
+    # we don't have it yet (rare in -w mode), the call is deferred.
     local container_line=$(grep -A 10 -B 5 "$DB_TYPE" "$compose_file" | grep -E "container_name:" | head -1)
+    local hinted_container=""
     if [ -n "$container_line" ]; then
-        DB_CONTAINER=$(echo "$container_line" | sed 's/.*container_name:\s*//' | tr -d '"' | tr -d "'" | xargs)
-    else
+        hinted_container=$(echo "$container_line" | sed 's/.*container_name:\s*//' | tr -d '"' | tr -d "'" | xargs)
+    fi
+    if [ -z "$hinted_container" ]; then
         # Try to find service name if container_name is not specified
-        DB_CONTAINER=$(grep -B 5 -A 10 "$DB_TYPE" "$compose_file" | grep -E "^\s*[a-zA-Z0-9_-]+:" | head -1 | sed 's/:\s*$//' | sed 's/^\s*//')
+        hinted_container=$(grep -B 5 -A 10 "$DB_TYPE" "$compose_file" | grep -E "^\s*[a-zA-Z0-9_-]+:" | head -1 | sed 's/:\s*$//' | sed 's/^\s*//')
     fi
-    
-    if [ -z "$DB_CONTAINER" ]; then
-        log_message "ERROR: Could not determine database container name"
-        return 1
+
+    # Verify the hint is actually a running container. Placeholders like
+    # "${COMPOSE_PROJECT_NAME:-wp_ols}_db" will obviously not be running,
+    # so we fall through to the resolver chain.
+    if [ -n "$hinted_container" ] && container_is_running "$hinted_container"; then
+        DB_CONTAINER="$hinted_container"
+        log_message "Database container (from compose hint): $DB_CONTAINER"
+        return 0
     fi
-    
-    log_message "Database container: $DB_CONTAINER"
-    return 0
+
+    if [ -n "$hinted_container" ]; then
+        log_message "Compose-hinted DB container '$hinted_container' is not running (likely \${VAR:-default} interpolation); falling back to resolver chain"
+    fi
+
+    # Fallback: use the shared 5-step resolver chain. This needs DB_HOST
+    # (extracted from wp-config.php); if we don't have it yet, the chain
+    # returns non-zero and we report a clear error below.
+    if [ -n "${DB_HOST:-}" ]; then
+        if resolve_db_container_from_running_stack "${DB_HOST}" "${WP_CONTAINER:-}" DB_CONTAINER; then
+            log_message "Database container (resolved via running-stack chain): $DB_CONTAINER"
+            return 0
+        fi
+    fi
+
+    # We have NO way to find the DB container. Two reasons this can happen:
+    #   - DB_HOST hasn't been extracted yet (wp-config.php parse failed
+    #     or wasn't run) and the literal hint is a placeholder.
+    #   - DB_HOST is a real value but no running container matches.
+    # Defer the "fatal" decision until extract_db_config() has run — the
+    # caller will set DB_HOST and retry. If we got here with an empty
+    # DB_HOST, just return 1 with a message that points at the missing data.
+    if [ -z "${DB_HOST:-}" ]; then
+        log_message "ERROR: Could not determine database container (compose hint was a placeholder and DB_HOST is not yet known)"
+        log_message "Hint: re-run after WordPress wp-config.php is readable (extract_db_config must run first)"
+    else
+        log_message "ERROR: Could not resolve database container (DB_HOST='$DB_HOST'); no running container matches and the compose hint was not usable"
+        log_message "Hint: start the DB container ('docker compose up -d'), or pass DB_HOST explicitly"
+    fi
+    return 1
 }
 
 # Function to detect native database service type
@@ -513,6 +563,13 @@ extract_db_config_from_container() {
 # Function to validate that the WP container exists and is running, and copy
 # wp-config.php to a temp path so the rest of the script can extract DB info
 # uniformly from a file.
+#
+# Auto-discovers the document root when the user did not pass -d:
+#   - The default /var/www/html works for the official WordPress image
+#     but is wrong for litespeedtech/openlitespeed
+#     (/var/www/vhosts/localhost/html) and several other images. We probe
+#     $WP_PATH / $WORDPRESS_PATH / $DOCROOT inside the container first,
+#     then a small list of common fallback paths. See issue003.md.
 prepare_container_direct_mode() {
     local container="$1"
     local docroot="$2"
@@ -534,10 +591,28 @@ prepare_container_direct_mode() {
         return 1
     fi
 
-    # Verify docroot contains wp-config.php
+    # Verify docroot contains wp-config.php. If the user-supplied (or
+    # default) docroot is wrong, run the shared docroot probe to look
+    # at common locations before failing (see issue003.md Failure B).
     if ! docker exec "$container" test -f "$docroot/wp-config.php" 2>/dev/null; then
-        log_message "ERROR: wp-config.php not found at $docroot/wp-config.php inside container '$container'"
-        return 1
+        log_message "wp-config.php not at $docroot; probing common locations..."
+        if detect_container_docroot "$container" "$docroot" WP_CONTAINER_DOCROOT; then
+            docroot="$WP_CONTAINER_DOCROOT"
+            log_message "Document root inside container (probed): $docroot"
+        else
+            # Build a friendly error that lists what we tried so the user
+            # can pass -d confidently on retry.
+            log_message "ERROR: wp-config.php not found in container '$container'."
+            log_message "Tried the supplied/default docroot and these common locations:"
+            log_message "  - $docroot"
+            log_message "  - /var/www/html"
+            log_message "  - /var/www/vhosts/localhost/html"
+            log_message "  - /opt/bitnami/wordpress"
+            log_message "  - /usr/src/wordpress"
+            log_message "  - \$WP_PATH / \$WORDPRESS_PATH / \$DOCROOT env vars (unset or did not contain wp-config.php)"
+            log_message "Re-run with -d <path> to specify the document root explicitly (e.g. -d /var/www/vhosts/localhost/html for the litespeedtech/openlitespeed image)."
+            return 1
+        fi
     fi
 
     # Pull wp-config.php out so we can reuse extract_db_config() unchanged
@@ -553,97 +628,12 @@ prepare_container_direct_mode() {
 # Function to find the database container that pairs with the WordPress
 # container. Strategy:
 #   1) Look for docker-compose.yml near the WP container and match service
-#      names referenced by DB_HOST (e.g. "db") to a running container with
-#      a mysql/mariadb image.
-#   2) If DB_HOST is a DNS service name, look up docker network aliases.
-#   3) Fallback: scan all running mysql/mariadb containers and pick the one
-#      sharing at least one docker network with the WP container.
-#
-# IMPORTANT: This function is called via $(...) so its stdout is captured
-# as the container name. Therefore ALL log output must go to stderr (>&2).
-find_db_container_for_wp() {
-    local wp_container="$1"
-    local db_host="$2"
-
-    log_message "Resolving database container for '$wp_container' (DB_HOST='$db_host')..." >&2
-
-    # Normalize "host:port" or "host"
-    local db_service="${db_host%%:*}"
-
-    # Try to find docker-compose.yml near the WP container by inspecting its
-    # labels (compose sets label com.docker.compose.project.config_files).
-    local compose_file=""
-    local config_files=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$wp_container" 2>/dev/null || true)
-    if [ -n "$config_files" ] && [ "$config_files" != "<no value>" ]; then
-        # Take the first path in the (possibly comma-separated) list
-        compose_file="${config_files%%,*}"
-        if [ -f "$compose_file" ]; then
-            log_message "Found compose file via container labels: $compose_file" >&2
-        else
-            compose_file=""
-        fi
-    fi
-
-    # Strategy 1: match by service name in compose file
-    if [ -n "$compose_file" ]; then
-        # Find a service block whose name matches db_service OR whose
-        # container_name is set to db_service
-        local matched_container=""
-        local current_service=""
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*([a-zA-Z0-9_-]+):[[:space:]]*$ ]]; then
-                current_service="${BASH_REMATCH[1]}"
-            fi
-            if [[ "$line" =~ container_name:[[:space:]]*([^[:space:]]+) ]]; then
-                local cn="${BASH_REMATCH[1]}"
-                if [ "$cn" = "$db_service" ] || [ "$cn" = "${PROJECT_NAME:-}_${db_service}" ] || [ "$cn" = "${PROJECT_NAME:-}-${db_service}" ]; then
-                    matched_container="$cn"
-                fi
-            fi
-            if [ "$current_service" = "$db_service" ] && [ -z "$matched_container" ]; then
-                # Try to find a running container whose name starts with
-                # the project prefix + service name
-                local project=$(basename "$(dirname "$compose_file")")
-                local candidate="${project}-${db_service}"
-                if docker inspect "$candidate" >/dev/null 2>&1; then
-                    matched_container="$candidate"
-                fi
-            fi
-        done < "$compose_file"
-
-        if [ -n "$matched_container" ] && docker ps --format '{{.Names}}' | grep -qx "$matched_container"; then
-            echo "$matched_container"
-            return 0
-        fi
-    fi
-
-    # Strategy 2: a container literally named db_service (DB_HOST value)
-    if docker ps --format '{{.Names}}' | grep -qx "$db_service"; then
-        local candidate_state=$(docker inspect -f '{{.State.Running}}' "$db_service" 2>/dev/null)
-        if [ "$candidate_state" = "true" ]; then
-            echo "$db_service"
-            return 0
-        fi
-    fi
-
-    # Strategy 3: scan all running mysql/mariadb containers and pick the one
-    # sharing a network with the WP container
-    local wp_networks=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$wp_container" 2>/dev/null)
-    local candidates=$(docker ps --format '{{.Names}}\t{{.Image}}' | awk '$2 ~ /mysql|mariadb/ {print $1}')
-
-    for cand in $candidates; do
-        local cand_networks=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cand" 2>/dev/null)
-        for net in $wp_networks; do
-            if [[ " $cand_networks " == *" $net "* ]]; then
-                log_message "Picked DB container '$cand' via shared network '$net'" >&2
-                echo "$cand"
-                return 0
-            fi
-        done
-    done
-
-    return 1
-}
+# DB container resolution lives in lib/container_resolution.sh — sourced
+# at the top of this script. The function it provides
+# (resolve_db_container_from_running_stack) supersedes the old
+# find_db_container_for_wp() defined here previously. See issue003.md
+# for the rationale (handles ${VAR:-default} interpolation in
+# container_name: directives and cross-stack restores).
 
 # Pull WordPress files out of the container into a temp directory using
 # 'docker cp'. Used in container-direct mode.
@@ -1026,10 +1016,14 @@ if [ "$IS_DOCKER" = true ]; then
             exit 1
         fi
 
-        # Now resolve the DB container from DB_HOST (e.g. "db:3306" -> "db")
+        # Now resolve the DB container using the shared 5-step chain. The
+        # old find_db_container_for_wp() helper is replaced by
+        # resolve_db_container_from_running_stack() in
+        # lib/container_resolution.sh, which handles ${VAR:-default}
+        # interpolation in compose container_name: directives and
+        # cross-stack restores via shared-network detection.
         DB_TYPE="mysql"
-        DB_CONTAINER=$(find_db_container_for_wp "$WP_CONTAINER" "$DB_HOST")
-        if [ -z "$DB_CONTAINER" ]; then
+        if ! resolve_db_container_from_running_stack "${DB_HOST}" "${WP_CONTAINER}" DB_CONTAINER; then
             log_message "ERROR: Could not resolve database container for '$WP_CONTAINER' (DB_HOST='$DB_HOST')"
             log_message "Hint: ensure the DB container is running and shares a docker network with the WordPress container"
             rm -rf "$TEMP_DIR"
@@ -1044,6 +1038,16 @@ if [ "$IS_DOCKER" = true ]; then
         esac
         log_message "Database container: $DB_CONTAINER (image=$local_db_image, type=$DB_TYPE)"
     else
+        # Host-path (-w) Docker mode: the resolver chain needs DB_HOST to
+        # bridge the literal-placeholder gap (see detect_docker_database_info
+        # comment, issue003.md Failure A). Extract it from wp-config.php
+        # first so the chain has something to work with; if extraction
+        # fails, detect_docker_database_info surfaces that clearly.
+        if ! extract_db_config "$WORDPRESS_DIR"; then
+            log_message "ERROR: Failed to extract database configuration"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
         if ! detect_docker_database_info; then
             log_message "ERROR: Failed to detect Docker database configuration"
             rm -rf "$TEMP_DIR"
@@ -1119,7 +1123,10 @@ trap cleanup EXIT
 
 # Extract database configuration. In container-direct mode, the DB config
 # was already extracted via extract_db_config_from_container() earlier.
-if [ "$CONTAINER_DIRECT" = false ]; then
+# In host-path Docker mode, the DB config was already extracted just
+# before detect_docker_database_info() so the resolver chain has DB_HOST.
+# Only native mode still needs to extract here.
+if [ "$IS_DOCKER" = false ]; then
     if ! extract_db_config "$WORDPRESS_DIR"; then
         log_message "ERROR: Failed to extract database configuration"
         exit 1
